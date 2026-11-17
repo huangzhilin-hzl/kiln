@@ -1,0 +1,14 @@
+# Laptop dry-run: mock engine, no GPU needed.
+name: mock
+engine:
+  kind: mock
+tiers:
+  - {name: fast, num_layers: 4, repeats: 3, trace_kernels: true}
+  - {name: slow, repeats: 5}
+traffic_file: traffic/sample.jsonl
+agents:
+  num_agents: 2
+  command: "claude -p --dangerously-skip-permissions"
+  budget_hours: 1
+workdir: runs
+server_url: http://127.0.0.1:8765

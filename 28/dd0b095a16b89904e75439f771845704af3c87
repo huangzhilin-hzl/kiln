@@ -1,0 +1,24 @@
+README.md
+  h_65d95dfcbf63bf 60-63,66,74-76
+configs/dsv41_flash_h20.yaml
+  h_65d95dfcbf63bf 1-41
+kiln/config.py
+  h_65d95dfcbf63bf 18-20
+kiln/engine/vllm_engine.py
+  h_65d95dfcbf63bf 9,18-22,30-33,45-47,49-50,54,57-61,64-65
+kiln/engine/vllm_ext.py
+  h_65d95dfcbf63bf 3-5,9-21,28,33-35,38-45,51-53,55-70,72-87,89-91,94-125,127-153
+scripts/smoke_vllm.py
+  h_65d95dfcbf63bf 1-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "28dd0b095a16b89904e75439f771845704af3c87",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}

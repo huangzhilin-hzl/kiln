@@ -1,0 +1,14 @@
+kiln/cli.py
+  h_65d95dfcbf63bf 13-16,40-41,48,57,61,65,70,72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2d0d4672caec5a82aaf063318b7d58029f3c8db0",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}

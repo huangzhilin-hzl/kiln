@@ -6,12 +6,18 @@ start, faster jobs, still real kernels and real data). Slow tier: full model.
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
 from .base import Engine, MeasureResult
+
+
+# Both tiers live in one process; CUDA_VISIBLE_DEVICES is process-global and is read when
+# vLLM spawns its EngineCore/worker processes. Boot engines one at a time.
+_BOOT_LOCK = threading.Lock()
 
 
 class VLLMEngine(Engine):
@@ -21,6 +27,10 @@ class VLLMEngine(Engine):
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
+        with _BOOT_LOCK:
+            self._start()
+
+    def _start(self) -> None:
         if self.tier.gpus:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.tier.gpus))
         from vllm import LLM
@@ -31,19 +41,28 @@ class VLLMEngine(Engine):
             max_model_len=self.cfg.max_model_len,
             enable_prefix_caching=True,          # TKCC: reuse a fixed request set -> cached prompts
             worker_extension_cls="kiln.engine.vllm_ext.HotReloadExt",
-            **self.cfg.extra_args,
         )
+        kwargs.update(self.cfg.extra_args)
+        kwargs.update(self.tier.engine_overrides)
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
         if self.tier.num_layers is not None:
-            kwargs["hf_overrides"] = {"num_hidden_layers": self.tier.num_layers}
+            kwargs["hf_overrides"] = {**kwargs.get("hf_overrides", {}),
+                                      "num_hidden_layers": self.tier.num_layers}
         t0 = time.time()
         self.llm = LLM(**kwargs)
         print(f"[kiln] {self.tier.name} tier engine up in {time.time() - t0:.0f}s")
+        print(f"[kiln] {self.tier.name} info: {self.llm.collective_rpc('kiln_info')[0]}")
 
     def hot_reload(self, candidate_path: str) -> None:
-        self.llm.collective_rpc("kiln_hot_reload", args=(os.path.abspath(candidate_path),))
+        secs = self.llm.collective_rpc("kiln_hot_reload", args=(os.path.abspath(candidate_path),),
+                                       timeout=self.tier.timeout_s)
+        # Cached KV was written by the previous forward; never let a candidate reuse it.
+        self.llm.reset_prefix_cache()
+        print(f"[kiln] {self.tier.name}: hot reload {max(secs):.1f}s")
 
     def teardown_candidate(self) -> None:
-        self.llm.collective_rpc("kiln_teardown")
+        self.llm.collective_rpc("kiln_teardown", timeout=self.tier.timeout_s)
+        self.llm.reset_prefix_cache()
 
     def shutdown(self) -> None:
         del self.llm

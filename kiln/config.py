@@ -15,6 +15,9 @@ class TierConfig(BaseModel):
     gpus: list[int] = Field(default_factory=list)
     repeats: int = 3               # back-to-back measurements per job
     trace_kernels: bool = False    # CUPTI / torch.profiler kernel report
+    # Extra LLM(...) kwargs for this tier only, merged over engine.extra_args.
+    # e.g. fast tier: {speculative_config: null} -- truncated models break MTP/DSpark layers.
+    engine_overrides: dict = Field(default_factory=dict)
     timeout_s: float = 600.0
 
 

@@ -8,9 +8,6 @@ engine:
   max_model_len: 8192
   extra_args:
     gpu_memory_utilization: 0.85
-    # Start with torch.compile off so the patched forward actually runs; keep CUDA graphs.
-    # (Key names depend on vLLM version: older uses `level`, newer uses `mode`.)
-    compilation_config: {level: 0}
 tiers:
   - {name: fast, num_layers: 4, gpus: [0], repeats: 3, trace_kernels: true}
   - {name: slow, gpus: [1], repeats: 5}

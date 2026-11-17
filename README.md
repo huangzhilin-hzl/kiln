@@ -57,12 +57,13 @@ uv pip install -e '.[gpu,dev]'
 # 1. Record real traffic to traffic/sample.jsonl: {"prompt_ids": [...], "output_len": N}
 # 2. Pick a parallel config
 kiln costmodel --model qwen3-30b-a3b --chip B200 --isl 8192 --osl 1024 --tps 40
-# 3. Start the persistent engines (the slow startup happens once)
-kiln serve -c configs/llama1b_vllm.yaml
-# 4. Check that hot reload works before adding agents
+# 3. Smoke-test hot reload on one tier (boot, reload, teardown, broken-candidate rejection, noise)
+python scripts/smoke_vllm.py -c configs/dsv41_flash_h20.yaml --tier fast
+# 4. Start the persistent engines (the slow startup happens once)
+kiln serve -c configs/dsv41_flash_h20.yaml
 kiln submit candidates/baseline_forward.py --tier fast --wait     # speedup ≈ 1.0
 # 5. Release the agents
-kiln agents -c configs/llama1b_vllm.yaml
+kiln agents -c configs/dsv41_flash_h20.yaml
 ```
 
 Agents get `KILN_AGENT` / `KILN_SERVER` env vars and use `kiln submit / status / board / leaderboard`.
@@ -70,10 +71,9 @@ Run artifacts go to `runs/<name>/` (`jobs/<id>/candidate.py` and `result.json`, 
 
 ## Known gaps and TODOs
 
-- **Check the vLLM internals** (`model_runner.model`, `capture_model()`, compile settings) against
-  your installed version. See the notes at the top of `vllm_ext.py`. Step 4 above is the smoke test.
-- **torch.compile:** the configs turn it off so the patched `forward` really runs. Turn it back on
-  once the loop works (re-trigger compilation in `kiln_hot_reload`).
+- **vLLM internals:** hot reload reuses vLLM's elastic-EP recipe for "release graphs, reset
+  torch.compile, recapture" (checked against vLLM main @ 20d8574, 2026-11-16). On a GPU box, run
+  `python scripts/smoke_vllm.py -c <config> --tier fast` before anything else.
 - **Noise:** tune `fast.num_layers` and `repeats` until `variance_pct` is below the gains you're
   looking for (TKCC got ~0.1%).
 - **Final verifier:** before you deploy, add perplexity / eval-suite and KV-cache contamination checks.

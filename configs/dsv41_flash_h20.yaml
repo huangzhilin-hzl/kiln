@@ -1,0 +1,41 @@
+# DeepSeek-V4.1-Flash on one 8x H20-3e node (SM90, 141 GB HBM3e each), vLLM main.
+#   fast tier: GPUs 0-3, TP4, first 8 layers, no spec decode -> quick crash/regression filter
+#   slow tier: GPUs 4-7, TP4, all layers, DSpark            -> high-fidelity number
+# If the full model does not fit at TP4 on your checkpoint, use two nodes (slow tier TP8).
+name: dsv41-flash-h20
+engine:
+  kind: vllm
+  model: /path/to/DeepSeek-V4.1-Flash          # MXFP4 checkpoint (NVFP4 needs Blackwell)
+  tensor_parallel_size: 4
+  max_model_len: 16384
+  extra_args:
+    tokenizer_mode: deepseek_v41
+    trust_remote_code: true
+    gpu_memory_utilization: 0.85
+    speculative_config: {method: dspark, num_speculative_tokens: 5}
+    # Keep compile + CUDA graphs ON: kiln resets torch.compile and re-captures after each
+    # reload (same path vLLM uses for elastic EP). Set enforce_eager: true only to debug.
+tiers:
+  - name: fast
+    num_layers: 8              # must leave a valid compress_ratios/kv-source prefix; smoke-test it
+    gpus: [0, 1, 2, 3]
+    repeats: 3
+    trace_kernels: true
+    timeout_s: 900
+    engine_overrides:
+      speculative_config: null # truncated model + DSpark draft (aux hidden states) is unsafe
+  - name: slow
+    gpus: [4, 5, 6, 7]
+    repeats: 5
+    timeout_s: 1800
+traffic_file: traffic/sample.jsonl   # replace with recorded traffic
+correctness:
+  min_token_match: 0.90        # MXFP4 + spec decode: long greedy runs drift; also check GSM8K before deploy
+  num_prompts: 8
+  max_new_tokens: 32
+agents:
+  num_agents: 4
+  command: "claude -p --dangerously-skip-permissions"
+  budget_hours: 12
+workdir: runs
+server_url: http://127.0.0.1:8765

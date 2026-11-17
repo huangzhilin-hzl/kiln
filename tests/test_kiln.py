@@ -46,3 +46,20 @@ def test_costmodel_high_tps_prefers_more_tp():
     hi = rank(m, chip, Workload(decode_tps_sla=120), max_chips=8, k=1)
     assert hi, "a high-TPS SLA should still be feasible at TP8"
     assert hi[0]["decode_batch"] <= lo["decode_batch"]
+
+
+def test_parse_agentx_export(tmp_path: Path):
+    import json
+    from kiln.bench.agentx import parse_agentx_export
+    p = tmp_path / "profile_export_aiperf.json"
+    p.write_text(json.dumps({
+        "warmup_metrics": {"total_token_throughput": {"unit": "tokens/sec", "avg": 1.0}},
+        "total_token_throughput": {"unit": "tokens/sec", "avg": 80000.0},
+        "output_token_throughput": {"unit": "tokens/sec", "avg": 2000.0},
+        "inter_token_latency": {"unit": "ms", "avg": 9.0, "p50": 8.0, "p90": 12.5},
+        "submission_valid": True,
+    }))
+    r = parse_agentx_export(p, num_gpus=4)
+    assert r.total_tput_per_gpu == 20000.0
+    assert r.itl_p90_ms == 12.5 and abs(r.interactivity_p90 - 80.0) < 1e-9
+    assert r.submission_valid is True

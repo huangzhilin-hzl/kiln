@@ -92,6 +92,13 @@ def cmd_costmodel(a):
               f"TTFT={r['ttft_s']:.3f}s TPS/user={r['decode_tps_user']:.0f}")
 
 
+def cmd_agentx_export(a):
+    from kiln.bench.agentx import export_offline
+    s = export_offline(a.out, tokenizer=a.tokenizer, hf_repo=a.hf_repo, num_traces=a.traces,
+                       turns_per_trace=a.turns, seed=a.seed, max_context=a.max_context)
+    print(json.dumps(s, indent=2))
+
+
 def cmd_synth(a):
     from kiln.bench.traffic import synth_traffic
     synth_traffic(a.out, n=a.n, isl=a.isl, osl=a.osl)
@@ -135,6 +142,14 @@ def main(argv=None):
     s.add_argument("--out", default="traffic/sample.jsonl"); s.add_argument("-n", type=int, default=32)
     s.add_argument("--isl", type=int, default=1024); s.add_argument("--osl", type=int, default=256)
     s.set_defaults(f=cmd_synth)
+
+    s = sp.add_parser("agentx-export", help="AgentX traces -> offline replay JSONL (fast tier)")
+    s.add_argument("--tokenizer", required=True, help="target model path / HF id")
+    s.add_argument("--out", default="traffic/agentx.jsonl")
+    s.add_argument("--hf-repo", default="semianalysisai/cc-traces-weka-062126")
+    s.add_argument("--traces", type=int, default=32); s.add_argument("--turns", type=int, default=4)
+    s.add_argument("--seed", type=int, default=42); s.add_argument("--max-context", type=int)
+    s.set_defaults(f=cmd_agentx_export)
 
     a = p.parse_args(argv)
     a.f(a)

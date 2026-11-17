@@ -29,9 +29,33 @@ import time
 import types
 
 
+def _snapshot_forwards(model) -> list[tuple]:
+    """Capture original instance and class `.forward` bindings across `model` and all submodules."""
+    snap = []
+    it = model.named_modules() if hasattr(model, "named_modules") else [("", model)]
+    for _, sub in it:
+        had_inst = "forward" in sub.__dict__
+        inst_fwd = sub.__dict__.get("forward")
+        cls = type(sub)
+        cls_fwd = getattr(cls, "forward", None)
+        snap.append((sub, had_inst, inst_fwd, cls, cls_fwd))
+    return snap
+
+
+def _restore_forwards(snap: list[tuple] | None) -> None:
+    if not snap:
+        return
+    for sub, had_inst, inst_fwd, cls, cls_fwd in snap:
+        if had_inst:
+            sub.__dict__["forward"] = inst_fwd
+        else:
+            sub.__dict__.pop("forward", None)
+        if cls_fwd is not None and getattr(cls, "forward", None) is not cls_fwd:
+            cls.forward = cls_fwd
+
+
 class HotReloadExt:
     # Attribute names must not collide with anything on vLLM's Worker (it asserts).
-    _kiln_baseline_forward = None
     _kiln_patched: list | None = None
     _kiln_module: types.ModuleType | None = None
 
@@ -40,35 +64,42 @@ class HotReloadExt:
         """Install candidate `path`, recompile + recapture. Returns seconds taken."""
         t0 = time.perf_counter()
         model = self.model_runner.get_model()
-        if self._kiln_baseline_forward is None:
-            self._kiln_baseline_forward = model.__dict__.get("forward")  # None => class method
+        if self._kiln_patched is None:
+            self._kiln_patched = _snapshot_forwards(model)
+        else:
+            # Defensively clean up in case a previous run did not tear down cleanly.
+            _restore_forwards(self._kiln_patched)
+
         name = f"kiln_candidate_{abs(hash((path, t0)))}"
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[name] = mod
-        spec.loader.exec_module(mod)
-
-        new_fwd = mod.make_forward(model)
-        if new_fwd is not None:
-            model.forward = new_fwd
+        try:
+            spec.loader.exec_module(mod)
+            new_fwd = mod.make_forward(model)
+            if new_fwd is not None:
+                model.forward = new_fwd
+        except Exception:
+            _restore_forwards(self._kiln_patched)
+            sys.modules.pop(name, None)
+            raise
         self._kiln_module = mod
         self._kiln_rebuild()
         return time.perf_counter() - t0
 
     def kiln_teardown(self) -> float:
-        """Restore the baseline forward (and any submodule patches the candidate undid)."""
+        """Restore baseline `.forward` across `model` and all submodules, then re-capture."""
         t0 = time.perf_counter()
         model = self.model_runner.get_model()
         mod = self._kiln_module
-        if mod is not None and hasattr(mod, "restore"):
-            mod.restore(model)             # candidates that patch submodules should define this
-        if self._kiln_baseline_forward is None:
-            model.__dict__.pop("forward", None)
-        else:
-            model.forward = self._kiln_baseline_forward
-        if mod is not None:
-            sys.modules.pop(mod.__name__, None)
-            self._kiln_module = None
+        try:
+            if mod is not None and hasattr(mod, "restore"):
+                mod.restore(model)
+        finally:
+            _restore_forwards(self._kiln_patched)
+            if mod is not None:
+                sys.modules.pop(mod.__name__, None)
+                self._kiln_module = None
         self._kiln_rebuild()
         return time.perf_counter() - t0
 

@@ -5,9 +5,14 @@ start, faster jobs, still real kernels and real data). Slow tier: full model.
 """
 from __future__ import annotations
 
+import gc
+import gzip
+import json
 import os
 import threading
 import time
+from collections import defaultdict
+from pathlib import Path
 
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
@@ -15,15 +20,40 @@ from kiln.config import EngineConfig, TierConfig
 from .base import Engine, MeasureResult
 
 
-# Both tiers live in one process; CUDA_VISIBLE_DEVICES is process-global and is read when
+# Both tiers may live in one process; CUDA_VISIBLE_DEVICES is process-global and is read when
 # vLLM spawns its EngineCore/worker processes. Boot engines one at a time.
 _BOOT_LOCK = threading.Lock()
+
+
+def _summarize_trace(trace_dir: str | Path, top_k: int = 12) -> str:
+    p = Path(trace_dir)
+    files = sorted(p.glob("*.pt.trace.json*"), key=lambda f: f.stat().st_mtime)
+    if not files:
+        return f"trace written to {trace_dir}"
+    latest = files[-1]
+    try:
+        opener = gzip.open if latest.name.endswith(".gz") else open
+        with opener(latest, "rt", encoding="utf-8") as f:
+            data = json.load(f)
+        dur_by_kernel: dict[str, float] = defaultdict(float)
+        for ev in data.get("traceEvents", ()):
+            if ev.get("cat") == "kernel" and "dur" in ev:
+                dur_by_kernel[str(ev.get("name", "unknown"))] += float(ev["dur"])
+        total = sum(dur_by_kernel.values())
+        if not total:
+            return f"trace written to {latest}"
+        top = sorted(dur_by_kernel.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        lines = [f"{100.0 * us / total:5.1f}%  {us / 1000.0:8.2f} ms  {name[:90]}" for name, us in top]
+        return f"trace: {latest}\n" + "\n".join(lines)
+    except Exception:
+        return f"trace written to {latest}"
 
 
 class VLLMEngine(Engine):
     def __init__(self, cfg: EngineConfig, tier: TierConfig):
         self.cfg, self.tier = cfg, tier
         self.llm = None
+        self._trace_dir: str | None = None
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -33,6 +63,11 @@ class VLLMEngine(Engine):
     def _start(self) -> None:
         if self.tier.gpus:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.tier.gpus))
+        if self.tier.trace_kernels:
+            tdir = os.environ.get("VLLM_TORCH_PROFILER_DIR") or str(Path("runs/traces") / self.tier.name)
+            Path(tdir).mkdir(parents=True, exist_ok=True)
+            os.environ["VLLM_TORCH_PROFILER_DIR"] = tdir
+            self._trace_dir = tdir
         from vllm import LLM
 
         kwargs = dict(
@@ -65,8 +100,22 @@ class VLLMEngine(Engine):
         self.llm.reset_prefix_cache()
 
     def shutdown(self) -> None:
-        del self.llm
-        self.llm = None
+        if self.llm is not None:
+            try:
+                core = getattr(getattr(self.llm, "llm_engine", None), "engine_core", None)
+                if core is not None and hasattr(core, "shutdown"):
+                    core.shutdown()
+            except Exception:
+                pass
+            del self.llm
+            self.llm = None
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------- measuring
     def _prompts(self, reqs: list[Request]):
@@ -109,15 +158,15 @@ class VLLMEngine(Engine):
         )
 
     def _kernel_report(self, prompts) -> str | None:
-        """Top kernels by CUDA time (fast tier only). Uses vLLM's torch-profiler hooks
-        if VLLM_TORCH_PROFILER_DIR is set; otherwise returns None."""
-        if not os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+        """Top kernels by CUDA time (fast tier only)."""
+        tdir = self._trace_dir or os.environ.get("VLLM_TORCH_PROFILER_DIR")
+        if not tdir:
             return None
         from vllm import SamplingParams
         self.llm.start_profile()
         self.llm.generate(prompts[:4], SamplingParams(max_tokens=32, ignore_eos=True), use_tqdm=False)
         self.llm.stop_profile()
-        return f"trace written to {os.environ['VLLM_TORCH_PROFILER_DIR']}"
+        return _summarize_trace(tdir)
 
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         from vllm import SamplingParams

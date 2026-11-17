@@ -39,6 +39,7 @@ class Job:
     variance_pct: float | None = None
     token_match: float | None = None
     kernel_report: str | None = None
+    extra: dict = field(default_factory=dict)
     error: str | None = None
 
 
@@ -108,6 +109,7 @@ class TierWorker:
             m = eng.measure(self.requests, self.tier.repeats, trace=self.tier.trace_kernels)
             job.decode_tps, job.prefill_tps = m.decode_tps, m.prefill_tps
             job.variance_pct, job.kernel_report = m.variance_pct, m.kernel_report
+            job.extra = m.extra
             job.speedup = m.decode_tps / self.baseline_tps
             job.status = "done"
         finally:

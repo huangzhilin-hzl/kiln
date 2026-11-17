@@ -50,6 +50,22 @@ echo 'SPEEDUP = 1.08' > /tmp/c.py
 .venv/bin/pytest -q
 ```
 
+## Workload: AgentX (SemiAnalysis InferenceX)
+
+kiln uses the same workload as the TKCC paper: AgentX's public agentic-coding traces
+(`semianalysisai/cc-traces-weka-062126`, 393 sessions with subagents, seed 42).
+
+| Tier | How AgentX is used | Fidelity |
+|---|---|---|
+| fast (`engine_kind: vllm`) | `kiln agentx-export` builds offline requests from the traces with AgentX's own content generator. Lengths, hash-block prefix sharing and the coding text match AgentX; timing and subagent concurrency are not replayed. | Approximate, quick |
+| slow (`engine_kind: vllm_server`) | `vllm serve` (with `VLLM_SERVER_DEV_MODE=1`) is measured by the real `agentx profile` harness. Hot reload goes through `/collective_rpc`. Score = InferenceX throughput/GPU; P90 interactivity is recorded in `extra`. | Exact protocol |
+
+```bash
+uv pip install -e '.[agentx]'          # agentx-harness==1.0.12, the version pinned in the paper
+kiln agentx-export --tokenizer /path/to/DeepSeek-V4.1-Flash --traces 32 --turns 4
+# The first run builds AgentX's ~10M-token coding pool. That takes a few minutes, then it is cached.
+```
+
 ## Real run (GPU box)
 
 ```bash

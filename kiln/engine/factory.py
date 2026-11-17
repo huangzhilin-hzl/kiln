@@ -6,10 +6,14 @@ from .base import Engine
 
 
 def make_engine(cfg: EngineConfig, tier: TierConfig) -> Engine:
-    if cfg.kind == "mock":
+    kind = tier.engine_kind or cfg.kind
+    if kind == "mock":
         from .mock import MockEngine
         return MockEngine(tier)
-    if cfg.kind == "vllm":
+    if kind == "vllm":
         from .vllm_engine import VLLMEngine
         return VLLMEngine(cfg, tier)
-    raise ValueError(f"unknown engine kind {cfg.kind}")
+    if kind == "vllm_server":
+        from .vllm_server import VLLMServerEngine
+        return VLLMServerEngine(cfg, tier)
+    raise ValueError(f"unknown engine kind {kind}")

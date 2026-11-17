@@ -19,6 +19,7 @@ class MeasureResult:
     ttft_s: float                      # mean time-to-first-token
     runs_decode_tps: list[float] = field(default_factory=list)
     kernel_report: str | None = None
+    extra: dict = field(default_factory=dict)   # e.g. AgentX P90 interactivity, export path
 
     @property
     def variance_pct(self) -> float:

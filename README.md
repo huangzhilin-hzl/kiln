@@ -63,7 +63,7 @@ kiln uses the same workload as the TKCC paper: AgentX's public agentic-coding tr
 ```bash
 uv pip install -e '.[agentx]'          # agentx-harness==1.0.12, the version pinned in the paper
 kiln agentx-export --tokenizer /path/to/DeepSeek-V4.1-Flash --traces 32 --turns 4
-# The first run builds AgentX's ~10M-token coding pool. That takes a few minutes, then it is cached.
+# Each run first builds AgentX's ~10M-token coding pool, which takes a few minutes.
 ```
 
 ## Real run (GPU box)

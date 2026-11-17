@@ -10,6 +10,10 @@ import time
 import httpx
 
 
+# Talk to the kiln server directly; ignore HTTP(S)_PROXY env vars (they break localhost).
+http = httpx.Client(trust_env=False, timeout=30)
+
+
 def _url() -> str:
     return os.environ.get("KILN_SERVER", "http://127.0.0.1:8765")
 
@@ -33,15 +37,15 @@ def cmd_serve(a):
 
 def cmd_submit(a):
     src = open(a.file).read()
-    r = httpx.post(f"{_url()}/jobs", json={"agent": _agent(a), "tier": a.tier,
-                                           "source": src, "note": a.note}, timeout=30)
+    r = http.post(f"{_url()}/jobs", json={"agent": _agent(a), "tier": a.tier,
+                                           "source": src, "note": a.note})
     r.raise_for_status()
     jid = r.json()["id"]
     if not a.wait:
         _print(r.json())
         return
     while True:
-        j = httpx.get(f"{_url()}/jobs/{jid}", timeout=30).json()
+        j = http.get(f"{_url()}/jobs/{jid}").json()
         if j["status"] not in ("queued", "running"):
             j.pop("candidate_path", None)
             _print(j)
@@ -50,22 +54,22 @@ def cmd_submit(a):
 
 
 def cmd_job(a):
-    _print(httpx.get(f"{_url()}/jobs/{a.id}", timeout=30).json())
+    _print(http.get(f"{_url()}/jobs/{a.id}").json())
 
 
 def cmd_status(a):
-    _print(httpx.get(f"{_url()}/status", timeout=30).json())
+    _print(http.get(f"{_url()}/status").json())
 
 
 def cmd_leaderboard(a):
-    _print(httpx.get(f"{_url()}/leaderboard", params={"tier": a.tier, "k": a.k}, timeout=30).json())
+    _print(http.get(f"{_url()}/leaderboard", params={"tier": a.tier, "k": a.k}).json())
 
 
 def cmd_board(a):
     if a.post:
-        _print(httpx.post(f"{_url()}/board", json={"agent": _agent(a), "text": a.post}, timeout=30).json())
+        _print(http.post(f"{_url()}/board", json={"agent": _agent(a), "text": a.post}).json())
         return
-    for m in httpx.get(f"{_url()}/board", params={"since": a.since, "limit": a.limit}, timeout=30).json():
+    for m in http.get(f"{_url()}/board", params={"since": a.since, "limit": a.limit}).json():
         print(f"[{time.strftime('%H:%M:%S', time.localtime(m['ts']))}] {m['agent']}: {m['text']}")
 
 

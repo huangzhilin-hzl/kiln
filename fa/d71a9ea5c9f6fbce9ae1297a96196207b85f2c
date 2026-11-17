@@ -1,0 +1,14 @@
+README.md
+  h_65d95dfcbf63bf 66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fad71a9ea5c9f6fbce9ae1297a96196207b85f2c",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}

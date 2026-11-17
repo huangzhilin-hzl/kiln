@@ -1,0 +1,38 @@
+README.md
+  h_65d95dfcbf63bf 53-68
+configs/dsv41_flash_h20.yaml
+  h_65d95dfcbf63bf 1-5,7,12-13,18,22-23,29,31,33-41,43,49
+kiln/bench/agentx.py
+  h_65d95dfcbf63bf 1-209
+kiln/cli.py
+  h_65d95dfcbf63bf 95-101,146-153
+kiln/config.py
+  h_65d95dfcbf63bf 16-18,22-25,30,32,48,50,66-69
+kiln/engine/base.py
+  h_65d95dfcbf63bf 22
+kiln/engine/factory.py
+  h_65d95dfcbf63bf 9-10,13,16-19
+kiln/engine/vllm_engine.py
+  h_65d95dfcbf63bf 8-10,14-15,23,28-51,56,66-70,103-118,161-163,169
+kiln/engine/vllm_ext.py
+  h_65d95dfcbf63bf 32-56,67-72,77-85,91,95-102
+kiln/engine/vllm_server.py
+  h_65d95dfcbf63bf 1-158
+kiln/server/jobs.py
+  h_65d95dfcbf63bf 42,112
+pyproject.toml
+  h_65d95dfcbf63bf 18
+tests/test_kiln.py
+  h_65d95dfcbf63bf 49-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2f238b93d0f3848191e14b5d605914b4b1fad2c6",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}

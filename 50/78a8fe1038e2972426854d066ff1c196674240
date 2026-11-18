@@ -1,0 +1,106 @@
+configs/dsv41_flash_h20_1node.yaml
+  s_46dc9d7aee3db8::t_134c9aed373b3e 38
+  s_46dc9d7aee3db8::t_0f715161259d1e 35-37
+  s_46dc9d7aee3db8::t_3e5df07fb0d6d1 39-41
+kiln/agents/launcher.py
+  s_46dc9d7aee3db8::t_14658fc3d249c2 3,13,22-33,40,46-53,55,60-61,66-68,70,76-80,85-88,92-95,99-108
+  s_46dc9d7aee3db8::t_ef68eeadaf14df 34-38
+  s_46dc9d7aee3db8::t_735bab5717ded1 39,69,71,89-91,96-98
+  s_46dc9d7aee3db8::t_901a1f357cc39b 72-75
+kiln/server/auth.py
+  s_46dc9d7aee3db8::t_14658fc3d249c2 1-7
+kiln/engine/vllm_server.py
+  s_46dc9d7aee3db8::t_ef68eeadaf14df 216-218,226-229,245-247
+  s_46dc9d7aee3db8::t_102bd2a4dba1a5 87
+  s_46dc9d7aee3db8::t_53ea9cfeb17c71 30,64,72-73,89
+  s_46dc9d7aee3db8::t_e2ead6727f2c44 37,42-43
+  s_46dc9d7aee3db8::t_134c9aed373b3e 11,18,20,29,62,79,204-207,210,213,215,219-224,233
+  s_46dc9d7aee3db8::t_d75f261b2732bf 10,56-60,83-86,88,144-197,199-201
+tests/test_regressions.py
+  s_46dc9d7aee3db8::t_e2ead6727f2c44 189-196
+  s_46dc9d7aee3db8::t_d3eb16d3357f63 271-299
+  s_46dc9d7aee3db8::t_53796041323a4d 187-188,197-270
+  s_46dc9d7aee3db8::t_bb9f6ba58602b0 1-186
+kiln/cli.py
+  s_46dc9d7aee3db8::t_14658fc3d249c2 12-13,16,20,36-49,98-110,113,122-168,187-196
+README.md
+  s_46dc9d7aee3db8::t_7ce117724b7675 121
+  s_46dc9d7aee3db8::t_991f41c04665da 74-87,97,115
+  s_46dc9d7aee3db8::t_735bab5717ded1 72,90-92,111
+  s_46dc9d7aee3db8::t_3a5da051c6ee02 71
+  s_46dc9d7aee3db8::t_038148cacf731b 73
+  s_46dc9d7aee3db8::t_f18598e82b67a0 88-89
+  s_46dc9d7aee3db8::t_5cf7de12340c47 93-96
+  s_46dc9d7aee3db8::t_216cdb7075dd5d 98-100,108-110
+  s_46dc9d7aee3db8::t_3c755895ba29f2 112
+  s_46dc9d7aee3db8::t_cdc8c2b4604fdd 114
+  s_46dc9d7aee3db8::t_507ef2aca9b276 116
+  s_46dc9d7aee3db8::t_cec295e2d93359 122
+configs/dsv41_flash_h20_1node_tp4.yaml
+  s_46dc9d7aee3db8::t_134c9aed373b3e 41
+  s_46dc9d7aee3db8::t_aee48fe5c7b70e 38-40
+  s_46dc9d7aee3db8::t_c8a50f14265244 42-44
+.gitignore
+  s_46dc9d7aee3db8::t_7ce117724b7675 2
+kiln/engine/base.py
+  s_46dc9d7aee3db8::t_134c9aed373b3e 15-22
+tests/test_kiln.py
+  s_46dc9d7aee3db8::t_f7ccc139c97451 157-170
+  s_46dc9d7aee3db8::t_4dddddf8912c23 13,66-156,171-258
+configs/v4_flash_h20_tp4.yaml
+  s_46dc9d7aee3db8::t_2c4e413d1e5d48 1-24
+kiln/server/app.py
+  s_46dc9d7aee3db8::t_14658fc3d249c2 4,6-7,9-10,16,33-62,64,66-72,74-82,86-94,106-108,123-148
+  s_46dc9d7aee3db8::t_bb2c53eec5cd7c 149
+pyproject.toml
+  s_46dc9d7aee3db8::t_735bab5717ded1 17
+  s_46dc9d7aee3db8::t_c0c14049902a83 18
+kiln/engine/vllm_engine.py
+  s_46dc9d7aee3db8::t_53ea9cfeb17c71 28-38,92-93,173,178-181
+  s_46dc9d7aee3db8::t_102bd2a4dba1a5 78-79
+  s_46dc9d7aee3db8::t_ab3204b575948c 77
+kiln/server/jobs.py
+  s_46dc9d7aee3db8::t_134c9aed373b3e 25,35,237-241
+  s_46dc9d7aee3db8::t_ef68eeadaf14df 188,191-193,371-372,477-480,536-537
+  s_46dc9d7aee3db8::t_3fe820b8004132 17,175,476,481-533,538-572
+  s_46dc9d7aee3db8::t_9fe44e47630b62 209,211,213,219,221-224,317,321
+  s_46dc9d7aee3db8::t_53ea9cfeb17c71 311-312
+  s_46dc9d7aee3db8::t_0daf2befddbce6 161,355-370,373-473
+  s_46dc9d7aee3db8::t_9c8b94bdfa1ae5 242-244
+  s_46dc9d7aee3db8::t_031e69d72be1b6 10,19,47-90,94-97,100-101,106,111-131,133-153,160,179,182,194-203,214-218,251,259,262,264,275-282,297,300,313-316,318-320,322-332,336-337,349,351
+  s_46dc9d7aee3db8::t_ffb83060d73b15 163-168
+  s_46dc9d7aee3db8::t_46b4447351635f 154-159,162,169-171,173-174,176-178,180-181,183-184,204-206,286,288,293-296,298-299,301-310,354,474,534-535,573-574
+scripts/smoke_vllm.py
+  s_46dc9d7aee3db8::t_f7ccc139c97451 32
+  s_46dc9d7aee3db8::t_204074494e6c02 19,27-30,33-51,61-62,66-67,73-78,80-81,83-85,89,95,98-99,102-103,106-119
+kiln/bench/agentx.py
+  s_46dc9d7aee3db8::t_134c9aed373b3e 157,162-166,202
+  s_46dc9d7aee3db8::t_ef68eeadaf14df 185-189,195
+  s_46dc9d7aee3db8::t_8652661be4d57a 10-16,34-35,37-38,42,46-96,102-106,111-112,114,117-118,120-121,123,128-139,144-146,167
+configs/dsv41_flash_h20.yaml
+  s_46dc9d7aee3db8::t_134c9aed373b3e 1-6,10-11,17,22-24,29-30,32-33,41-42,49,51,53
+kiln/bench/correctness.py
+  s_46dc9d7aee3db8::t_735bab5717ded1 18-20,27
+kiln/config.py
+  s_46dc9d7aee3db8::t_134c9aed373b3e 8-10,19,26,31-39
+  s_46dc9d7aee3db8::t_fdc8ae060f0c8e 40
+kiln/engine/vllm_ext.py
+  s_46dc9d7aee3db8::t_ab1e44758fd66c 61,68,73-74,76,82-83,85,92-98,101-110,114-115,194-197,202-203
+  s_46dc9d7aee3db8::t_102bd2a4dba1a5 192-193,198-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5078a8fe1038e2972426854d066ff1c196674240",
+  "prompts": {},
+  "sessions": {
+    "s_46dc9d7aee3db8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e892-396e-77d2-bbfc-52809c9b1744",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

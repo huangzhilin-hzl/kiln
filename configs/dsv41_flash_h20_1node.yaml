@@ -1,0 +1,50 @@
+# DeepSeek-V4.1-Flash on ONE 8x H20-3e node (SM90, 141 GB HBM3e/GPU = 1,128 GB total).
+# Recommended single-node mode: one persistent TP8 `vllm serve` engine shared by fast + slow tiers.
+#   - Everything (510 GB checkpoint + ~188 GiB Engram + 1M KV) stays 100% resident in HBM3e.
+#   - fast tier (`share_engine: slow`): replays 16 pre-tokenized AgentX requests via /v1/completions.
+#   - slow tier: runs the real AgentX harness against the exact same TP8 engine (serialized via lock).
+name: dsv41-flash-h20-1node-tp8
+engine:
+  kind: vllm_server
+  model: /path/to/DeepSeek-V4.1-Flash          # MXFP4/FP8 checkpoint (~510 GB; NVFP4 needs Blackwell)
+  tensor_parallel_size: 8
+  max_model_len: 1048576       # AgentX contexts are long (median >140k). If memory is tight use
+                               # 262144 + public_dataset semianalysis_cc_traces_weka_062126_256k
+  extra_args:
+    tokenizer_mode: deepseek_v41
+    trust_remote_code: true
+    gpu_memory_utilization: 0.88
+    enable_prefix_caching: true
+    speculative_config: {method: dspark, num_speculative_tokens: 5}
+tiers:
+  - name: fast
+    share_engine: slow         # shares slow's TP8 vllm serve instance (also works with smoke_vllm.py)
+    gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+    port: 8200
+    max_requests: 16           # fast replay over /v1/completions (~20-40s per candidate)
+    repeats: 3
+    trace_kernels: true
+    timeout_s: 900
+  - name: slow
+    engine_kind: vllm_server
+    gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+    port: 8200
+    repeats: 2                 # each repeat is one AgentX run
+    timeout_s: 3600
+    agentx:
+      concurrency: 8
+      public_dataset: semianalysis_cc_traces_weka_062126
+      random_seed: 42
+      benchmark_duration_s: 900   # null uses the AgentX harness default
+traffic_file: traffic/agentx.jsonl   # kiln agentx-export --tokenizer <model path> --max-context 262144
+correctness:
+  min_token_match: 0.90        # MXFP4 + spec decode drift on long greedy runs; GSM8K before deploy
+  num_prompts: 8
+  max_new_tokens: 32
+agents:
+  num_agents: 4
+  command: "codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -c shell_environment_policy.inherit=all -"
+  budget_hours: 24
+  respawn_on_exit: true
+workdir: runs
+server_url: http://127.0.0.1:8765

@@ -25,6 +25,17 @@ from .base import Engine, MeasureResult
 _BOOT_LOCK = threading.Lock()
 
 
+def _configure_torch_profiler(kwargs: dict, tier_name: str) -> str:
+    config = {**(kwargs.get("profiler_config") or {})}
+    directory = (config.get("torch_profiler_dir") or os.environ.get("VLLM_TORCH_PROFILER_DIR")
+                 or Path("runs/traces") / tier_name)
+    directory = Path(directory).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    config.update(profiler="torch", torch_profiler_dir=str(directory))
+    kwargs["profiler_config"] = config
+    return str(directory)
+
+
 def _summarize_trace(trace_dir: str | Path, top_k: int = 12) -> str:
     p = Path(trace_dir)
     files = sorted(p.glob("*.pt.trace.json*"), key=lambda f: f.stat().st_mtime)
@@ -63,11 +74,9 @@ class VLLMEngine(Engine):
     def _start(self) -> None:
         if self.tier.gpus:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.tier.gpus))
-        if self.tier.trace_kernels:
-            tdir = os.environ.get("VLLM_TORCH_PROFILER_DIR") or str(Path("runs/traces") / self.tier.name)
-            Path(tdir).mkdir(parents=True, exist_ok=True)
-            os.environ["VLLM_TORCH_PROFILER_DIR"] = tdir
-            self._trace_dir = tdir
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+        # A candidate can patch child forwards without changing vLLM's compile cache key.
+        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
         from vllm import LLM
 
         kwargs = dict(
@@ -80,6 +89,8 @@ class VLLMEngine(Engine):
         kwargs.update(self.cfg.extra_args)
         kwargs.update(self.tier.engine_overrides)
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        if self.tier.trace_kernels:
+            self._trace_dir = _configure_torch_profiler(kwargs, self.tier.name)
         if self.tier.num_layers is not None:
             kwargs["hf_overrides"] = {**kwargs.get("hf_overrides", {}),
                                       "num_hidden_layers": self.tier.num_layers}
@@ -159,13 +170,15 @@ class VLLMEngine(Engine):
 
     def _kernel_report(self, prompts) -> str | None:
         """Top kernels by CUDA time (fast tier only)."""
-        tdir = self._trace_dir or os.environ.get("VLLM_TORCH_PROFILER_DIR")
+        tdir = self._trace_dir
         if not tdir:
             return None
         from vllm import SamplingParams
         self.llm.start_profile()
-        self.llm.generate(prompts[:4], SamplingParams(max_tokens=32, ignore_eos=True), use_tqdm=False)
-        self.llm.stop_profile()
+        try:
+            self.llm.generate(prompts[:4], SamplingParams(max_tokens=32, ignore_eos=True), use_tqdm=False)
+        finally:
+            self.llm.stop_profile()
         return _summarize_trace(tdir)
 
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:

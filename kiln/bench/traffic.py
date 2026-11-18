@@ -18,7 +18,8 @@ class Request:
     output_len: int
 
 
-def load_traffic(path: str | Path, limit: int | None = None, tokenizer=None) -> list[Request]:
+def load_traffic(path: str | Path, limit: int | None = None, tokenizer=None,
+                 model_name: str | None = None) -> list[Request]:
     reqs: list[Request] = []
     for line in Path(path).read_text().splitlines():
         if not line.strip():
@@ -26,6 +27,9 @@ def load_traffic(path: str | Path, limit: int | None = None, tokenizer=None) -> 
         row = json.loads(line)
         ids = row.get("prompt_ids")
         if ids is None:
+            if tokenizer is None and model_name:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             if tokenizer is None:
                 raise ValueError("text prompts need a tokenizer")
             ids = tokenizer.encode(row["prompt"])

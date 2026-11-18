@@ -58,50 +58,61 @@ class HotReloadExt:
     # Attribute names must not collide with anything on vLLM's Worker (it asserts).
     _kiln_patched: list | None = None
     _kiln_module: types.ModuleType | None = None
+    _kiln_dirty: bool = False
 
     # ------------------------------------------------------------------ public RPCs
     def kiln_hot_reload(self, path: str) -> float:
         """Install candidate `path`, recompile + recapture. Returns seconds taken."""
         t0 = time.perf_counter()
         model = self.model_runner.get_model()
-        if self._kiln_patched is None:
-            self._kiln_patched = _snapshot_forwards(model)
-        else:
-            # Defensively clean up in case a previous run did not tear down cleanly.
-            _restore_forwards(self._kiln_patched)
+        self.kiln_teardown()
 
         name = f"kiln_candidate_{abs(hash((path, t0)))}"
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
+        self._kiln_patched = _snapshot_forwards(model)
+        self._kiln_module = mod
         sys.modules[name] = mod
+        rebuild_started = False
         try:
             spec.loader.exec_module(mod)
             new_fwd = mod.make_forward(model)
             if new_fwd is not None:
                 model.forward = new_fwd
+            rebuild_started = True
+            self._kiln_rebuild()
         except Exception:
-            _restore_forwards(self._kiln_patched)
-            sys.modules.pop(name, None)
+            self._kiln_restore_baseline(rebuild_started)
             raise
-        self._kiln_module = mod
-        self._kiln_rebuild()
         return time.perf_counter() - t0
 
     def kiln_teardown(self) -> float:
         """Restore baseline `.forward` across `model` and all submodules, then re-capture."""
         t0 = time.perf_counter()
-        model = self.model_runner.get_model()
+        if self._kiln_dirty:
+            raise RuntimeError("Kiln candidate rollback failed; restart the engine")
+        if self._kiln_patched is not None:
+            self._kiln_restore_baseline(rebuild=True)
+        return time.perf_counter() - t0
+
+    def _kiln_restore_baseline(self, rebuild: bool) -> None:
         mod = self._kiln_module
         try:
-            if mod is not None and hasattr(mod, "restore"):
-                mod.restore(model)
+            try:
+                if mod is not None and hasattr(mod, "restore"):
+                    mod.restore(self.model_runner.get_model())
+            finally:
+                _restore_forwards(self._kiln_patched)
+            if rebuild:
+                self._kiln_rebuild()
+        except Exception as exc:
+            self._kiln_dirty = True
+            raise RuntimeError("Kiln candidate rollback failed; restart the engine") from exc
         finally:
-            _restore_forwards(self._kiln_patched)
             if mod is not None:
                 sys.modules.pop(mod.__name__, None)
-                self._kiln_module = None
-        self._kiln_rebuild()
-        return time.perf_counter() - t0
+            self._kiln_module = None
+            self._kiln_patched = None
 
     def kiln_info(self) -> dict:
         r = self.model_runner
@@ -178,7 +189,15 @@ class HotReloadExt:
         self._kiln_release_graphs()
         unlock_workspace()
         runner = self.model_runner
-        with preserve_serving_state(runner):   # warmup writes go to the null KV block
-            runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-            self.compile_or_warm_up_model()
-        lock_workspace()
+        kv_cache = runner.extensible_kv_cache
+        committed_blocks = kv_cache.num_committed_blocks if kv_cache is not None else None
+        try:
+            with preserve_serving_state(runner):   # warmup writes go to the null KV block
+                runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+                self.compile_or_warm_up_model()
+                # Startup warmup shrinks the physical KV allocation. The live
+                # scheduler still owns the original block range after recapture.
+                if committed_blocks is not None:
+                    kv_cache.commit(committed_blocks)
+        finally:
+            lock_workspace()

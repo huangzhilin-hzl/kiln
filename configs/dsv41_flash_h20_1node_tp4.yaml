@@ -1,0 +1,53 @@
+# DeepSeek-V4.1-Flash on ONE 8x H20-3e node (SM90, 141 GB HBM3e/GPU) with CONCURRENT fast + slow tiers.
+# Uses `engram_config: {cpu_offload: true}` to move the ~188 GiB Engram tables into host RAM so each
+# TP4 instance holds ~315 GB (~79 GB/GPU) in VRAM.
+#   REQUIREMENT: >= 400 GB free pinned host RAM (2x ~188 GiB Engram tables). Lookups cross PCIe, so
+#   slow-tier throughput reflects PCIe-offloaded Engram rather than pure-HBM TP8.
+#   fast tier: GPUs 0-3, TP4, offline vllm, 16-request AgentX slice, no spec decode.
+#   slow tier: GPUs 4-7, TP4, `vllm serve` + DSpark + real AgentX harness (256k corpus).
+name: dsv41-flash-h20-1node-tp4
+engine:
+  kind: vllm
+  model: /path/to/DeepSeek-V4.1-Flash          # MXFP4/FP8 checkpoint (~510 GB total; ~315 GB w/ Engram offloaded)
+  tensor_parallel_size: 4
+  max_model_len: 262144
+  extra_args:
+    tokenizer_mode: deepseek_v41
+    trust_remote_code: true
+    gpu_memory_utilization: 0.88
+    enable_prefix_caching: true
+    engram_config: {cpu_offload: true}
+    speculative_config: {method: dspark, num_speculative_tokens: 5}
+tiers:
+  - name: fast
+    engine_kind: vllm
+    gpus: [0, 1, 2, 3]
+    max_requests: 16
+    repeats: 3
+    trace_kernels: true
+    timeout_s: 900
+    engine_overrides:
+      speculative_config: null
+  - name: slow
+    engine_kind: vllm_server
+    gpus: [4, 5, 6, 7]
+    port: 8200
+    repeats: 2
+    timeout_s: 3600
+    agentx:
+      concurrency: 8
+      public_dataset: semianalysis_cc_traces_weka_062126_256k
+      random_seed: 42
+      benchmark_duration_s: 900
+traffic_file: traffic/agentx.jsonl   # kiln agentx-export --tokenizer <model path> --max-context 262144
+correctness:
+  min_token_match: 0.90
+  num_prompts: 8
+  max_new_tokens: 32
+agents:
+  num_agents: 4
+  command: "codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -c shell_environment_policy.inherit=all -"
+  budget_hours: 24
+  respawn_on_exit: true
+workdir: runs
+server_url: http://127.0.0.1:8765

@@ -12,6 +12,14 @@ from dataclasses import dataclass, field
 from kiln.bench.traffic import Request
 
 
+class InvalidBenchmark(ValueError):
+    """A completed measurement that cannot be scored."""
+
+    def __init__(self, message: str, extra: dict):
+        super().__init__(message)
+        self.extra = extra
+
+
 @dataclass
 class MeasureResult:
     decode_tps: float                  # output tokens / s during pure-decode phase

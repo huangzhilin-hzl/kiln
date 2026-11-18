@@ -14,9 +14,22 @@ replace `ChipSpec` numbers with *measured* GEMM / HBM / collective throughput
 from __future__ import annotations
 
 import itertools
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 GB = 1e9
+
+
+@dataclass
+class EmpiricalCurves:
+    """Measured hardware curves from `kiln probe` (TKCC §4.3 Level 2)."""
+    bf16_tflops_by_m: list[tuple[int, float]] = field(default_factory=list)
+    fp8_tflops_by_m: list[tuple[int, float]] = field(default_factory=list)
+    fp4_tflops_by_m: list[tuple[int, float]] = field(default_factory=list)
+    fp4_native_tc: bool = False
+    moe_roofline_eff_by_tokens: list[tuple[int, float]] = field(default_factory=list)
+    allreduce_by_k: dict[int, list[tuple[int, float]]] = field(default_factory=dict)
+    alltoall_by_k: dict[int, list[tuple[int, float]]] = field(default_factory=dict)
+    cudagraph_per_kernel_s: float = 0.0
 
 
 @dataclass
@@ -31,13 +44,18 @@ class ChipSpec:
     bw_eff: float = 0.8
     link_eff: float = 0.7
     max_chips: int = 8        # chips reachable at link_bw (e.g. one NVL8 node)
+    fp8_scale: float = 2.0    # FP8 / BF16 Tensor Core ratio (datasheet=2.0, or calibrated)
+    empirical: EmpiricalCurves | None = None
 
 
 CHIPS = {
     "H100": ChipSpec("H100", 989e12, 3.35e12, 80 * GB, 450 * GB),
+    "H20-3e": ChipSpec("H20-3e", 148e12, 4.0e12, 141 * GB, 450 * GB),
     "B200": ChipSpec("B200", 2250e12, 8.0e12, 180 * GB, 900 * GB),
+    "B300": ChipSpec("B300", 2250e12, 8.0e12, 288 * GB, 900 * GB),
     "MI355X": ChipSpec("MI355X", 2500e12, 8.0e12, 288 * GB, 538 * GB),
 }
+CHIPS["h20-3e"] = CHIPS["H20-3e"]
 
 
 @dataclass
@@ -57,6 +75,10 @@ class ModelSpec:
     bytes_per_param: float = 2.0
     kv_bytes: float = 2.0
     mtp_accept: float = 1.0     # tokens per decode step (speculative / MTP acceptance)
+    # Optional architectural overrides (e.g. DeepSeek-V4.1-Flash CED + CSA2 + Engram):
+    total_weight_bytes: float | None = None
+    prefill_layer_frac: float = 1.0
+    kv_bytes_per_tok: float | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -79,6 +101,8 @@ class ModelSpec:
         return self.ffn_params_total()
 
     def kv_bytes_per_token(self) -> float:
+        if self.kv_bytes_per_tok is not None:
+            return self.kv_bytes_per_tok
         return self.layers * 2 * self.kv_heads * self.head_dim * self.kv_bytes
 
 
@@ -147,22 +171,64 @@ def prune(m: ModelSpec, c: ParallelConfig, chip: ChipSpec) -> str | None:
 
 def weight_bytes_per_chip(m: ModelSpec, c: ParallelConfig) -> float:
     attn = m.attn_params() / c.attn_tp
-    ffn = m.ffn_params_total() / c.n
     emb = 2 * m.vocab * m.hidden / c.attn_tp
+    if m.total_weight_bytes is not None:
+        attn_emb_total = (m.layers * m.attn_params() + 2 * m.vocab * m.hidden) * m.bytes_per_param
+        routed_bytes = max(0.0, m.total_weight_bytes - attn_emb_total)
+        return (m.layers * attn + emb) * m.bytes_per_param + routed_bytes / c.n
+    ffn = m.ffn_params_total() / c.n
     return (m.layers * (attn + ffn) + emb) * m.bytes_per_param
 
 
 # --------------------------------------------------------------------------- per-pass time
+def _interp_linear(pts: list[tuple[int, float]], x: float) -> float:
+    if x <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in itertools.pairwise(pts):
+        if x <= x1:
+            return y0 + (x - x0) / max(x1 - x0, 1e-12) * (y1 - y0)
+    return pts[-1][1]
+
+
+def _interp_comm(pts: list[tuple[int, float]], bytes_: float, asymp_factor: float, eff_bw: float) -> float:
+    if bytes_ <= pts[0][0]:
+        return pts[0][1]
+    if bytes_ <= pts[-1][0]:
+        return _interp_linear(pts, bytes_)
+    return pts[-1][1] + asymp_factor * (bytes_ - pts[-1][0]) / max(eff_bw, 1.0)
+
+
 def _allreduce(bytes_: float, k: int, chip: ChipSpec) -> float:
     if k <= 1:
         return 0.0
+    pts = chip.empirical.allreduce_by_k.get(k) if chip.empirical else None
+    if pts:
+        return _interp_comm(pts, bytes_, 2 * (k - 1) / k, chip.link_bw * chip.link_eff)
     return 2 * (k - 1) / k * bytes_ / (chip.link_bw * chip.link_eff) + 2 * chip.link_latency
 
 
 def _alltoall(bytes_: float, k: int, chip: ChipSpec) -> float:
     if k <= 1:
         return 0.0
+    pts = chip.empirical.alltoall_by_k.get(k) if chip.empirical else None
+    if pts:
+        return _interp_comm(pts, bytes_, (k - 1) / k, chip.link_bw * chip.link_eff)
     return (k - 1) / k * bytes_ / (chip.link_bw * chip.link_eff) + chip.link_latency
+
+
+def _compute_ceiling(m: ModelSpec, chip: ChipSpec, tok_attn: int, prefill: bool) -> float:
+    emp = chip.empirical
+    if emp is not None:
+        curve = emp.bf16_tflops_by_m
+        if m.bytes_per_param <= 0.6 and emp.fp4_native_tc and emp.fp4_tflops_by_m:
+            curve = emp.fp4_tflops_by_m
+        elif m.bytes_per_param <= 1.0 and emp.fp8_tflops_by_m:
+            curve = emp.fp8_tflops_by_m
+        if curve:
+            tflops = _interp_linear(curve, tok_attn) if prefill else curve[-1][1]
+            return max(1e9, tflops * 1e12)
+    fp_scale = chip.fp8_scale if m.bytes_per_param <= 1.0 else 1.0   # FP8 Tensor Core speedup over BF16
+    return chip.flops * fp_scale * chip.flops_eff
 
 
 def pass_time(m: ModelSpec, c: ParallelConfig, chip: ChipSpec, batch: int,
@@ -171,14 +237,15 @@ def pass_time(m: ModelSpec, c: ParallelConfig, chip: ChipSpec, batch: int,
     seqs_per_dp = max(1, -(-batch // c.attn_dp))
     tok_attn = seqs_per_dp * tokens_per_seq           # tokens one attention group processes
     tok_total = batch * tokens_per_seq
-    act = m.bytes_per_param
-    F, BW = chip.flops * chip.flops_eff, chip.hbm_bw * chip.bw_eff
+    act = max(1.0, m.bytes_per_param)
+    F, BW = _compute_ceiling(m, chip, tok_attn, prefill), chip.hbm_bw * chip.bw_eff
 
     # attention projections + score/value matmuls
     attn_flops = 2 * tok_attn * m.attn_params() / c.attn_tp
     attn_flops += 4 * tok_attn * ctx_len * m.heads * m.head_dim / c.attn_tp
     attn_bytes = m.attn_params() * m.bytes_per_param / c.attn_tp
-    attn_bytes += seqs_per_dp * ctx_len * 2 * m.kv_heads * m.head_dim * m.kv_bytes / max(1, min(c.attn_tp, m.kv_heads))
+    kv_per_layer = m.kv_bytes_per_token() / max(m.layers, 1)
+    attn_bytes += seqs_per_dp * ctx_len * kv_per_layer / max(1, min(c.attn_tp, m.kv_heads))
 
     # FFN / MoE (per chip share of total routed work)
     ffn_flops = 2 * tok_total * m.ffn_params_active() / c.n
@@ -189,10 +256,17 @@ def pass_time(m: ModelSpec, c: ParallelConfig, chip: ChipSpec, batch: int,
     else:
         ffn_bytes = m.ffn_params_total() * m.bytes_per_param / c.n
 
+    emp = chip.empirical
+    moe_eff = 1.0
+    if m.is_moe and emp is not None and emp.moe_roofline_eff_by_tokens:
+        moe_eff = max(0.05, _interp_linear(emp.moe_roofline_eff_by_tokens, tok_total))
+
     if prefill:
-        t_layer = (attn_flops + ffn_flops) / F                      # compute-bound
+        t_layer = attn_flops / F + (ffn_flops / F) / moe_eff        # compute-bound
     else:
-        t_layer = max(attn_flops / F, attn_bytes / BW) + max(ffn_flops / F, ffn_bytes / BW)
+        t_layer = max(attn_flops / F, attn_bytes / BW) + max(ffn_flops / F, ffn_bytes / BW) / moe_eff
+    if emp is not None and emp.cudagraph_per_kernel_s > 0:
+        t_layer = max(t_layer, 8.0 * emp.cudagraph_per_kernel_s)
 
     comm = _allreduce(tok_attn * m.hidden * act, c.attn_tp, chip)
     if m.is_moe and c.moe_ep > 1:
@@ -201,8 +275,9 @@ def pass_time(m: ModelSpec, c: ParallelConfig, chip: ChipSpec, batch: int,
     if c.n > chip.max_chips:          # crude cross-node penalty
         comm *= 4
 
+    eff_layers = m.layers * (m.prefill_layer_frac if prefill else 1.0)
     lm_head = 2 * tok_attn * m.vocab * m.hidden / c.attn_tp / F
-    return m.layers * (t_layer + comm) + lm_head
+    return eff_layers * (t_layer + comm) + lm_head
 
 
 # --------------------------------------------------------------------------- throughput
@@ -276,4 +351,14 @@ MODELS = {
                                head_dim=128, vocab=128256, ffn_inter=28672),
     "qwen3-30b-a3b": ModelSpec("qwen3-30b-a3b", layers=48, hidden=2048, heads=32, kv_heads=4,
                                head_dim=128, vocab=151936, experts=128, top_k=8, expert_inter=768),
+    # 552B MoE (MXFP4 experts + FP8 dense) + 196.6B FP8 Engram (~510 GB checkpoint),
+    # 20 causal encoder + 20 decoder layers, CSA2 + FP4 KV (~890 B/tok), DSpark 5-tok spec decode.
+    "deepseek-v4.1-flash": ModelSpec(
+        "deepseek-v4.1-flash", layers=40, hidden=5120, heads=64, kv_heads=1, head_dim=128,
+        vocab=129280, experts=256, top_k=8, expert_inter=2304, shared_experts=1,
+        bytes_per_param=0.7, kv_bytes=0.5, mtp_accept=3.2,
+        total_weight_bytes=510 * GB, prefill_layer_frac=0.5, kv_bytes_per_tok=890.0,
+    ),
 }
+MODELS["deepseek4.1-flash"] = MODELS["deepseek-v4.1-flash"]
+MODELS["dsv41-flash"] = MODELS["deepseek-v4.1-flash"]

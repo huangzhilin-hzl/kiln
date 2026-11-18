@@ -1,15 +1,19 @@
 """HTTP API used by agents (via the `kiln` CLI or curl)."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import asdict
+from hmac import compare_digest
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field, FiniteFloat
 
 from kiln.bench.traffic import load_traffic
 from kiln.config import RunConfig
 
 from .board import Board
+from .auth import auth_headers
 from .jobs import JobManager
 
 
@@ -26,20 +30,68 @@ class PostReq(BaseModel):
     kind: str = "note"
 
 
-def create_app(run: RunConfig) -> FastAPI:
-    requests = load_traffic(run.traffic_file)
-    mgr = JobManager(run, requests)
-    board = Board(mgr.root / "board.jsonl")
-    app = FastAPI(title="kiln")
+class HeartbeatReq(BaseModel):
+    worker_id: str = Field(min_length=1)
+    attempt_id: str | None = None
+    ready: bool
+    baseline_tps: FiniteFloat | None = None
+    crashes: int = 0
 
-    @app.on_event("startup")
-    def _start():
+
+class CompleteReq(BaseModel):
+    id: str
+    worker_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    status: Literal["done", "incorrect", "invalid", "crashed"]
+    speedup: FiniteFloat | None = None
+    decode_tps: FiniteFloat | None = None
+    prefill_tps: FiniteFloat | None = None
+    variance_pct: FiniteFloat | None = None
+    token_match: FiniteFloat | None = None
+    kernel_report: str | None = None
+    extra: dict = Field(default_factory=dict)
+    error: str | None = None
+    crashes: int | None = None
+
+
+def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
+    if run.hw_profile:
+        run.resolve_hw_profile()
+    tok_name = None if run.engine.kind == "mock" else (run.engine.tokenizer or run.engine.model)
+    requests = load_traffic(run.traffic_file, model_name=tok_name)
+    mgr = JobManager(run, requests, local_tiers=local_tiers)
+    board = Board(mgr.root / "board.jsonl")
+    expected_auth = auth_headers().get("Authorization")
+
+    def authenticate(authorization: Annotated[str | None, Header()] = None):
+        if expected_auth and not compare_digest((authorization or "").encode(), expected_auth.encode()):
+            raise HTTPException(401, "A valid bearer token is required",
+                                headers={"WWW-Authenticate": "Bearer"})
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
         mgr.start()
+        yield
+
+    app = FastAPI(title="kiln", lifespan=lifespan, dependencies=[Depends(authenticate)])
+
+    def require_remote(tier: str) -> None:
+        if tier not in mgr.tiers:
+            raise HTTPException(404, f"unknown tier {tier}")
+        if mgr.tiers[tier].local:
+            raise HTTPException(409, f"tier {tier} runs locally")
 
     @app.get("/status")
     def status():
-        return {"run": run.name, "tiers": [w.stats() for w in mgr.tiers.values()],
-                "jobs": len(mgr.jobs)}
+        return mgr.status()
+
+    @app.get("/hardware")
+    def hardware():
+        path = run.resolve_hw_profile()
+        if path is None:
+            return {"available": False, "profile": None}
+        from kiln.costmodel.probe import HardwareProfile
+        return {"available": True, "path": str(path), "profile": HardwareProfile.load(path).to_dict()}
 
     @app.post("/jobs")
     def submit(req: SubmitReq):
@@ -51,10 +103,10 @@ def create_app(run: RunConfig) -> FastAPI:
 
     @app.get("/jobs/{jid}")
     def get_job(jid: str):
-        job = mgr.jobs.get(jid)
-        if not job:
+        try:
+            return mgr.get_job(jid)
+        except KeyError:
             raise HTTPException(404, "no such job")
-        return asdict(job)
 
     @app.get("/leaderboard")
     def leaderboard(tier: str = "slow", k: int = 10):
@@ -67,6 +119,33 @@ def create_app(run: RunConfig) -> FastAPI:
     @app.get("/board")
     def read(since: float = 0.0, limit: int = 200):
         return board.read(since, limit)
+
+    # ------------------------------------------------------ multi-node worker RPCs
+    @app.get("/workers/{tier}/requests")
+    def worker_requests(tier: str):
+        require_remote(tier)
+        return [asdict(r) for r in mgr.requests]
+
+    @app.post("/workers/{tier}/heartbeat")
+    def worker_heartbeat(tier: str, req: HeartbeatReq):
+        require_remote(tier)
+        mgr.heartbeat_remote(tier, **req.model_dump())
+        return {"ok": True}
+
+    @app.post("/workers/{tier}/claim")
+    def worker_claim(tier: str, worker_id: Annotated[str, Query(min_length=1)],
+                     wait_s: Annotated[float, Query(ge=0, le=10)] = 2.0):
+        require_remote(tier)
+        return {"job": mgr.claim_remote(tier, worker_id, wait_s=wait_s)}
+
+    @app.post("/workers/{tier}/complete")
+    def worker_complete(tier: str, data: CompleteReq):
+        require_remote(tier)
+        try:
+            mgr.complete_remote(tier, data.model_dump(exclude_unset=True))
+        except (KeyError, ValueError):
+            raise HTTPException(409, "Unknown job, stale claim, or invalid completion")
+        return {"ok": True}
 
     app.state.mgr, app.state.board = mgr, board
     return app

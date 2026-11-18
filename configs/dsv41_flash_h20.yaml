@@ -1,35 +1,36 @@
-# DeepSeek-V4.1-Flash on one 8x H20-3e node (SM90, 141 GB HBM3e each), vLLM main, AgentX workload.
-#   fast tier: GPUs 0-3, TP4, first 8 layers, offline replay of AgentX-derived requests
-#              (kiln agentx-export), no spec decode -> quick crash/regression filter
-#   slow tier: GPUs 4-7, TP4, full model + DSpark, `vllm serve` measured by the REAL AgentX
-#              harness (agentx-harness 1.0.12, public 393-trace corpus, seed 42) -> the score
-# If the full model does not fit at TP4 on your checkpoint, use two nodes (slow tier TP8).
+# DeepSeek-V4.1-Flash on 2x8 H20-3e GPUs (SM90, 141 GB HBM3e/GPU = 1,128 GB/node), vLLM main, AgentX + Codex.
+#   Node 0 (8x H20-3e, TP8): job server + fast tier (full 40-layer CED/CSA2 model, 16-request AgentX slice,
+#                            kernel profiler, no spec decode) + 4 parallel Codex agents.
+#   Node 1 (8x H20-3e, TP8): slow tier via `kiln worker --tier slow --server http://<NODE0_IP>:8765`
+#                            (`vllm serve` + DSpark + real AgentX harness, 393-trace corpus, seed 42).
+#   (If all 16 GPUs live on a single host, change slow.gpus to [8,9,10,11,12,13,14,15] and run `kiln serve`.)
 name: dsv41-flash-h20-agentx
 engine:
   kind: vllm
-  model: /path/to/DeepSeek-V4.1-Flash          # MXFP4 checkpoint (NVFP4 needs Blackwell)
-  tensor_parallel_size: 4
+  model: /path/to/DeepSeek-V4.1-Flash          # MXFP4/FP8 checkpoint (~510 GB; NVFP4 needs Blackwell)
+  tensor_parallel_size: 8
   max_model_len: 1048576       # AgentX contexts are long (median >140k). If memory is tight use
                                # 262144 + public_dataset semianalysis_cc_traces_weka_062126_256k
   extra_args:
     tokenizer_mode: deepseek_v41
     trust_remote_code: true
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.88
     enable_prefix_caching: true
     speculative_config: {method: dspark, num_speculative_tokens: 5}
 tiers:
   - name: fast
-    engine_kind: vllm          # offline LLM, replays traffic_file
-    num_layers: 8
-    gpus: [0, 1, 2, 3]
+    engine_kind: vllm          # Node 0: offline LLM, replays max_requests from traffic_file on all 40 layers
+    gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+    max_requests: 16           # keeps fast-tier jobs short without breaking 20+20 CED / kv_source_layer_ids
     repeats: 3
     trace_kernels: true
     timeout_s: 900
     engine_overrides:
-      speculative_config: null # truncated model + DSpark draft is unsafe
+      max_model_len: 262144
+      speculative_config: null # isolate base-model forward gains & speed up hot-reload graph capture
   - name: slow
-    engine_kind: vllm_server   # vllm serve + AgentX harness
-    gpus: [4, 5, 6, 7]
+    engine_kind: vllm_server   # Node 1: `vllm serve` + DSpark + real AgentX harness
+    gpus: [0, 1, 2, 3, 4, 5, 6, 7]
     port: 8200
     repeats: 2                 # each repeat is one AgentX run
     timeout_s: 3600
@@ -37,15 +38,16 @@ tiers:
       concurrency: 8           # sessions; compile once per parallel config, check several later
       public_dataset: semianalysis_cc_traces_weka_062126
       random_seed: 42
-      benchmark_duration_s: 600   # null = full-corpus replay (exact InferenceX protocol, slow)
-traffic_file: traffic/agentx.jsonl   # kiln agentx-export --tokenizer <model path>
+      benchmark_duration_s: 900   # null uses the AgentX harness default
+traffic_file: traffic/agentx.jsonl   # kiln agentx-export --tokenizer <model path> --max-context 262144
 correctness:
   min_token_match: 0.90        # MXFP4 + spec decode drift on long greedy runs; GSM8K before deploy
   num_prompts: 8
   max_new_tokens: 32
 agents:
   num_agents: 4
-  command: "claude -p --dangerously-skip-permissions"
+  command: "codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -c shell_environment_policy.inherit=all -"
   budget_hours: 24
+  respawn_on_exit: true
 workdir: runs
-server_url: http://127.0.0.1:8765
+server_url: http://0.0.0.0:8765

@@ -15,14 +15,15 @@ class CorrectnessResult:
 
 def compare_tokens(baseline: list[list[int]], candidate: list[list[int]],
                    cfg: CorrectnessConfig) -> CorrectnessResult:
+    if len(candidate) != len(baseline):
+        return CorrectnessResult(False, 0.0,
+                                 f"expected {len(baseline)} outputs, received {len(candidate)}")
     total = match = 0
     for b, c in zip(baseline, candidate):
-        # Compare up to first divergence + rest; greedy decoding diverges after one flip,
-        # so we count per-position matches but also report the first-divergence index.
         n = min(len(b), len(c))
         total += max(len(b), len(c))
         match += sum(1 for i in range(n) if b[i] == c[i])
     frac = match / total if total else 0.0
-    ok = frac >= cfg.min_token_match
+    ok = total > 0 and frac >= cfg.min_token_match
     return CorrectnessResult(ok=ok, token_match=frac,
                              detail=f"token match {frac:.4f} (min {cfg.min_token_match})")

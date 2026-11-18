@@ -1,0 +1,24 @@
+# DeepSeek V4 Flash fast-tier baseline on four H20-3e GPUs.
+name: v4-flash-h20-tp4
+engine:
+  kind: vllm_server
+  model: /home/shared/models/deepseek-ai/DeepSeek-V4-Flash
+  tensor_parallel_size: 4
+  max_model_len: 65536
+  extra_args:
+    tokenizer_mode: deepseek_v4
+    trust_remote_code: true
+    kv_cache_dtype: fp8
+    block_size: 256
+    gpu_memory_utilization: 0.85
+    enable_prefix_caching: true
+tiers:
+  - name: fast
+    gpus: [0, 1, 2, 3]
+    max_requests: 16
+    repeats: 3
+    trace_kernels: true
+    timeout_s: 900
+traffic_file: traffic/v4-flash-fast.jsonl
+correctness:
+  min_token_match: 1.0

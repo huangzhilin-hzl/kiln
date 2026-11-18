@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from kiln.bench.agentx import AgentXConfig
 
 
 class TierConfig(BaseModel):
@@ -14,16 +16,27 @@ class TierConfig(BaseModel):
     num_layers: int | None = None
     gpus: list[int] = Field(default_factory=list)
     max_requests: int | None = None  # cap offline traffic replay count (useful when keeping all layers)
-    repeats: int = 3                 # back-to-back measurements per job
+    repeats: int = Field(default=3, ge=1)  # back-to-back measurements per job
     trace_kernels: bool = False      # CUPTI / torch.profiler kernel report
     # Extra LLM(...) kwargs for this tier only, merged over engine.extra_args.
     # e.g. fast tier: {speculative_config: null} -- truncated models break MTP/DSpark layers.
     engine_overrides: dict = Field(default_factory=dict)
     # Per-tier engine kind (defaults to engine.kind). "vllm_server" = `vllm serve` + AgentX harness.
     engine_kind: Literal["mock", "vllm", "vllm_server"] | None = None
+    share_engine: str | None = None              # reuse another local tier's engine (single-node mode)
     port: int | None = None                      # vllm_server only
     agentx: dict | None = None                   # vllm_server only: AgentXConfig fields
     timeout_s: float = 600.0
+
+    @field_validator("agentx")
+    @classmethod
+    def validate_agentx(cls, value: dict | None) -> dict | None:
+        if value is not None:
+            try:
+                AgentXConfig(**value)
+            except TypeError as exc:
+                raise ValueError(str(exc)) from exc
+        return value
 
 
 class EngineConfig(BaseModel):
@@ -60,12 +73,25 @@ class RunConfig(BaseModel):
     traffic_file: str = "traffic/sample.jsonl"
     correctness: CorrectnessConfig = Field(default_factory=CorrectnessConfig)
     agents: AgentConfig = Field(default_factory=AgentConfig)
+    hw_profile: str | None = None    # optional `kiln probe` JSON (auto-discovered in workdir if unset)
     workdir: str = "runs"
     server_url: str = "http://127.0.0.1:8765"
 
     @property
     def client_url(self) -> str:
         return self.server_url.replace("://0.0.0.0:", "://127.0.0.1:")
+
+    def resolve_hw_profile(self) -> Path | None:
+        if self.hw_profile:
+            p = Path(self.hw_profile)
+            if not p.exists():
+                raise FileNotFoundError(f"Configured hw_profile does not exist: {p}")
+            return p
+        for cand in (Path(self.workdir) / self.name / "hw_profile.json",
+                     Path(self.workdir) / "hw_profile.json"):
+            if cand.exists():
+                return cand
+        return None
 
     @classmethod
     def load(cls, path: str | Path) -> "RunConfig":

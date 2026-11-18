@@ -14,8 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["vllm>=0.8", "torch>=2.5"]
-agentx = ["agentx-harness==1.0.12", "datasets", "transformers"]   # version pinned in the TKCC paper
+gpu = ["vllm==0.34.0rc1.dev677+g20d8574ef", "torch==2.14.0"]
+agentx = ["agentx-harness==1.0.12", "huggingface_hub", "transformers"]   # version pinned in the TKCC paper
 dev = ["pytest>=8"]
 
 [project.scripts]

@@ -60,6 +60,38 @@ COMM_BYTES = [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024,
               1 * MIB, 4 * MIB, 16 * MIB, 64 * MIB, 256 * MIB]
 
 
+def _fmt_size(b: int) -> str:
+    if b >= GIB and b % GIB == 0:
+        return f"{b // GIB} GiB"
+    if b >= MIB and b % MIB == 0:
+        return f"{b // MIB} MiB"
+    if b >= 1024 and b % 1024 == 0:
+        return f"{b // 1024} KiB"
+    return f"{b} B"
+
+
+def _row_bytes(r: dict) -> int:
+    if "bytes" in r:
+        return int(r["bytes"])
+    if "size_mib" in r:
+        return int(round(float(r["size_mib"]) * MIB))
+    num_s, _, unit = str(r.get("size", "0")).strip().partition(" ")
+    mult = {"B": 1, "KIB": 1024, "KB": 1000, "MIB": MIB, "MB": 10**6, "GIB": GIB, "GB": 10**9}.get(unit.upper(), 1)
+    return int(round(float(num_s) * mult))
+
+
+def _topo_hbm_bytes(t: dict) -> float:
+    return float(t["hbm_gb"]) * GB if "hbm_gb" in t else float(t.get("hbm_bytes", 80 * GB))
+
+
+def _topo_free_bytes(t: dict) -> int:
+    return int(float(t["free_hbm_gb"]) * GB) if "free_hbm_gb" in t else int(t.get("free_hbm_bytes", 0))
+
+
+def _topo_l2_bytes(t: dict) -> int:
+    return int(float(t["l2_cache_mib"]) * MIB) if "l2_cache_mib" in t else int(t.get("l2_cache_bytes", 50 * MIB))
+
+
 def _match_spec(device_name: str) -> dict | None:
     up = device_name.upper()
     for key, spec in _SPEC_DB:
@@ -191,9 +223,9 @@ class HardwareProfile:
         for k_str, g in (self.comm.get("groups") or {}).items():
             k = int(k_str)
             if g.get("all_reduce"):
-                ar_by_k[k] = sorted((int(r["bytes"]), float(r["lat_us"]) * 1e-6) for r in g["all_reduce"])
+                ar_by_k[k] = sorted((_row_bytes(r), float(r["lat_us"]) * 1e-6) for r in g["all_reduce"])
             if g.get("all_to_all"):
-                a2a_by_k[k] = sorted((int(r["bytes"]), float(r["lat_us"]) * 1e-6) for r in g["all_to_all"])
+                a2a_by_k[k] = sorted((_row_bytes(r), float(r["lat_us"]) * 1e-6) for r in g["all_to_all"])
 
         fp4_info = dtypes.get("fp4") or {}
         emp = EmpiricalCurves(
@@ -206,13 +238,18 @@ class HardwareProfile:
             alltoall_by_k=a2a_by_k,
             cudagraph_per_kernel_s=float(self.overhead.get("cudagraph_per_kernel_us", 0.0)) * 1e-6,
         )
+        flops = float(cc["tflops"]) * 1e12 if "tflops" in cc else float(cc["flops"])
+        hbm_bw = float(cc["hbm_bw_gbps"]) * 1e9 if "hbm_bw_gbps" in cc else float(cc["hbm_bw"])
+        hbm_bytes = float(cc["hbm_gb"]) * GB if "hbm_gb" in cc else float(cc["hbm_bytes"])
+        link_bw = float(cc["link_bw_gbps"]) * 1e9 if "link_bw_gbps" in cc else float(cc["link_bw"])
+        link_lat = float(cc["link_latency_us"]) * 1e-6 if "link_latency_us" in cc else float(cc["link_latency_s"])
         return ChipSpec(
             name=str(cc.get("name", self.topology.get("device_name", "probed-gpu"))),
-            flops=float(cc["flops"]),
-            hbm_bw=float(cc["hbm_bw"]),
-            hbm_bytes=float(cc["hbm_bytes"]),
-            link_bw=float(cc["link_bw"]),
-            link_latency=float(cc["link_latency_s"]),
+            flops=flops,
+            hbm_bw=hbm_bw,
+            hbm_bytes=hbm_bytes,
+            link_bw=link_bw,
+            link_latency=link_lat,
             flops_eff=float(cc["flops_eff"]),
             bw_eff=float(cc["bw_eff"]),
             link_eff=float(cc["link_eff"]),
@@ -238,8 +275,8 @@ class HardwareProfile:
 
         # 1. Topology
         ngpu = t.get("num_gpus", 1)
-        hbm_gb = t.get("hbm_bytes", 0) / GB
-        l2_mb = t.get("l2_cache_bytes", 0) / MIB
+        hbm_gb = _topo_hbm_bytes(t) / GB
+        l2_mb = _topo_l2_bytes(t) / MIB
         lines.append("## 1. Node & GPU Topology")
         lines.append(
             f"- **GPU:** {ngpu}× `{t.get('device_name', 'unknown')}` "
@@ -341,10 +378,10 @@ class HardwareProfile:
                 )
                 lines.append("| Message Size | AllReduce Lat (µs) | AllReduce BusBW (GB/s) | AllToAll Lat (µs) | AllToAll BusBW (GB/s) |")
                 lines.append("|---:|---:|---:|---:|---:|")
-                ar_map = {int(r["bytes"]): r for r in g.get("all_reduce", ())}
-                a2a_map = {int(r["bytes"]): r for r in g.get("all_to_all", ())}
+                ar_map = {_row_bytes(r): r for r in g.get("all_reduce", ())}
+                a2a_map = {_row_bytes(r): r for r in g.get("all_to_all", ())}
                 for b in sorted(set(ar_map) | set(a2a_map)):
-                    label = f"{b // MIB} MiB" if b >= MIB else f"{b // 1024} KiB"
+                    label = _fmt_size(b)
                     ar = ar_map.get(b)
                     a2a = a2a_map.get(b)
                     ar_c = f"{ar['lat_us']:,.1f} | {ar['busbw_gbps']:,.1f}" if ar else "— | —"
@@ -383,7 +420,7 @@ class HardwareProfile:
         parts = [f"\n## Hardware & Roofline Reference{tag}"]
         parts.append(
             f"- GPU: {t.get('num_gpus', 1)}× {t.get('device_name', '?')} ({t.get('arch', '?')}, "
-            f"{t.get('sm_count', '?')} SMs, {t.get('l2_cache_bytes', 0) / MIB:.0f} MiB L2, "
+            f"{t.get('sm_count', '?')} SMs, {_topo_l2_bytes(t) / MIB:.0f} MiB L2, "
             f"HBM achieved `{bw.get('hbm_peak_achieved_gbps', 0):,.0f} GB/s`, "
             f"L2 `{bw.get('l2_gbps', 0):,.0f} GB/s`, PCIe H2D `{bw.get('h2d_gbps', 0):,.0f} GB/s`)."
         )
@@ -465,15 +502,15 @@ def _build_calibrated_chip(topology: dict, bandwidth: dict, gemm: dict, comm: di
     max_chips = max(int(topology.get("nvlink_clique_size", 1)), int(topology.get("num_gpus", 1)))
     return {
         "name": short_name,
-        "flops": flops_spec,
+        "tflops": round(flops_spec / 1e12, 2),
         "flops_eff": round(flops_eff, 4),
         "fp8_scale": round(fp8_scale, 4),
-        "hbm_bw": hbm_spec,
+        "hbm_bw_gbps": round(hbm_spec / 1e9, 2),
         "bw_eff": round(bw_eff, 4),
-        "hbm_bytes": float(topology.get("hbm_bytes", 80 * GB)),
-        "link_bw": link_spec,
+        "hbm_gb": round(_topo_hbm_bytes(topology) / GB, 2),
+        "link_bw_gbps": round(link_spec / 1e9, 2),
         "link_eff": round(link_eff, 4),
-        "link_latency_s": round(link_lat_s, 9),
+        "link_latency_us": round(link_lat_s * 1e6, 2),
         "max_chips": max_chips,
     }
 
@@ -590,9 +627,9 @@ def _probe_topology_cuda() -> dict:
         "minor": int(props.minor),
         "sm_count": int(props.multi_processor_count),
         "num_gpus": int(num_gpus),
-        "hbm_bytes": int(total_b),
-        "free_hbm_bytes": int(free_b),
-        "l2_cache_bytes": l2_b,
+        "hbm_gb": round(total_b / GB, 2),
+        "free_hbm_gb": round(free_b / GB, 2),
+        "l2_cache_mib": round(l2_b / MIB, 1),
         "interconnect": interconnect,
         "nvlink_clique_size": int(clique),
         "sm_clock_mhz": sm_cur,
@@ -648,7 +685,7 @@ def _probe_bandwidth_cuda(l2_bytes: int, free_bytes: int) -> dict:
         dt_copy = _cuda_bench(lambda _: c.copy_(a), min_total_ms=15.0)
         dt_triad = _cuda_bench(lambda _: torch.add(a, b, out=c), min_total_ms=15.0)
         curve.append({
-            "bytes": sz,
+            "size_mib": round(sz / MIB, 1),
             "copy_gbps": round((2.0 * sz) / dt_copy / 1e9, 2),
             "triad_gbps": round((3.0 * sz) / dt_triad / 1e9, 2),
         })
@@ -1171,7 +1208,7 @@ def _nccl_worker(rank: int, world_size: int, port: int, sizes: list[int], out_pa
                     alg_ar = actual_b / dt_ar / 1e9
                     bus_ar = alg_ar * 2.0 * (k - 1) / k
                     ar_rows.append({
-                        "bytes": actual_b,
+                        "size": _fmt_size(actual_b),
                         "lat_us": round(dt_ar * 1e6, 2),
                         "algbw_gbps": round(alg_ar, 2),
                         "busbw_gbps": round(bus_ar, 2),
@@ -1194,7 +1231,7 @@ def _nccl_worker(rank: int, world_size: int, port: int, sizes: list[int], out_pa
                     alg_a2a = actual_b / dt_a2a / 1e9
                     bus_a2a = alg_a2a * (k - 1) / k
                     a2a_rows.append({
-                        "bytes": actual_b,
+                        "size": _fmt_size(actual_b),
                         "lat_us": round(dt_a2a * 1e6, 2),
                         "algbw_gbps": round(alg_a2a, 2),
                         "busbw_gbps": round(bus_a2a, 2),
@@ -1300,9 +1337,9 @@ def _probe_mock(chip_name: str, suite: str, no_comm: bool = False) -> HardwarePr
         "minor": 0,
         "sm_count": 148 if spec["fp4_tc"] else 78,
         "num_gpus": num_gpus,
-        "hbm_bytes": int(base.hbm_bytes),
-        "free_hbm_bytes": int(0.98 * base.hbm_bytes),
-        "l2_cache_bytes": l2_bytes,
+        "hbm_gb": round(base.hbm_bytes / GB, 2),
+        "free_hbm_gb": round(0.98 * base.hbm_bytes / GB, 2),
+        "l2_cache_mib": round(l2_bytes / MIB, 1),
         "interconnect": "NVLink/NVSwitch",
         "nvlink_clique_size": num_gpus,
         "sm_clock_mhz": 1980,
@@ -1316,7 +1353,7 @@ def _probe_mock(chip_name: str, suite: str, no_comm: bool = False) -> HardwarePr
     hbm_ach = base.hbm_bw * base.bw_eff
     hbm_gbps = hbm_ach / 1e9
     bw_curve = [
-        {"bytes": sz, "copy_gbps": round(hbm_gbps * frac, 2), "triad_gbps": round(hbm_gbps * (frac - 0.02), 2)}
+        {"size_mib": round(sz / MIB, 1), "copy_gbps": round(hbm_gbps * frac, 2), "triad_gbps": round(hbm_gbps * (frac - 0.02), 2)}
         for sz, frac in ((64 * MIB, 0.91), (256 * MIB, 0.97), (512 * MIB, 0.995), (1024 * MIB, 1.00))
     ]
     bandwidth = {
@@ -1419,7 +1456,7 @@ def _probe_mock(chip_name: str, suite: str, no_comm: bool = False) -> HardwarePr
                 dt_ar = 2.0 * lat0 + (2.0 * (k - 1) / k * b) / (eff_link * ramp)
                 alg_ar = b / dt_ar / 1e9
                 ar_rows.append({
-                    "bytes": b,
+                    "size": _fmt_size(b),
                     "lat_us": round(dt_ar * 1e6, 2),
                     "algbw_gbps": round(alg_ar, 2),
                     "busbw_gbps": round(alg_ar * 2.0 * (k - 1) / k, 2),
@@ -1427,7 +1464,7 @@ def _probe_mock(chip_name: str, suite: str, no_comm: bool = False) -> HardwarePr
                 dt_a2a = lat0 * (1.0 + 0.08 * k) + ((k - 1) / k * b) / (eff_link * ramp * 0.92)
                 alg_a2a = b / dt_a2a / 1e9
                 a2a_rows.append({
-                    "bytes": b,
+                    "size": _fmt_size(b),
                     "lat_us": round(dt_a2a * 1e6, 2),
                     "algbw_gbps": round(alg_a2a, 2),
                     "busbw_gbps": round(alg_a2a * (k - 1) / k, 2),
@@ -1500,14 +1537,16 @@ def probe_hardware(
     t0 = time.perf_counter()
     _log("[1/5] probing GPU & node topology...")
     topo = _probe_topology_cuda()
+    l2_b = _topo_l2_bytes(topo)
+    free_b = _topo_free_bytes(topo)
 
     _log("[2/5] measuring L2, HBM, and PCIe bandwidth...")
-    bw = _probe_bandwidth_cuda(topo["l2_cache_bytes"], topo["free_hbm_bytes"])
+    bw = _probe_bandwidth_cuda(l2_b, free_b)
 
     _log(f"[3/5] measuring cold-L2 dense GEMM roofline (suite={suite})...")
     gemm = _probe_gemm_cuda(
-        topo["l2_cache_bytes"],
-        topo["free_hbm_bytes"],
+        l2_b,
+        free_b,
         bw["hbm_peak_achieved_gbps"],
         topo["major"],
         deep=(suite == "deep"),
@@ -1518,7 +1557,7 @@ def probe_hardware(
     if suite == "deep":
         _log("[4/5] measuring grouped MoE GEMM & launch/CUDA-graph overhead...")
         bf16_peak = float(gemm["dtypes"]["bf16"]["peak_tflops"])
-        moe = _probe_moe_cuda(topo["free_hbm_bytes"], bf16_peak, bw["hbm_peak_achieved_gbps"])
+        moe = _probe_moe_cuda(free_b, bf16_peak, bw["hbm_peak_achieved_gbps"])
         overhead = _probe_overhead_cuda()
     else:
         _log("[4/5] skipping MoE & launch overhead (use --suite deep to enable)...")
@@ -1526,7 +1565,7 @@ def probe_hardware(
     comm: dict = {"backend": "none", "groups": {}}
     if suite in ("standard", "deep") and not no_comm and topo["num_gpus"] >= 2:
         _log(f"[5/5] measuring multi-GPU NCCL collectives across {topo['num_gpus']} GPUs...")
-        comm = _probe_comm_cuda(topo["num_gpus"], topo["free_hbm_bytes"])
+        comm = _probe_comm_cuda(topo["num_gpus"], free_b)
     else:
         _log("[5/5] skipping multi-GPU collectives...")
 

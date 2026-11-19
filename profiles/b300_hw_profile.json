@@ -10,9 +10,9 @@
     "minor": 3,
     "sm_count": 148,
     "num_gpus": 8,
-    "hbm_bytes": 287428640768,
-    "free_hbm_bytes": 286768365568,
-    "l2_cache_bytes": 132644864,
+    "hbm_gb": 287.43,
+    "free_hbm_gb": 286.77,
+    "l2_cache_mib": 126.5,
     "interconnect": "NVLink/NVSwitch (NV18)",
     "nvlink_clique_size": 8,
     "sm_clock_mhz": 2032,
@@ -34,22 +34,22 @@
     "d2h_gbps": 56.93,
     "hbm_curve": [
       {
-        "bytes": 67108864,
+        "size_mib": 64.0,
         "copy_gbps": 5440.08,
         "triad_gbps": 6404.6
       },
       {
-        "bytes": 268435456,
+        "size_mib": 256.0,
         "copy_gbps": 6364.43,
         "triad_gbps": 6755.7
       },
       {
-        "bytes": 536870912,
+        "size_mib": 512.0,
         "copy_gbps": 6331.74,
         "triad_gbps": 6887.43
       },
       {
-        "bytes": 1073741824,
+        "size_mib": 1024.0,
         "copy_gbps": 6449.67,
         "triad_gbps": 6971.38
       }
@@ -244,55 +244,55 @@
         "peak_busbw_gbps": 508.66,
         "all_reduce": [
           {
-            "bytes": 4096,
+            "size": "4 KiB",
             "lat_us": 25.2,
             "algbw_gbps": 0.16,
             "busbw_gbps": 0.16
           },
           {
-            "bytes": 16384,
+            "size": "16 KiB",
             "lat_us": 25.38,
             "algbw_gbps": 0.65,
             "busbw_gbps": 0.65
           },
           {
-            "bytes": 65536,
+            "size": "64 KiB",
             "lat_us": 25.13,
             "algbw_gbps": 2.61,
             "busbw_gbps": 2.61
           },
           {
-            "bytes": 262144,
+            "size": "256 KiB",
             "lat_us": 24.94,
             "algbw_gbps": 10.51,
             "busbw_gbps": 10.51
           },
           {
-            "bytes": 1048576,
+            "size": "1 MiB",
             "lat_us": 25.41,
             "algbw_gbps": 41.26,
             "busbw_gbps": 41.26
           },
           {
-            "bytes": 4194304,
+            "size": "4 MiB",
             "lat_us": 39.24,
             "algbw_gbps": 106.89,
             "busbw_gbps": 106.89
           },
           {
-            "bytes": 16777216,
+            "size": "16 MiB",
             "lat_us": 58.06,
             "algbw_gbps": 288.94,
             "busbw_gbps": 288.94
           },
           {
-            "bytes": 67108864,
+            "size": "64 MiB",
             "lat_us": 153.86,
             "algbw_gbps": 436.18,
             "busbw_gbps": 436.18
           },
           {
-            "bytes": 268435456,
+            "size": "256 MiB",
             "lat_us": 527.73,
             "algbw_gbps": 508.66,
             "busbw_gbps": 508.66
@@ -300,55 +300,55 @@
         ],
         "all_to_all": [
           {
-            "bytes": 4096,
+            "size": "4 KiB",
             "lat_us": 25.86,
             "algbw_gbps": 0.16,
             "busbw_gbps": 0.08
           },
           {
-            "bytes": 16384,
+            "size": "16 KiB",
             "lat_us": 24.54,
             "algbw_gbps": 0.67,
             "busbw_gbps": 0.33
           },
           {
-            "bytes": 65536,
+            "size": "64 KiB",
             "lat_us": 24.74,
             "algbw_gbps": 2.65,
             "busbw_gbps": 1.32
           },
           {
-            "bytes": 262144,
+            "size": "256 KiB",
             "lat_us": 25.36,
             "algbw_gbps": 10.34,
             "busbw_gbps": 5.17
           },
           {
-            "bytes": 1048576,
+            "size": "1 MiB",
             "lat_us": 26.66,
             "algbw_gbps": 39.33,
             "busbw_gbps": 19.66
           },
           {
-            "bytes": 4194304,
+            "size": "4 MiB",
             "lat_us": 27.51,
             "algbw_gbps": 152.44,
             "busbw_gbps": 76.22
           },
           {
-            "bytes": 16777216,
+            "size": "16 MiB",
             "lat_us": 43.95,
             "algbw_gbps": 381.72,
             "busbw_gbps": 190.86
           },
           {
-            "bytes": 67108864,
+            "size": "64 MiB",
             "lat_us": 128.46,
             "algbw_gbps": 522.39,
             "busbw_gbps": 261.2
           },
           {
-            "bytes": 268435456,
+            "size": "256 MiB",
             "lat_us": 415.23,
             "algbw_gbps": 646.47,
             "busbw_gbps": 323.24
@@ -360,55 +360,55 @@
         "peak_busbw_gbps": 590.94,
         "all_reduce": [
           {
-            "bytes": 4096,
+            "size": "4 KiB",
             "lat_us": 24.73,
             "algbw_gbps": 0.17,
             "busbw_gbps": 0.25
           },
           {
-            "bytes": 16384,
+            "size": "16 KiB",
             "lat_us": 23.01,
             "algbw_gbps": 0.71,
             "busbw_gbps": 1.07
           },
           {
-            "bytes": 65536,
+            "size": "64 KiB",
             "lat_us": 24.57,
             "algbw_gbps": 2.67,
             "busbw_gbps": 4.0
           },
           {
-            "bytes": 262144,
+            "size": "256 KiB",
             "lat_us": 21.61,
             "algbw_gbps": 12.13,
             "busbw_gbps": 18.19
           },
           {
-            "bytes": 1048576,
+            "size": "1 MiB",
             "lat_us": 22.05,
             "algbw_gbps": 47.54,
             "busbw_gbps": 71.32
           },
           {
-            "bytes": 4194304,
+            "size": "4 MiB",
             "lat_us": 37.61,
             "algbw_gbps": 111.51,
             "busbw_gbps": 167.27
           },
           {
-            "bytes": 16777216,
+            "size": "16 MiB",
             "lat_us": 101.81,
             "algbw_gbps": 164.79,
             "busbw_gbps": 247.19
           },
           {
-            "bytes": 67108864,
+            "size": "64 MiB",
             "lat_us": 186.83,
             "algbw_gbps": 359.19,
             "busbw_gbps": 538.79
           },
           {
-            "bytes": 268435456,
+            "size": "256 MiB",
             "lat_us": 681.38,
             "algbw_gbps": 393.96,
             "busbw_gbps": 590.94
@@ -416,55 +416,55 @@
         ],
         "all_to_all": [
           {
-            "bytes": 4096,
+            "size": "4 KiB",
             "lat_us": 25.57,
             "algbw_gbps": 0.16,
             "busbw_gbps": 0.12
           },
           {
-            "bytes": 16384,
+            "size": "16 KiB",
             "lat_us": 25.77,
             "algbw_gbps": 0.64,
             "busbw_gbps": 0.48
           },
           {
-            "bytes": 65536,
+            "size": "64 KiB",
             "lat_us": 26.37,
             "algbw_gbps": 2.48,
             "busbw_gbps": 1.86
           },
           {
-            "bytes": 262144,
+            "size": "256 KiB",
             "lat_us": 25.93,
             "algbw_gbps": 10.11,
             "busbw_gbps": 7.58
           },
           {
-            "bytes": 1048576,
+            "size": "1 MiB",
             "lat_us": 26.79,
             "algbw_gbps": 39.14,
             "busbw_gbps": 29.35
           },
           {
-            "bytes": 4194304,
+            "size": "4 MiB",
             "lat_us": 27.43,
             "algbw_gbps": 152.91,
             "busbw_gbps": 114.68
           },
           {
-            "bytes": 16777216,
+            "size": "16 MiB",
             "lat_us": 52.08,
             "algbw_gbps": 322.14,
             "busbw_gbps": 241.61
           },
           {
-            "bytes": 67108864,
+            "size": "64 MiB",
             "lat_us": 129.41,
             "algbw_gbps": 518.58,
             "busbw_gbps": 388.94
           },
           {
-            "bytes": 268435456,
+            "size": "256 MiB",
             "lat_us": 425.28,
             "algbw_gbps": 631.2,
             "busbw_gbps": 473.4
@@ -476,55 +476,55 @@
         "peak_busbw_gbps": 651.62,
         "all_reduce": [
           {
-            "bytes": 4096,
+            "size": "4 KiB",
             "lat_us": 26.75,
             "algbw_gbps": 0.15,
             "busbw_gbps": 0.27
           },
           {
-            "bytes": 16384,
+            "size": "16 KiB",
             "lat_us": 39.94,
             "algbw_gbps": 0.41,
             "busbw_gbps": 0.72
           },
           {
-            "bytes": 65536,
+            "size": "64 KiB",
             "lat_us": 31.03,
             "algbw_gbps": 2.11,
             "busbw_gbps": 3.7
           },
           {
-            "bytes": 262144,
+            "size": "256 KiB",
             "lat_us": 34.05,
             "algbw_gbps": 7.7,
             "busbw_gbps": 13.47
           },
           {
-            "bytes": 1048576,
+            "size": "1 MiB",
             "lat_us": 32.81,
             "algbw_gbps": 31.96,
             "busbw_gbps": 55.92
           },
           {
-            "bytes": 4194304,
+            "size": "4 MiB",
             "lat_us": 56.61,
             "algbw_gbps": 74.09,
             "busbw_gbps": 129.66
           },
           {
-            "bytes": 16777216,
+            "size": "16 MiB",
             "lat_us": 103.57,
             "algbw_gbps": 161.99,
             "busbw_gbps": 283.49
           },
           {
-            "bytes": 67108864,
+            "size": "64 MiB",
             "lat_us": 282.37,
             "algbw_gbps": 237.66,
             "busbw_gbps": 415.91
           },
           {
-            "bytes": 268435456,
+            "size": "256 MiB",
             "lat_us": 720.91,
             "algbw_gbps": 372.36,
             "busbw_gbps": 651.62
@@ -532,55 +532,55 @@
         ],
         "all_to_all": [
           {
-            "bytes": 4096,
+            "size": "4 KiB",
             "lat_us": 33.68,
             "algbw_gbps": 0.12,
             "busbw_gbps": 0.11
           },
           {
-            "bytes": 16384,
+            "size": "16 KiB",
             "lat_us": 34.96,
             "algbw_gbps": 0.47,
             "busbw_gbps": 0.41
           },
           {
-            "bytes": 65536,
+            "size": "64 KiB",
             "lat_us": 30.67,
             "algbw_gbps": 2.14,
             "busbw_gbps": 1.87
           },
           {
-            "bytes": 262144,
+            "size": "256 KiB",
             "lat_us": 28.17,
             "algbw_gbps": 9.31,
             "busbw_gbps": 8.14
           },
           {
-            "bytes": 1048576,
+            "size": "1 MiB",
             "lat_us": 38.4,
             "algbw_gbps": 27.31,
             "busbw_gbps": 23.89
           },
           {
-            "bytes": 4194304,
+            "size": "4 MiB",
             "lat_us": 31.18,
             "algbw_gbps": 134.52,
             "busbw_gbps": 117.7
           },
           {
-            "bytes": 16777216,
+            "size": "16 MiB",
             "lat_us": 56.7,
             "algbw_gbps": 295.87,
             "busbw_gbps": 258.89
           },
           {
-            "bytes": 67108864,
+            "size": "64 MiB",
             "lat_us": 137.71,
             "algbw_gbps": 487.31,
             "busbw_gbps": 426.4
           },
           {
-            "bytes": 268435456,
+            "size": "256 MiB",
             "lat_us": 433.49,
             "algbw_gbps": 619.25,
             "busbw_gbps": 541.84
@@ -598,15 +598,15 @@
   },
   "calibrated_chip": {
     "name": "B300",
-    "flops": 2250000000000000.0,
+    "tflops": 2250.0,
     "flops_eff": 0.7998,
     "fp8_scale": 1.8626,
-    "hbm_bw": 8000000000000.0,
+    "hbm_bw_gbps": 8000.0,
     "bw_eff": 0.8714,
-    "hbm_bytes": 287428640768.0,
-    "link_bw": 900000000000.0,
+    "hbm_gb": 287.43,
+    "link_bw_gbps": 900.0,
     "link_eff": 0.724,
-    "link_latency_s": 1.338e-05,
+    "link_latency_us": 13.38,
     "max_chips": 8
   }
 }

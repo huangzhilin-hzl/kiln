@@ -1,0 +1,20 @@
+kiln/cli.py
+  h_7339bf36ecd0bc 104-113,115
+kiln/costmodel/probe.py
+  h_7339bf36ecd0bc 41-54,241-257,269,273,483-487,491-493,499-501,507-510,515,522,531-545,547,551
+profiles/b300_hw_profile.json
+  h_7339bf36ecd0bc 601-615,617,621
+tests/test_probe.py
+  h_7339bf36ecd0bc 181-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "496aaba185cbfc44912bbd465ab025bd078b8286",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

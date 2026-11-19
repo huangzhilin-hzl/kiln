@@ -68,7 +68,7 @@ def _match_spec(device_name: str) -> dict | None:
     return None
 
 
-def _host_info() -> dict:
+def _host_info(include_hostname: bool = False) -> dict:
     cpus = os.cpu_count() or 1
     ram_total, ram_avail = 0, 0
     meminfo = Path("/proc/meminfo")
@@ -85,13 +85,15 @@ def _host_info() -> dict:
             ram_total = int(out)
         except Exception:
             pass
-    return {
-        "hostname": platform.node(),
-        "os": f"{platform.system()} {platform.release()}",
+    info: dict = {
+        "os": platform.system(),
         "host_cpus": cpus,
         "host_ram_gb": round(ram_total / GB, 1) if ram_total else None,
         "host_ram_avail_gb": round(ram_avail / GB, 1) if ram_avail else None,
     }
+    if include_hostname:
+        info["hostname"] = platform.node()
+    return info
 
 
 def _has_cuda() -> bool:
@@ -255,7 +257,8 @@ class HardwareProfile:
             )
         if t.get("host_cpus"):
             ram = f", {t['host_ram_gb']} GB RAM" if t.get("host_ram_gb") else ""
-            lines.append(f"- **Host:** `{t.get('hostname', '')}` ({t['host_cpus']} CPUs{ram})")
+            host_prefix = f"`{t['hostname']}` " if t.get("hostname") else ""
+            lines.append(f"- **Host:** {host_prefix}{t['host_cpus']} CPUs{ram}")
         for w in t.get("warnings", ()):
             lines.append(f"- **Warning:** {w}")
         lines.append("")

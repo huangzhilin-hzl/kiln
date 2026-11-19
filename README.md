@@ -36,6 +36,7 @@ tiers. Winners get promoted. When traffic shifts, you run the loop again.
 | `kiln/bench/correctness.py` | Greedy-token match against baseline | §4.1 |
 | `kiln/costmodel/model.py` | Roofline + comm cost model, search space, pruning, TPM ranking | §4.3, App. D |
 | `kiln/costmodel/probe.py` | Hardware & roofline microbenchmarks (HBM/L2/PCIe, BF16/FP8/FP4 GEMM, MoE, launch, NCCL) | §4.3 (Level 2) |
+| `profiles/b300_hw_profile.json` | Measured 8× NVIDIA B300 SXM6 AC (`sm_103`) hardware & roofline profile | §4.3 (Level 2) |
 | `kiln/agents/` | Agent launcher + the deliberately minimal prompt | §4.4 |
 | `candidates/baseline_forward.py` | The candidate contract: `make_forward(model)` | — |
 

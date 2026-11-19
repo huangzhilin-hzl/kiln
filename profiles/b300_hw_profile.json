@@ -1,0 +1,612 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-11-19T04:10:12+00:00",
+  "is_mock": false,
+  "suite": "deep",
+  "topology": {
+    "device_name": "NVIDIA B300 SXM6 AC",
+    "arch": "sm_103",
+    "major": 10,
+    "minor": 3,
+    "sm_count": 148,
+    "num_gpus": 8,
+    "hbm_bytes": 287428640768,
+    "free_hbm_bytes": 286768365568,
+    "l2_cache_bytes": 132644864,
+    "interconnect": "NVLink/NVSwitch (NV18)",
+    "nvlink_clique_size": 8,
+    "sm_clock_mhz": 2032,
+    "sm_max_clock_mhz": 2032,
+    "power_draw_w": 239.0,
+    "power_limit_w": 1100.0,
+    "warnings": [],
+    "os": "Linux",
+    "host_cpus": 8,
+    "host_ram_gb": 137.4,
+    "host_ram_avail_gb": 136.9
+  },
+  "bandwidth": {
+    "hbm_copy_gbps": 6449.67,
+    "hbm_triad_gbps": 6971.38,
+    "hbm_peak_achieved_gbps": 6971.38,
+    "l2_gbps": 11815.06,
+    "h2d_gbps": 55.0,
+    "d2h_gbps": 56.93,
+    "hbm_curve": [
+      {
+        "bytes": 67108864,
+        "copy_gbps": 5440.08,
+        "triad_gbps": 6404.6
+      },
+      {
+        "bytes": 268435456,
+        "copy_gbps": 6364.43,
+        "triad_gbps": 6755.7
+      },
+      {
+        "bytes": 536870912,
+        "copy_gbps": 6331.74,
+        "triad_gbps": 6887.43
+      },
+      {
+        "bytes": 1073741824,
+        "copy_gbps": 6449.67,
+        "triad_gbps": 6971.38
+      }
+    ]
+  },
+  "gemm": {
+    "shape_nk": [
+      8192,
+      4096
+    ],
+    "dtypes": {
+      "bf16": {
+        "supported": true,
+        "mode": "tensor_core",
+        "peak_tflops": 1799.5,
+        "ridge_flop_per_byte": 258.1,
+        "by_m": [
+          {
+            "m": 1,
+            "tflops": 4.93,
+            "gbps": 4928.6
+          },
+          {
+            "m": 8,
+            "tflops": 43.73,
+            "gbps": 5482.7
+          },
+          {
+            "m": 32,
+            "tflops": 174.95,
+            "gbps": 5531.2
+          },
+          {
+            "m": 128,
+            "tflops": 608.58,
+            "gbps": 4977.4
+          },
+          {
+            "m": 512,
+            "tflops": 1484.75,
+            "gbps": 3443.6
+          },
+          {
+            "m": 4096,
+            "tflops": 1799.5,
+            "gbps": 1098.3
+          }
+        ]
+      },
+      "fp8_e4m3": {
+        "supported": true,
+        "mode": "float8_e4m3fn",
+        "peak_tflops": 3351.66,
+        "ridge_flop_per_byte": 480.8,
+        "by_m": [
+          {
+            "m": 1,
+            "tflops": 5.62,
+            "gbps": 2812.7
+          },
+          {
+            "m": 8,
+            "tflops": 45.35,
+            "gbps": 2848.4
+          },
+          {
+            "m": 32,
+            "tflops": 193.35,
+            "gbps": 3080.1
+          },
+          {
+            "m": 128,
+            "tflops": 761.05,
+            "gbps": 3205.1
+          },
+          {
+            "m": 512,
+            "tflops": 2471.67,
+            "gbps": 3168.0
+          },
+          {
+            "m": 4096,
+            "tflops": 3351.66,
+            "gbps": 1432.0
+          }
+        ]
+      },
+      "fp4": {
+        "supported": true,
+        "native_tc": true,
+        "mode": "nvfp4_cublaslt_tc",
+        "peak_tflops": 5563.17,
+        "ridge_flop_per_byte": 798.0,
+        "by_m": [
+          {
+            "m": 1,
+            "tflops": 5.29,
+            "gbps": 1488.8
+          },
+          {
+            "m": 8,
+            "tflops": 42.52,
+            "gbps": 1506.8
+          },
+          {
+            "m": 32,
+            "tflops": 169.73,
+            "gbps": 1539.1
+          },
+          {
+            "m": 128,
+            "tflops": 681.74,
+            "gbps": 1687.8
+          },
+          {
+            "m": 512,
+            "tflops": 2683.61,
+            "gbps": 2221.5
+          },
+          {
+            "m": 4096,
+            "tflops": 5563.17,
+            "gbps": 1931.2
+          }
+        ]
+      }
+    }
+  },
+  "moe": {
+    "supported": true,
+    "backend": "torch_grouped_mm_bf16",
+    "num_experts": 32,
+    "top_k": 8,
+    "hidden": 4096,
+    "inter": 2048,
+    "by_tokens": [
+      {
+        "tokens": 1,
+        "avg_m_per_expert": 0.25,
+        "touched_experts": 7.18,
+        "tflops": 3.63,
+        "gbps": 3261.7,
+        "roofline_eff": 0.4679
+      },
+      {
+        "tokens": 8,
+        "avg_m_per_expert": 2.0,
+        "touched_experts": 27.81,
+        "tflops": 9.81,
+        "gbps": 4266.0,
+        "roofline_eff": 0.6119
+      },
+      {
+        "tokens": 32,
+        "avg_m_per_expert": 8.0,
+        "touched_experts": 31.99,
+        "tflops": 39.09,
+        "gbps": 4903.8,
+        "roofline_eff": 0.7034
+      },
+      {
+        "tokens": 128,
+        "avg_m_per_expert": 32.0,
+        "touched_experts": 32.0,
+        "tflops": 152.09,
+        "gbps": 4827.0,
+        "roofline_eff": 0.6924
+      },
+      {
+        "tokens": 512,
+        "avg_m_per_expert": 128.0,
+        "touched_experts": 32.0,
+        "tflops": 597.66,
+        "gbps": 4961.1,
+        "roofline_eff": 0.7116
+      },
+      {
+        "tokens": 2048,
+        "avg_m_per_expert": 512.0,
+        "touched_experts": 32.0,
+        "tflops": 1468.18,
+        "gbps": 3584.4,
+        "roofline_eff": 0.8159
+      }
+    ]
+  },
+  "comm": {
+    "backend": "nccl",
+    "groups": {
+      "2": {
+        "link_latency_us": 12.6,
+        "peak_busbw_gbps": 508.66,
+        "all_reduce": [
+          {
+            "bytes": 4096,
+            "lat_us": 25.2,
+            "algbw_gbps": 0.16,
+            "busbw_gbps": 0.16
+          },
+          {
+            "bytes": 16384,
+            "lat_us": 25.38,
+            "algbw_gbps": 0.65,
+            "busbw_gbps": 0.65
+          },
+          {
+            "bytes": 65536,
+            "lat_us": 25.13,
+            "algbw_gbps": 2.61,
+            "busbw_gbps": 2.61
+          },
+          {
+            "bytes": 262144,
+            "lat_us": 24.94,
+            "algbw_gbps": 10.51,
+            "busbw_gbps": 10.51
+          },
+          {
+            "bytes": 1048576,
+            "lat_us": 25.41,
+            "algbw_gbps": 41.26,
+            "busbw_gbps": 41.26
+          },
+          {
+            "bytes": 4194304,
+            "lat_us": 39.24,
+            "algbw_gbps": 106.89,
+            "busbw_gbps": 106.89
+          },
+          {
+            "bytes": 16777216,
+            "lat_us": 58.06,
+            "algbw_gbps": 288.94,
+            "busbw_gbps": 288.94
+          },
+          {
+            "bytes": 67108864,
+            "lat_us": 153.86,
+            "algbw_gbps": 436.18,
+            "busbw_gbps": 436.18
+          },
+          {
+            "bytes": 268435456,
+            "lat_us": 527.73,
+            "algbw_gbps": 508.66,
+            "busbw_gbps": 508.66
+          }
+        ],
+        "all_to_all": [
+          {
+            "bytes": 4096,
+            "lat_us": 25.86,
+            "algbw_gbps": 0.16,
+            "busbw_gbps": 0.08
+          },
+          {
+            "bytes": 16384,
+            "lat_us": 24.54,
+            "algbw_gbps": 0.67,
+            "busbw_gbps": 0.33
+          },
+          {
+            "bytes": 65536,
+            "lat_us": 24.74,
+            "algbw_gbps": 2.65,
+            "busbw_gbps": 1.32
+          },
+          {
+            "bytes": 262144,
+            "lat_us": 25.36,
+            "algbw_gbps": 10.34,
+            "busbw_gbps": 5.17
+          },
+          {
+            "bytes": 1048576,
+            "lat_us": 26.66,
+            "algbw_gbps": 39.33,
+            "busbw_gbps": 19.66
+          },
+          {
+            "bytes": 4194304,
+            "lat_us": 27.51,
+            "algbw_gbps": 152.44,
+            "busbw_gbps": 76.22
+          },
+          {
+            "bytes": 16777216,
+            "lat_us": 43.95,
+            "algbw_gbps": 381.72,
+            "busbw_gbps": 190.86
+          },
+          {
+            "bytes": 67108864,
+            "lat_us": 128.46,
+            "algbw_gbps": 522.39,
+            "busbw_gbps": 261.2
+          },
+          {
+            "bytes": 268435456,
+            "lat_us": 415.23,
+            "algbw_gbps": 646.47,
+            "busbw_gbps": 323.24
+          }
+        ]
+      },
+      "4": {
+        "link_latency_us": 12.37,
+        "peak_busbw_gbps": 590.94,
+        "all_reduce": [
+          {
+            "bytes": 4096,
+            "lat_us": 24.73,
+            "algbw_gbps": 0.17,
+            "busbw_gbps": 0.25
+          },
+          {
+            "bytes": 16384,
+            "lat_us": 23.01,
+            "algbw_gbps": 0.71,
+            "busbw_gbps": 1.07
+          },
+          {
+            "bytes": 65536,
+            "lat_us": 24.57,
+            "algbw_gbps": 2.67,
+            "busbw_gbps": 4.0
+          },
+          {
+            "bytes": 262144,
+            "lat_us": 21.61,
+            "algbw_gbps": 12.13,
+            "busbw_gbps": 18.19
+          },
+          {
+            "bytes": 1048576,
+            "lat_us": 22.05,
+            "algbw_gbps": 47.54,
+            "busbw_gbps": 71.32
+          },
+          {
+            "bytes": 4194304,
+            "lat_us": 37.61,
+            "algbw_gbps": 111.51,
+            "busbw_gbps": 167.27
+          },
+          {
+            "bytes": 16777216,
+            "lat_us": 101.81,
+            "algbw_gbps": 164.79,
+            "busbw_gbps": 247.19
+          },
+          {
+            "bytes": 67108864,
+            "lat_us": 186.83,
+            "algbw_gbps": 359.19,
+            "busbw_gbps": 538.79
+          },
+          {
+            "bytes": 268435456,
+            "lat_us": 681.38,
+            "algbw_gbps": 393.96,
+            "busbw_gbps": 590.94
+          }
+        ],
+        "all_to_all": [
+          {
+            "bytes": 4096,
+            "lat_us": 25.57,
+            "algbw_gbps": 0.16,
+            "busbw_gbps": 0.12
+          },
+          {
+            "bytes": 16384,
+            "lat_us": 25.77,
+            "algbw_gbps": 0.64,
+            "busbw_gbps": 0.48
+          },
+          {
+            "bytes": 65536,
+            "lat_us": 26.37,
+            "algbw_gbps": 2.48,
+            "busbw_gbps": 1.86
+          },
+          {
+            "bytes": 262144,
+            "lat_us": 25.93,
+            "algbw_gbps": 10.11,
+            "busbw_gbps": 7.58
+          },
+          {
+            "bytes": 1048576,
+            "lat_us": 26.79,
+            "algbw_gbps": 39.14,
+            "busbw_gbps": 29.35
+          },
+          {
+            "bytes": 4194304,
+            "lat_us": 27.43,
+            "algbw_gbps": 152.91,
+            "busbw_gbps": 114.68
+          },
+          {
+            "bytes": 16777216,
+            "lat_us": 52.08,
+            "algbw_gbps": 322.14,
+            "busbw_gbps": 241.61
+          },
+          {
+            "bytes": 67108864,
+            "lat_us": 129.41,
+            "algbw_gbps": 518.58,
+            "busbw_gbps": 388.94
+          },
+          {
+            "bytes": 268435456,
+            "lat_us": 425.28,
+            "algbw_gbps": 631.2,
+            "busbw_gbps": 473.4
+          }
+        ]
+      },
+      "8": {
+        "link_latency_us": 13.38,
+        "peak_busbw_gbps": 651.62,
+        "all_reduce": [
+          {
+            "bytes": 4096,
+            "lat_us": 26.75,
+            "algbw_gbps": 0.15,
+            "busbw_gbps": 0.27
+          },
+          {
+            "bytes": 16384,
+            "lat_us": 39.94,
+            "algbw_gbps": 0.41,
+            "busbw_gbps": 0.72
+          },
+          {
+            "bytes": 65536,
+            "lat_us": 31.03,
+            "algbw_gbps": 2.11,
+            "busbw_gbps": 3.7
+          },
+          {
+            "bytes": 262144,
+            "lat_us": 34.05,
+            "algbw_gbps": 7.7,
+            "busbw_gbps": 13.47
+          },
+          {
+            "bytes": 1048576,
+            "lat_us": 32.81,
+            "algbw_gbps": 31.96,
+            "busbw_gbps": 55.92
+          },
+          {
+            "bytes": 4194304,
+            "lat_us": 56.61,
+            "algbw_gbps": 74.09,
+            "busbw_gbps": 129.66
+          },
+          {
+            "bytes": 16777216,
+            "lat_us": 103.57,
+            "algbw_gbps": 161.99,
+            "busbw_gbps": 283.49
+          },
+          {
+            "bytes": 67108864,
+            "lat_us": 282.37,
+            "algbw_gbps": 237.66,
+            "busbw_gbps": 415.91
+          },
+          {
+            "bytes": 268435456,
+            "lat_us": 720.91,
+            "algbw_gbps": 372.36,
+            "busbw_gbps": 651.62
+          }
+        ],
+        "all_to_all": [
+          {
+            "bytes": 4096,
+            "lat_us": 33.68,
+            "algbw_gbps": 0.12,
+            "busbw_gbps": 0.11
+          },
+          {
+            "bytes": 16384,
+            "lat_us": 34.96,
+            "algbw_gbps": 0.47,
+            "busbw_gbps": 0.41
+          },
+          {
+            "bytes": 65536,
+            "lat_us": 30.67,
+            "algbw_gbps": 2.14,
+            "busbw_gbps": 1.87
+          },
+          {
+            "bytes": 262144,
+            "lat_us": 28.17,
+            "algbw_gbps": 9.31,
+            "busbw_gbps": 8.14
+          },
+          {
+            "bytes": 1048576,
+            "lat_us": 38.4,
+            "algbw_gbps": 27.31,
+            "busbw_gbps": 23.89
+          },
+          {
+            "bytes": 4194304,
+            "lat_us": 31.18,
+            "algbw_gbps": 134.52,
+            "busbw_gbps": 117.7
+          },
+          {
+            "bytes": 16777216,
+            "lat_us": 56.7,
+            "algbw_gbps": 295.87,
+            "busbw_gbps": 258.89
+          },
+          {
+            "bytes": 67108864,
+            "lat_us": 137.71,
+            "algbw_gbps": 487.31,
+            "busbw_gbps": 426.4
+          },
+          {
+            "bytes": 268435456,
+            "lat_us": 433.49,
+            "algbw_gbps": 619.25,
+            "busbw_gbps": 541.84
+          }
+        ]
+      }
+    }
+  },
+  "overhead": {
+    "eager_launch_us": 5.777,
+    "eager_gpu_step_us": 5.564,
+    "cudagraph_fixed_launch_us": 4.536,
+    "cudagraph_per_kernel_us": 1.006,
+    "host_sync_us": 16.96
+  },
+  "calibrated_chip": {
+    "name": "B300",
+    "flops": 2250000000000000.0,
+    "flops_eff": 0.7998,
+    "fp8_scale": 1.8626,
+    "hbm_bw": 8000000000000.0,
+    "bw_eff": 0.8714,
+    "hbm_bytes": 287428640768.0,
+    "link_bw": 900000000000.0,
+    "link_eff": 0.724,
+    "link_latency_s": 1.338e-05,
+    "max_chips": 8
+  }
+}

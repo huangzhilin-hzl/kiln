@@ -17,6 +17,7 @@ from kiln.server.app import create_app
 def test_probe_suites_and_roundtrip(tmp_path: Path):
     h20 = probe_hardware(suite="deep", mock_chip="H20-3e", progress=False)
     assert h20.is_mock is True
+    assert "hostname" not in h20.topology
     assert h20.gemm["dtypes"]["fp4"]["supported"] is True
     assert h20.gemm["dtypes"]["fp4"]["native_tc"] is False
     assert h20.moe["supported"] is True and len(h20.moe["by_tokens"]) == 6
@@ -168,3 +169,16 @@ def test_parse_nvlink_topology_with_ansi_and_many_nics(monkeypatch):
     b300 = probe_hardware(suite="deep", mock_chip="B300", progress=False)
     assert b300.calibrated_chip["name"] == "B300"
     assert b300.gemm["dtypes"]["fp4"]["native_tc"] is True
+
+
+def test_checked_in_b300_profile():
+    path = Path("profiles/b300_hw_profile.json")
+    raw = path.read_text(encoding="utf-8")
+    for secret in ("hostname", "molou", "sigma", "aidc", "antgroup"):
+        assert secret not in raw.lower()
+    prof = HardwareProfile.load(path)
+    assert prof.is_mock is False
+    assert prof.calibrated_chip["name"] == "B300"
+    assert prof.topology["interconnect"] == "NVLink/NVSwitch (NV18)"
+    rows = rank(MODELS["deepseek-v4.1-flash"], prof.to_chip_spec(), Workload(), max_chips=8)
+    assert rows and rows[0]["tpm_per_chip"] > 0

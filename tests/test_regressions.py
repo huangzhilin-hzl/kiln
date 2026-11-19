@@ -297,3 +297,16 @@ def test_vllm_reload_restores_live_kv_allocation(monkeypatch):
     ext._kiln_rebuild()
     assert cache.num_committed_blocks == 4096
     assert workspace == ["unlocked", "locked"]
+
+
+def test_spawn_agent_substitutes_prompt_placeholder(tmp_path):
+    import os
+    import shlex
+    import sys
+    from kiln.agents.launcher import _spawn_agent
+
+    cmd = shlex.split(f"{sys.executable} -c 'import sys; print(sys.argv[1], sys.stdin.read() == \"\")' {{prompt}}")
+    proc, log = _spawn_agent(cmd, tmp_path, dict(os.environ), "hello\nmulti-line $prompt")
+    assert proc.wait(timeout=5) == 0
+    log.close()
+    assert (tmp_path / "agent.log").read_text() == "hello\nmulti-line $prompt True\n"

@@ -1,7 +1,8 @@
 """Spawn N parallel coding agents, each in its own workspace dir.
 
-Any CLI agent that accepts a prompt on stdin works (Codex `codex exec ... -`, Claude Code `claude -p`,
-Gemini CLI, ...). Configure via `agents.command` in the run YAML.
+Any CLI agent that accepts a prompt on stdin (Codex `codex exec ... -`, Claude Code `claude -p`)
+or via an argv `{prompt}` placeholder (Antigravity `agy ... -p {prompt}`) works. Configure via
+`agents.command` in the run YAML.
 """
 from __future__ import annotations
 
@@ -28,6 +29,11 @@ CONTINUE_NOTE = (
 
 def _spawn_agent(cmd: list[str], ws: Path, env: dict[str, str], prompt_text: str):
     log = open(ws / "agent.log", "ab")
+    if any("{prompt}" in tok for tok in cmd):
+        argv = [tok.replace("{prompt}", prompt_text) for tok in cmd]
+        p = subprocess.Popen(argv, cwd=ws, env=env,
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        return p, log
     p = subprocess.Popen(cmd, cwd=ws, env=env,
                          stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
     assert p.stdin is not None
@@ -51,12 +57,28 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
     if hw_path := run.resolve_hw_profile():
         from kiln.costmodel.probe import HardwareProfile
         hw_profile = HardwareProfile.load(hw_path)
+    else:
+        try:
+            import httpx
+            from kiln.costmodel.probe import HardwareProfile
+            from kiln.server.auth import auth_headers
+            r = httpx.get(f"{server_url.rstrip('/')}/hardware", headers=auth_headers(),
+                          trust_env=False, timeout=10.0)
+            if r.status_code == 200 and r.json().get("available") and r.json().get("profile"):
+                hw_profile = HardwareProfile.from_dict(r.json()["profile"])
+        except Exception:
+            pass
 
+    refs_dir = REPO / "refs"
+    if refs_dir.exists() and cmd and Path(cmd[0]).name == "agy" and "--add-dir" not in cmd:
+        cmd = [cmd[0], "--add-dir", str(refs_dir), *cmd[1:]]
     slots: list[dict] = []
     for i in range(1, n + 1):
         name = f"agent_{i}"
         ws = root / name
         ws.mkdir(exist_ok=True)
+        if refs_dir.exists() and not (ws / "refs").exists():
+            (ws / "refs").symlink_to(refs_dir)
         triton_dir = (ws / ".triton").resolve()
         triton_dir.mkdir(exist_ok=True)
         if not (ws / "forward.py").exists():

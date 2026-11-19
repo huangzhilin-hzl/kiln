@@ -1,0 +1,528 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-11-19T12:29:09+00:00",
+  "is_mock": false,
+  "suite": "standard",
+  "topology": {
+    "device_name": "NVIDIA H20-3e",
+    "arch": "sm_90",
+    "major": 9,
+    "minor": 0,
+    "sm_count": 78,
+    "num_gpus": 8,
+    "hbm_gb": 150.12,
+    "free_hbm_gb": 149.77,
+    "l2_cache_mib": 60.0,
+    "interconnect": "NVLink/NVSwitch (NV18)",
+    "nvlink_clique_size": 8,
+    "sm_clock_mhz": 1980,
+    "sm_max_clock_mhz": 1980,
+    "power_draw_w": 95.1,
+    "power_limit_w": 500.0,
+    "warnings": [],
+    "os": "Linux",
+    "host_cpus": 64,
+    "host_ram_gb": 1181.1,
+    "host_ram_avail_gb": 1173.6
+  },
+  "bandwidth": {
+    "hbm_copy_gbps": 3844.24,
+    "hbm_triad_gbps": 4371.91,
+    "hbm_peak_achieved_gbps": 4371.91,
+    "l2_gbps": 6475.89,
+    "h2d_gbps": 55.31,
+    "d2h_gbps": 55.11,
+    "hbm_curve": [
+      {
+        "size_mib": 64.0,
+        "copy_gbps": 3559.29,
+        "triad_gbps": 4097.26
+      },
+      {
+        "size_mib": 256.0,
+        "copy_gbps": 3792.75,
+        "triad_gbps": 4320.02
+      },
+      {
+        "size_mib": 512.0,
+        "copy_gbps": 3812.86,
+        "triad_gbps": 4355.46
+      },
+      {
+        "size_mib": 1024.0,
+        "copy_gbps": 3844.24,
+        "triad_gbps": 4371.91
+      }
+    ]
+  },
+  "gemm": {
+    "shape_nk": [
+      8192,
+      4096
+    ],
+    "dtypes": {
+      "bf16": {
+        "supported": true,
+        "mode": "tensor_core",
+        "peak_tflops": 134.13,
+        "ridge_flop_per_byte": 30.7,
+        "by_m": [
+          {
+            "m": 1,
+            "tflops": 2.84,
+            "gbps": 2837.6
+          },
+          {
+            "m": 8,
+            "tflops": 22.14,
+            "gbps": 2775.8
+          },
+          {
+            "m": 32,
+            "tflops": 91.32,
+            "gbps": 2887.1
+          },
+          {
+            "m": 128,
+            "tflops": 108.83,
+            "gbps": 890.1
+          },
+          {
+            "m": 512,
+            "tflops": 130.12,
+            "gbps": 301.8
+          },
+          {
+            "m": 4096,
+            "tflops": 134.13,
+            "gbps": 81.9
+          }
+        ]
+      },
+      "fp8_e4m3": {
+        "supported": true,
+        "mode": "float8_e4m3fn",
+        "peak_tflops": 273.85,
+        "ridge_flop_per_byte": 62.6,
+        "by_m": [
+          {
+            "m": 1,
+            "tflops": 5.45,
+            "gbps": 2724.2
+          },
+          {
+            "m": 8,
+            "tflops": 43.83,
+            "gbps": 2752.9
+          },
+          {
+            "m": 32,
+            "tflops": 147.26,
+            "gbps": 2345.9
+          },
+          {
+            "m": 128,
+            "tflops": 229.73,
+            "gbps": 967.5
+          },
+          {
+            "m": 512,
+            "tflops": 261.6,
+            "gbps": 335.3
+          },
+          {
+            "m": 4096,
+            "tflops": 273.85,
+            "gbps": 117.0
+          }
+        ]
+      }
+    }
+  },
+  "moe": {
+    "supported": false,
+    "by_tokens": []
+  },
+  "comm": {
+    "backend": "nccl",
+    "groups": {
+      "2": {
+        "link_latency_us": 12.11,
+        "peak_busbw_gbps": 302.85,
+        "all_reduce": [
+          {
+            "size": "4 KiB",
+            "lat_us": 24.22,
+            "algbw_gbps": 0.17,
+            "busbw_gbps": 0.17
+          },
+          {
+            "size": "16 KiB",
+            "lat_us": 22.25,
+            "algbw_gbps": 0.74,
+            "busbw_gbps": 0.74
+          },
+          {
+            "size": "64 KiB",
+            "lat_us": 22.76,
+            "algbw_gbps": 2.88,
+            "busbw_gbps": 2.88
+          },
+          {
+            "size": "256 KiB",
+            "lat_us": 22.44,
+            "algbw_gbps": 11.68,
+            "busbw_gbps": 11.68
+          },
+          {
+            "size": "1 MiB",
+            "lat_us": 24.08,
+            "algbw_gbps": 43.54,
+            "busbw_gbps": 43.54
+          },
+          {
+            "size": "4 MiB",
+            "lat_us": 32.55,
+            "algbw_gbps": 128.86,
+            "busbw_gbps": 128.86
+          },
+          {
+            "size": "16 MiB",
+            "lat_us": 76.83,
+            "algbw_gbps": 218.36,
+            "busbw_gbps": 218.36
+          },
+          {
+            "size": "64 MiB",
+            "lat_us": 252.42,
+            "algbw_gbps": 265.87,
+            "busbw_gbps": 265.87
+          },
+          {
+            "size": "256 MiB",
+            "lat_us": 886.35,
+            "algbw_gbps": 302.85,
+            "busbw_gbps": 302.85
+          }
+        ],
+        "all_to_all": [
+          {
+            "size": "4 KiB",
+            "lat_us": 23.4,
+            "algbw_gbps": 0.18,
+            "busbw_gbps": 0.09
+          },
+          {
+            "size": "16 KiB",
+            "lat_us": 23.39,
+            "algbw_gbps": 0.7,
+            "busbw_gbps": 0.35
+          },
+          {
+            "size": "64 KiB",
+            "lat_us": 23.63,
+            "algbw_gbps": 2.77,
+            "busbw_gbps": 1.39
+          },
+          {
+            "size": "256 KiB",
+            "lat_us": 23.03,
+            "algbw_gbps": 11.38,
+            "busbw_gbps": 5.69
+          },
+          {
+            "size": "1 MiB",
+            "lat_us": 24.43,
+            "algbw_gbps": 42.92,
+            "busbw_gbps": 21.46
+          },
+          {
+            "size": "4 MiB",
+            "lat_us": 25.3,
+            "algbw_gbps": 165.79,
+            "busbw_gbps": 82.89
+          },
+          {
+            "size": "16 MiB",
+            "lat_us": 55.87,
+            "algbw_gbps": 300.28,
+            "busbw_gbps": 150.14
+          },
+          {
+            "size": "64 MiB",
+            "lat_us": 141.49,
+            "algbw_gbps": 474.31,
+            "busbw_gbps": 237.15
+          },
+          {
+            "size": "256 MiB",
+            "lat_us": 481.22,
+            "algbw_gbps": 557.83,
+            "busbw_gbps": 278.91
+          }
+        ]
+      },
+      "4": {
+        "link_latency_us": 11.26,
+        "peak_busbw_gbps": 338.06,
+        "all_reduce": [
+          {
+            "size": "4 KiB",
+            "lat_us": 22.52,
+            "algbw_gbps": 0.18,
+            "busbw_gbps": 0.27
+          },
+          {
+            "size": "16 KiB",
+            "lat_us": 60.88,
+            "algbw_gbps": 0.27,
+            "busbw_gbps": 0.4
+          },
+          {
+            "size": "64 KiB",
+            "lat_us": 24.52,
+            "algbw_gbps": 2.67,
+            "busbw_gbps": 4.01
+          },
+          {
+            "size": "256 KiB",
+            "lat_us": 23.51,
+            "algbw_gbps": 11.15,
+            "busbw_gbps": 16.72
+          },
+          {
+            "size": "1 MiB",
+            "lat_us": 24.19,
+            "algbw_gbps": 43.34,
+            "busbw_gbps": 65.02
+          },
+          {
+            "size": "4 MiB",
+            "lat_us": 40.15,
+            "algbw_gbps": 104.47,
+            "busbw_gbps": 156.71
+          },
+          {
+            "size": "16 MiB",
+            "lat_us": 98.38,
+            "algbw_gbps": 170.53,
+            "busbw_gbps": 255.79
+          },
+          {
+            "size": "64 MiB",
+            "lat_us": 325.01,
+            "algbw_gbps": 206.48,
+            "busbw_gbps": 309.73
+          },
+          {
+            "size": "256 MiB",
+            "lat_us": 1191.07,
+            "algbw_gbps": 225.37,
+            "busbw_gbps": 338.06
+          }
+        ],
+        "all_to_all": [
+          {
+            "size": "4 KiB",
+            "lat_us": 34.57,
+            "algbw_gbps": 0.12,
+            "busbw_gbps": 0.09
+          },
+          {
+            "size": "16 KiB",
+            "lat_us": 51.78,
+            "algbw_gbps": 0.32,
+            "busbw_gbps": 0.24
+          },
+          {
+            "size": "64 KiB",
+            "lat_us": 28.82,
+            "algbw_gbps": 2.27,
+            "busbw_gbps": 1.71
+          },
+          {
+            "size": "256 KiB",
+            "lat_us": 27.15,
+            "algbw_gbps": 9.66,
+            "busbw_gbps": 7.24
+          },
+          {
+            "size": "1 MiB",
+            "lat_us": 30.07,
+            "algbw_gbps": 34.87,
+            "busbw_gbps": 26.16
+          },
+          {
+            "size": "4 MiB",
+            "lat_us": 34.05,
+            "algbw_gbps": 123.16,
+            "busbw_gbps": 92.37
+          },
+          {
+            "size": "16 MiB",
+            "lat_us": 64.46,
+            "algbw_gbps": 260.26,
+            "busbw_gbps": 195.19
+          },
+          {
+            "size": "64 MiB",
+            "lat_us": 195.89,
+            "algbw_gbps": 342.59,
+            "busbw_gbps": 256.94
+          },
+          {
+            "size": "256 MiB",
+            "lat_us": 691.25,
+            "algbw_gbps": 388.33,
+            "busbw_gbps": 291.25
+          }
+        ]
+      },
+      "8": {
+        "link_latency_us": 12.96,
+        "peak_busbw_gbps": 444.82,
+        "all_reduce": [
+          {
+            "size": "4 KiB",
+            "lat_us": 25.92,
+            "algbw_gbps": 0.16,
+            "busbw_gbps": 0.28
+          },
+          {
+            "size": "16 KiB",
+            "lat_us": 23.85,
+            "algbw_gbps": 0.69,
+            "busbw_gbps": 1.2
+          },
+          {
+            "size": "64 KiB",
+            "lat_us": 23.04,
+            "algbw_gbps": 2.84,
+            "busbw_gbps": 4.98
+          },
+          {
+            "size": "256 KiB",
+            "lat_us": 22.85,
+            "algbw_gbps": 11.47,
+            "busbw_gbps": 20.08
+          },
+          {
+            "size": "1 MiB",
+            "lat_us": 25.72,
+            "algbw_gbps": 40.78,
+            "busbw_gbps": 71.36
+          },
+          {
+            "size": "4 MiB",
+            "lat_us": 51.02,
+            "algbw_gbps": 82.21,
+            "busbw_gbps": 143.86
+          },
+          {
+            "size": "16 MiB",
+            "lat_us": 117.73,
+            "algbw_gbps": 142.51,
+            "busbw_gbps": 249.39
+          },
+          {
+            "size": "64 MiB",
+            "lat_us": 322.56,
+            "algbw_gbps": 208.05,
+            "busbw_gbps": 364.09
+          },
+          {
+            "size": "256 MiB",
+            "lat_us": 1056.06,
+            "algbw_gbps": 254.18,
+            "busbw_gbps": 444.82
+          }
+        ],
+        "all_to_all": [
+          {
+            "size": "4 KiB",
+            "lat_us": 33.13,
+            "algbw_gbps": 0.12,
+            "busbw_gbps": 0.11
+          },
+          {
+            "size": "16 KiB",
+            "lat_us": 31.09,
+            "algbw_gbps": 0.53,
+            "busbw_gbps": 0.46
+          },
+          {
+            "size": "64 KiB",
+            "lat_us": 41.24,
+            "algbw_gbps": 1.59,
+            "busbw_gbps": 1.39
+          },
+          {
+            "size": "256 KiB",
+            "lat_us": 33.48,
+            "algbw_gbps": 7.83,
+            "busbw_gbps": 6.85
+          },
+          {
+            "size": "1 MiB",
+            "lat_us": 34.27,
+            "algbw_gbps": 30.6,
+            "busbw_gbps": 26.77
+          },
+          {
+            "size": "4 MiB",
+            "lat_us": 35.19,
+            "algbw_gbps": 119.2,
+            "busbw_gbps": 104.3
+          },
+          {
+            "size": "16 MiB",
+            "lat_us": 80.14,
+            "algbw_gbps": 209.34,
+            "busbw_gbps": 183.17
+          },
+          {
+            "size": "64 MiB",
+            "lat_us": 235.14,
+            "algbw_gbps": 285.4,
+            "busbw_gbps": 249.73
+          },
+          {
+            "size": "256 MiB",
+            "lat_us": 859.31,
+            "algbw_gbps": 312.38,
+            "busbw_gbps": 273.34
+          }
+        ]
+      }
+    }
+  },
+  "overhead": {},
+  "calibrated_chip": {
+    "name": "H20-3e",
+    "peak_tflops": {
+      "bf16": 134.13,
+      "fp8": 273.85,
+      "fp4": null
+    },
+    "spec_tflops": {
+      "bf16": 148.0,
+      "fp8": 296.0,
+      "fp4": null
+    },
+    "flops_eff": {
+      "bf16": 0.9063,
+      "fp8": 0.9252,
+      "fp4": null
+    },
+    "hbm_bw_gbps": 4000.0,
+    "hbm_achieved_gbps": 4371.91,
+    "bw_eff": 1.0,
+    "hbm_gb": 150.12,
+    "link_bw_gbps": 450.0,
+    "link_bidir_bw_gbps": 900.0,
+    "link_achieved_gbps": 444.82,
+    "link_eff": 0.9885,
+    "link_latency_us": 12.96,
+    "max_chips": 8
+  }
+}

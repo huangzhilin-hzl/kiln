@@ -10,9 +10,9 @@ def make_engine(cfg: EngineConfig, tier: TierConfig) -> Engine:
     if kind == "mock":
         from .mock import MockEngine
         return MockEngine(tier)
-    if kind == "vllm":
-        from .vllm_engine import VLLMEngine
-        return VLLMEngine(cfg, tier)
+    if kind in ("vllm_offline", "vllm"):
+        from .vllm_offline import VLLMOfflineEngine
+        return VLLMOfflineEngine(cfg, tier)
     if kind == "vllm_server":
         from .vllm_server import VLLMServerEngine
         return VLLMServerEngine(cfg, tier)

@@ -27,7 +27,7 @@ from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
 from .base import Engine, InvalidBenchmark, MeasureResult
-from .vllm_engine import _configure_torch_profiler, _summarize_trace
+from .vllm_profiler import configure_torch_profiler, summarize_trace
 
 
 def _cli_args(d: dict) -> list[str]:
@@ -70,7 +70,7 @@ class VLLMServerEngine(Engine):
         args.update(self.cfg.extra_args)
         args.update(self.tier.engine_overrides)
         if self.tier.trace_kernels:
-            self._trace_dir = _configure_torch_profiler(args, self.tier.name)
+            self._trace_dir = configure_torch_profiler(args, self.tier.name)
         args.update(worker_extension_cls="kiln.engine.vllm_ext.HotReloadExt",
                     port=self.port, host="127.0.0.1")
         if self.tier.num_layers is not None:
@@ -164,7 +164,7 @@ class VLLMServerEngine(Engine):
                 list(pool.map(lambda req: self._complete_one(req.prompt_ids, 32), requests[:4]))
             finally:
                 self.http.post(f"{self.url}/stop_profile").raise_for_status()
-            return _summarize_trace(self._trace_dir)
+            return summarize_trace(self._trace_dir)
         except Exception:
             return None
 

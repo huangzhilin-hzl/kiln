@@ -28,7 +28,8 @@ tiers. Winners get promoted. When traffic shifts, you run the loop again.
 | Path | What it is | TKCC section |
 |---|---|---|
 | `kiln/engine/vllm_ext.py` | vLLM worker extension: `kiln_hot_reload` / `kiln_teardown` (swap `forward`, re-capture CUDA graphs) | §4.2, Fig 3 |
-| `kiln/engine/vllm_engine.py` | Persistent engine for one tier. The fast tier truncates layers with `hf_overrides`. Prefill and decode are measured separately. | §4.2, Table 1 |
+| `kiln/engine/vllm_offline.py` | Persistent offline `vllm.LLM` engine. Fast tier can truncate layers with `hf_overrides`; prefill and decode are measured separately. | §4.2, Table 1 |
+| `kiln/engine/vllm_server.py` | Persistent `vllm serve` HTTP engine measured with AgentX (or `/v1/completions` replay when shared). | §4.2 |
 | `kiln/engine/mock.py` | CPU mock engine, so the whole loop runs on a laptop | — |
 | `kiln/server/jobs.py` | One queue per tier, a worker thread per engine, auto-restart on crash, leaderboard | §4.2 |
 | `kiln/server/board.py` | Shared message board for agents | Fig 5c |
@@ -59,7 +60,7 @@ kiln uses the same workload as the TKCC paper: AgentX's public agentic-coding tr
 
 | Tier | How AgentX is used | Fidelity |
 |---|---|---|
-| fast (`engine_kind: vllm`) | `kiln agentx-export` builds offline requests from the same traces. Request lengths and hash-block prefix sharing are exact; block content is real Python code (AgentX uses synthetic coding text); timing and subagent concurrency are not replayed. | Approximate, quick |
+| fast (`engine_kind: vllm_offline`) | `kiln agentx-export` builds offline requests from the same traces. Request lengths and hash-block prefix sharing are exact; block content is real Python code (AgentX uses synthetic coding text); timing and subagent concurrency are not replayed. | Approximate, quick |
 | slow (`engine_kind: vllm_server`) | `vllm serve` (with `VLLM_SERVER_DEV_MODE=1`) is measured by the real `agentx profile` harness. Hot reload goes through `/collective_rpc`. Score = InferenceX throughput/GPU; P90 interactivity is recorded in `extra`. | Exact protocol |
 
 ```bash

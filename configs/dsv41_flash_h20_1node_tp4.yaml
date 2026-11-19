@@ -7,7 +7,7 @@
 #   slow tier: GPUs 4-7, TP4, `vllm serve` + DSpark + real AgentX harness (256k corpus).
 name: dsv41-flash-h20-1node-tp4
 engine:
-  kind: vllm
+  kind: vllm_offline
   model: /path/to/DeepSeek-V4.1-Flash          # MXFP4/FP8 checkpoint (~510 GB total; ~315 GB w/ Engram offloaded)
   tensor_parallel_size: 4
   max_model_len: 262144
@@ -20,7 +20,7 @@ engine:
     speculative_config: {method: dspark, num_speculative_tokens: 5}
 tiers:
   - name: fast
-    engine_kind: vllm
+    engine_kind: vllm_offline
     gpus: [0, 1, 2, 3]
     max_requests: 16
     repeats: 3

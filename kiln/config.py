@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field, field_validator
 from kiln.bench.agentx import AgentXConfig
 
 
+EngineKind = Literal["mock", "vllm_offline", "vllm_server", "vllm"]
+
+
 class TierConfig(BaseModel):
     name: Literal["fast", "slow"]
     # Number of decoder layers kept in this tier's engine (None = all layers).
@@ -21,8 +24,8 @@ class TierConfig(BaseModel):
     # Extra LLM(...) kwargs for this tier only, merged over engine.extra_args.
     # e.g. fast tier: {speculative_config: null} -- truncated models break MTP/DSpark layers.
     engine_overrides: dict = Field(default_factory=dict)
-    # Per-tier engine kind (defaults to engine.kind). "vllm_server" = `vllm serve` + AgentX harness.
-    engine_kind: Literal["mock", "vllm", "vllm_server"] | None = None
+    # Per-tier engine kind (defaults to engine.kind): "vllm_offline" (`vllm.LLM`) or "vllm_server" (`vllm serve`).
+    engine_kind: EngineKind | None = None
     share_engine: str | None = None              # reuse another local tier's engine (single-node mode)
     port: int | None = None                      # vllm_server only
     agentx: dict | None = None                   # vllm_server only: AgentXConfig fields
@@ -40,7 +43,7 @@ class TierConfig(BaseModel):
 
 
 class EngineConfig(BaseModel):
-    kind: Literal["mock", "vllm", "vllm_server"] = "mock"
+    kind: EngineKind = "mock"
     model: str = "meta-llama/Llama-3.2-1B-Instruct"
     tokenizer: str | None = None                 # defaults to model
     tensor_parallel_size: int = 1

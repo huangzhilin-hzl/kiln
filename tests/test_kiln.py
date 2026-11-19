@@ -68,10 +68,12 @@ def test_parse_agentx_export(tmp_path: Path):
 def test_dsv41_h20_config_and_costmodel():
     run = RunConfig.load("configs/dsv41_flash_h20.yaml")
     assert run.engine.tensor_parallel_size == 8
-    assert "codex exec" in run.agents.command
+    assert "agy" in run.agents.command and "gemini-4-neon" in run.agents.command
+    assert "{prompt}" in run.agents.command
     assert run.client_url == "http://127.0.0.1:8765"
     fast, slow = run.tiers
     assert fast.max_requests == 16 and fast.num_layers is None
+    assert fast.engine_kind == "vllm_offline"
     assert slow.engine_kind == "vllm_server"
 
     rows = rank(MODELS["deepseek4.1-flash"], CHIPS["h20-3e"],
@@ -256,3 +258,16 @@ def test_vllm_server_measure_requests_fallback():
     res = eng.measure(reqs, repeats=2, trace=False)
     assert res.decode_tps > 0 and res.prefill_tps > 0
     assert len(res.runs_decode_tps) == 2
+
+
+def test_engine_factory_vllm_offline_and_server():
+    from kiln.config import EngineConfig, TierConfig
+    from kiln.engine import make_engine
+    from kiln.engine.vllm_offline import VLLMOfflineEngine
+    from kiln.engine.vllm_server import VLLMServerEngine
+
+    tier = TierConfig(name="fast")
+    assert isinstance(make_engine(EngineConfig(kind="vllm_offline"), tier), VLLMOfflineEngine)
+    assert isinstance(make_engine(EngineConfig(kind="vllm"), tier), VLLMOfflineEngine)
+    assert isinstance(make_engine(EngineConfig(kind="vllm_server"), tier), VLLMServerEngine)
+

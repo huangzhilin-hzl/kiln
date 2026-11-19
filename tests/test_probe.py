@@ -178,7 +178,12 @@ def test_checked_in_b300_profile():
         assert secret not in raw.lower()
     prof = HardwareProfile.load(path)
     assert prof.is_mock is False
-    assert prof.calibrated_chip["name"] == "B300"
+    cc = prof.calibrated_chip
+    assert cc["name"] == "B300"
+    assert set(cc["peak_tflops"]) == {"bf16", "fp8", "fp4"}
+    assert cc["peak_tflops"]["fp4"] > cc["peak_tflops"]["fp8"] > cc["peak_tflops"]["bf16"] > 0
+    assert cc["spec_tflops"] == {"bf16": 2250.0, "fp8": 4500.0, "fp4": 9000.0}
+    assert all(0 < cc["flops_eff"][dt] <= 1.0 for dt in ("bf16", "fp8", "fp4"))
     assert prof.topology["interconnect"] == "NVLink/NVSwitch (NV18)"
     rows = rank(MODELS["deepseek-v4.1-flash"], prof.to_chip_spec(), Workload(), max_chips=8)
     assert rows and rows[0]["tpm_per_chip"] > 0

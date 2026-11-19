@@ -38,20 +38,20 @@ GIB = 1024 * MIB
 # Reference datasheet peaks (unidirectional link_bw matches `nccl-tests` busbw convention).
 # Order matters: more specific SKU substrings come first.
 _SPEC_DB: list[tuple[str, dict]] = [
-    ("H20-3E", {"name": "H20-3e", "flops": 148e12, "hbm_bw": 4.0e12, "link_bw": 450 * GB, "l2_mb": 60, "fp4_tc": False}),
-    ("H200",   {"name": "H200",   "flops": 989e12, "hbm_bw": 4.8e12, "link_bw": 450 * GB, "l2_mb": 50, "fp4_tc": False}),
-    ("H20",    {"name": "H20",    "flops": 148e12, "hbm_bw": 4.0e12, "link_bw": 450 * GB, "l2_mb": 60, "fp4_tc": False}),
-    ("H100",   {"name": "H100",   "flops": 989e12, "hbm_bw": 3.35e12, "link_bw": 450 * GB, "l2_mb": 50, "fp4_tc": False}),
-    ("GB300",  {"name": "GB300",  "flops": 2500e12, "hbm_bw": 8.0e12, "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
-    ("B300",   {"name": "B300",   "flops": 2250e12, "hbm_bw": 8.0e12, "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
-    ("GB200",  {"name": "GB200",  "flops": 2500e12, "hbm_bw": 8.0e12, "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
-    ("B200",   {"name": "B200",   "flops": 2250e12, "hbm_bw": 8.0e12, "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
-    ("A100",   {"name": "A100",   "flops": 312e12, "hbm_bw": 2.0e12, "link_bw": 300 * GB, "l2_mb": 40, "fp4_tc": False}),
-    ("L40S",   {"name": "L40S",   "flops": 362e12, "hbm_bw": 0.864e12, "link_bw": 32 * GB, "l2_mb": 96, "fp4_tc": False}),
-    ("4090",   {"name": "RTX4090", "flops": 165e12, "hbm_bw": 1.008e12, "link_bw": 32 * GB, "l2_mb": 72, "fp4_tc": False}),
-    ("MI355X", {"name": "MI355X", "flops": 2500e12, "hbm_bw": 8.0e12, "link_bw": 538 * GB, "l2_mb": 256, "fp4_tc": True}),
-    ("MI325X", {"name": "MI325X", "flops": 1307e12, "hbm_bw": 6.0e12, "link_bw": 448 * GB, "l2_mb": 256, "fp4_tc": False}),
-    ("MI300X", {"name": "MI300X", "flops": 1307e12, "hbm_bw": 5.3e12, "link_bw": 448 * GB, "l2_mb": 256, "fp4_tc": False}),
+    ("H20-3E", {"name": "H20-3e", "flops": 148e12,  "fp8_flops": 296e12,  "fp4_flops": None,     "hbm_bw": 4.0e12,   "link_bw": 450 * GB, "l2_mb": 60,  "fp4_tc": False}),
+    ("H200",   {"name": "H200",   "flops": 989e12,  "fp8_flops": 1979e12, "fp4_flops": None,     "hbm_bw": 4.8e12,   "link_bw": 450 * GB, "l2_mb": 50,  "fp4_tc": False}),
+    ("H20",    {"name": "H20",    "flops": 148e12,  "fp8_flops": 296e12,  "fp4_flops": None,     "hbm_bw": 4.0e12,   "link_bw": 450 * GB, "l2_mb": 60,  "fp4_tc": False}),
+    ("H100",   {"name": "H100",   "flops": 989e12,  "fp8_flops": 1979e12, "fp4_flops": None,     "hbm_bw": 3.35e12,  "link_bw": 450 * GB, "l2_mb": 50,  "fp4_tc": False}),
+    ("GB300",  {"name": "GB300",  "flops": 2500e12, "fp8_flops": 5000e12, "fp4_flops": 10000e12, "hbm_bw": 8.0e12,   "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
+    ("B300",   {"name": "B300",   "flops": 2250e12, "fp8_flops": 4500e12, "fp4_flops": 9000e12,  "hbm_bw": 8.0e12,   "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
+    ("GB200",  {"name": "GB200",  "flops": 2500e12, "fp8_flops": 5000e12, "fp4_flops": 10000e12, "hbm_bw": 8.0e12,   "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
+    ("B200",   {"name": "B200",   "flops": 2250e12, "fp8_flops": 4500e12, "fp4_flops": 9000e12,  "hbm_bw": 8.0e12,   "link_bw": 900 * GB, "l2_mb": 126, "fp4_tc": True}),
+    ("A100",   {"name": "A100",   "flops": 312e12,  "fp8_flops": None,    "fp4_flops": None,     "hbm_bw": 2.0e12,   "link_bw": 300 * GB, "l2_mb": 40,  "fp4_tc": False}),
+    ("L40S",   {"name": "L40S",   "flops": 362e12,  "fp8_flops": 733e12,  "fp4_flops": None,     "hbm_bw": 0.864e12, "link_bw": 32 * GB,  "l2_mb": 96,  "fp4_tc": False}),
+    ("4090",   {"name": "RTX4090","flops": 165e12,  "fp8_flops": 330e12,  "fp4_flops": None,     "hbm_bw": 1.008e12, "link_bw": 32 * GB,  "l2_mb": 72,  "fp4_tc": False}),
+    ("MI355X", {"name": "MI355X", "flops": 2500e12, "fp8_flops": 5000e12, "fp4_flops": 10000e12, "hbm_bw": 8.0e12,   "link_bw": 538 * GB, "l2_mb": 256, "fp4_tc": True}),
+    ("MI325X", {"name": "MI325X", "flops": 1307e12, "fp8_flops": 2614e12, "fp4_flops": None,     "hbm_bw": 6.0e12,   "link_bw": 448 * GB, "l2_mb": 256, "fp4_tc": False}),
+    ("MI300X", {"name": "MI300X", "flops": 1307e12, "fp8_flops": 2614e12, "fp4_flops": None,     "hbm_bw": 5.3e12,   "link_bw": 448 * GB, "l2_mb": 256, "fp4_tc": False}),
 ]
 
 M_BUCKETS = [1, 8, 32, 128, 512, 4096]
@@ -238,7 +238,23 @@ class HardwareProfile:
             alltoall_by_k=a2a_by_k,
             cudagraph_per_kernel_s=float(self.overhead.get("cudagraph_per_kernel_us", 0.0)) * 1e-6,
         )
-        flops = float(cc["tflops"]) * 1e12 if "tflops" in cc else float(cc["flops"])
+        spec_map = cc.get("spec_tflops") if isinstance(cc.get("spec_tflops"), dict) else {}
+        peak_map = cc.get("peak_tflops") if isinstance(cc.get("peak_tflops"), dict) else {}
+        eff_map = cc.get("flops_eff") if isinstance(cc.get("flops_eff"), dict) else {}
+
+        if spec_map.get("bf16") is not None:
+            flops = float(spec_map["bf16"]) * 1e12
+        elif "tflops" in cc:
+            flops = float(cc["tflops"]) * 1e12
+        else:
+            flops = float(cc["flops"])
+
+        flops_eff = float(eff_map["bf16"]) if eff_map.get("bf16") is not None else float(cc["flops_eff"])
+        if peak_map.get("fp8") and peak_map.get("bf16"):
+            fp8_scale = float(peak_map["fp8"]) / float(peak_map["bf16"])
+        else:
+            fp8_scale = float(cc.get("fp8_scale", 2.0))
+
         hbm_bw = float(cc["hbm_bw_gbps"]) * 1e9 if "hbm_bw_gbps" in cc else float(cc["hbm_bw"])
         hbm_bytes = float(cc["hbm_gb"]) * GB if "hbm_gb" in cc else float(cc["hbm_bytes"])
         link_bw = float(cc["link_bw_gbps"]) * 1e9 if "link_bw_gbps" in cc else float(cc["link_bw"])
@@ -250,11 +266,11 @@ class HardwareProfile:
             hbm_bytes=hbm_bytes,
             link_bw=link_bw,
             link_latency=link_lat,
-            flops_eff=float(cc["flops_eff"]),
+            flops_eff=flops_eff,
             bw_eff=float(cc["bw_eff"]),
             link_eff=float(cc["link_eff"]),
             max_chips=int(cc["max_chips"]),
-            fp8_scale=float(cc.get("fp8_scale", 2.0)),
+            fp8_scale=fp8_scale,
             empirical=emp,
         )
 
@@ -464,36 +480,46 @@ def _build_calibrated_chip(topology: dict, bandwidth: dict, gemm: dict, comm: di
     dev_name = topology.get("device_name", "unknown")
     spec = _match_spec(dev_name)
     dtypes = gemm.get("dtypes", {})
-    bf16_peak = float((dtypes.get("bf16") or {}).get("peak_tflops", 0.0)) * 1e12
-    fp8_peak = float((dtypes.get("fp8_e4m3") or {}).get("peak_tflops", 0.0)) * 1e12
+    bf16_tflops = float((dtypes.get("bf16") or {}).get("peak_tflops", 0.0)) or None
+    fp8_info = dtypes.get("fp8_e4m3") or {}
+    fp8_tflops = float(fp8_info["peak_tflops"]) if fp8_info.get("supported") else None
+    fp4_info = dtypes.get("fp4") or {}
+    fp4_tflops = float(fp4_info["peak_tflops"]) if fp4_info.get("supported") else None
     hbm_ach = float(bandwidth.get("hbm_peak_achieved_gbps", 0.0)) * 1e9
 
     if spec:
-        flops_spec = float(spec["flops"])
-        flops_eff = min(1.0, bf16_peak / flops_spec) if bf16_peak > 0 else 0.6
+        bf16_spec = float(spec["flops"]) / 1e12
+        fp8_spec = float(spec["fp8_flops"]) / 1e12 if spec.get("fp8_flops") else None
+        fp4_spec = float(spec["fp4_flops"]) / 1e12 if spec.get("fp4_flops") else None
         hbm_spec = float(spec["hbm_bw"])
         bw_eff = min(1.0, hbm_ach / hbm_spec) if hbm_ach > 0 else 0.8
         link_spec = float(spec["link_bw"])
         short_name = spec["name"]
     else:
-        flops_spec = bf16_peak if bf16_peak > 0 else 100e12
-        flops_eff = 1.0
+        bf16_spec = bf16_tflops if bf16_tflops else 100.0
+        fp8_spec = fp8_tflops
+        fp4_spec = fp4_tflops if fp4_info.get("native_tc") else None
         hbm_spec = hbm_ach if hbm_ach > 0 else 1.0e12
         bw_eff = 1.0
         link_spec = 300 * GB
         short_name = dev_name
 
-    fp8_scale = (fp8_peak / bf16_peak) if (fp8_peak > 0 and bf16_peak > 0) else 2.0
+    def _eff(ach: float | None, sp: float | None) -> float | None:
+        if ach is None or sp is None or sp <= 0:
+            return None
+        return round(min(1.0, ach / sp), 4)
 
     groups = comm.get("groups") or {}
     link_lat_s = 5e-6
     link_eff = 0.7
+    peak_busbw_gbps = None
     if groups:
         k_max = str(max(map(int, groups)))
         g = groups[k_max]
         link_lat_s = max(0.5e-6, float(g.get("link_latency_us", 5.0)) * 1e-6)
         peak_busbw = float(g.get("peak_busbw_gbps", 0.0)) * 1e9
         if peak_busbw > 0:
+            peak_busbw_gbps = round(peak_busbw / 1e9, 2)
             if spec:
                 link_eff = min(1.0, peak_busbw / link_spec)
             else:
@@ -502,13 +528,27 @@ def _build_calibrated_chip(topology: dict, bandwidth: dict, gemm: dict, comm: di
     max_chips = max(int(topology.get("nvlink_clique_size", 1)), int(topology.get("num_gpus", 1)))
     return {
         "name": short_name,
-        "tflops": round(flops_spec / 1e12, 2),
-        "flops_eff": round(flops_eff, 4),
-        "fp8_scale": round(fp8_scale, 4),
+        "peak_tflops": {
+            "bf16": round(bf16_tflops, 2) if bf16_tflops is not None else None,
+            "fp8": round(fp8_tflops, 2) if fp8_tflops is not None else None,
+            "fp4": round(fp4_tflops, 2) if fp4_tflops is not None else None,
+        },
+        "spec_tflops": {
+            "bf16": round(bf16_spec, 2),
+            "fp8": round(fp8_spec, 2) if fp8_spec is not None else None,
+            "fp4": round(fp4_spec, 2) if fp4_spec is not None else None,
+        },
+        "flops_eff": {
+            "bf16": _eff(bf16_tflops, bf16_spec) or 0.6,
+            "fp8": _eff(fp8_tflops, fp8_spec),
+            "fp4": _eff(fp4_tflops, fp4_spec) if fp4_info.get("native_tc") else None,
+        },
         "hbm_bw_gbps": round(hbm_spec / 1e9, 2),
+        "hbm_achieved_gbps": round(hbm_ach / 1e9, 2) if hbm_ach > 0 else None,
         "bw_eff": round(bw_eff, 4),
         "hbm_gb": round(_topo_hbm_bytes(topology) / GB, 2),
         "link_bw_gbps": round(link_spec / 1e9, 2),
+        "link_achieved_gbps": peak_busbw_gbps,
         "link_eff": round(link_eff, 4),
         "link_latency_us": round(link_lat_s * 1e6, 2),
         "max_chips": max_chips,

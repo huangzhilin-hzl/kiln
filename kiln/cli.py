@@ -101,9 +101,18 @@ def cmd_costmodel(a):
         chip = prof.to_chip_spec()
         cc = prof.calibrated_chip
         tag = "mock" if prof.is_mock else "measured"
-        bf16 = (prof.gemm.get("dtypes", {}).get("bf16") or {}).get("peak_tflops", 0.0)
+        peaks = cc.get("peak_tflops") if isinstance(cc.get("peak_tflops"), dict) else {}
+        effs = cc.get("flops_eff") if isinstance(cc.get("flops_eff"), dict) else {"bf16": cc.get("flops_eff")}
+        t_parts = []
+        for k_dt, lbl in (("bf16", "BF16"), ("fp8", "FP8"), ("fp4", "FP4")):
+            if peaks.get(k_dt):
+                e_val = effs.get(k_dt)
+                t_parts.append(f"{lbl}={peaks[k_dt]:,.0f}" + (f"({e_val:.2f})" if e_val is not None else ""))
+        if not t_parts:
+            bf16 = (prof.gemm.get("dtypes", {}).get("bf16") or {}).get("peak_tflops", 0.0)
+            t_parts.append(f"BF16={bf16:,.1f}")
         hbm = prof.bandwidth.get("hbm_peak_achieved_gbps", 0.0)
-        print(f"[profile: {chip.name} ({tag}) | BF16={bf16:,.1f} TFLOP/s (eff={cc.get('flops_eff', 0):.2f}) "
+        print(f"[profile: {chip.name} ({tag}) | {' '.join(t_parts)} TFLOP/s "
               f"| HBM={hbm:,.0f} GB/s (eff={cc.get('bw_eff', 0):.2f}) "
               f"| link_lat={chip.link_latency * 1e6:.1f}us]")
     else:

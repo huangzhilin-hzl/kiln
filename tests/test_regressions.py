@@ -290,13 +290,23 @@ def test_vllm_reload_restores_live_kv_allocation(monkeypatch):
 
     cache.commit = commit
     ext = HotReloadExt()
+    kernel_cfg = SimpleNamespace(enable_flashinfer_autotune=True)
+    ext.vllm_config = SimpleNamespace(kernel_config=kernel_cfg)
     ext.model_runner = SimpleNamespace(extensible_kv_cache=cache, max_num_tokens=8,
                                        _dummy_run=lambda *a, **kw: None)
     ext._kiln_release_graphs = lambda: None
-    ext.compile_or_warm_up_model = lambda: commit(2)  # vLLM startup warmup shrinks the cache
+    seen_autotune = []
+
+    def warmup():
+        seen_autotune.append(kernel_cfg.enable_flashinfer_autotune)
+        commit(2)  # vLLM startup warmup shrinks the cache
+
+    ext.compile_or_warm_up_model = warmup
     ext._kiln_rebuild()
     assert cache.num_committed_blocks == 4096
     assert workspace == ["unlocked", "locked"]
+    assert seen_autotune == [False]
+    assert kernel_cfg.enable_flashinfer_autotune is True
 
 
 def test_spawn_agent_substitutes_prompt_placeholder(tmp_path):

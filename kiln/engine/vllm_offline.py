@@ -147,5 +147,9 @@ class VLLMOfflineEngine(Engine):
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
         sp = SamplingParams(max_tokens=max_new_tokens, temperature=0.0, ignore_eos=True)
-        outs = self.llm.generate([TokensPrompt(prompt_token_ids=p) for p in prompts], sp, use_tqdm=False)
-        return [list(o.outputs[0].token_ids) for o in outs]
+        self.llm.reset_prefix_cache()
+        out = []
+        for p in prompts:
+            o = self.llm.generate([TokensPrompt(prompt_token_ids=p)], sp, use_tqdm=False)[0]
+            out.append(list(o.outputs[0].token_ids))
+        return out

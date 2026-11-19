@@ -191,6 +191,12 @@ class HotReloadExt:
         runner = self.model_runner
         kv_cache = runner.extensible_kv_cache
         committed_blocks = kv_cache.num_committed_blocks if kv_cache is not None else None
+        vllm_cfg = getattr(self, "vllm_config", None)
+        kernel_cfg = getattr(vllm_cfg, "kernel_config", None)
+        has_autotune = kernel_cfg is not None and hasattr(kernel_cfg, "enable_flashinfer_autotune")
+        prev_autotune = kernel_cfg.enable_flashinfer_autotune if has_autotune else None
+        if has_autotune:
+            kernel_cfg.enable_flashinfer_autotune = False
         try:
             with preserve_serving_state(runner):   # warmup writes go to the null KV block
                 runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
@@ -200,4 +206,6 @@ class HotReloadExt:
                 if committed_blocks is not None:
                     kv_cache.commit(committed_blocks)
         finally:
+            if has_autotune:
+                kernel_cfg.enable_flashinfer_autotune = prev_autotune
             lock_workspace()

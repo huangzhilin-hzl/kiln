@@ -606,18 +606,19 @@
     "spec_tflops": {
       "bf16": 2250.0,
       "fp8": 4500.0,
-      "fp4": 9000.0
+      "fp4": 13500.0
     },
     "flops_eff": {
       "bf16": 0.7998,
       "fp8": 0.7448,
-      "fp4": 0.6181
+      "fp4": 0.4121
     },
     "hbm_bw_gbps": 8000.0,
     "hbm_achieved_gbps": 6971.38,
     "bw_eff": 0.8714,
     "hbm_gb": 287.43,
     "link_bw_gbps": 900.0,
+    "link_bidir_bw_gbps": 1800.0,
     "link_achieved_gbps": 651.62,
     "link_eff": 0.724,
     "link_latency_us": 13.38,

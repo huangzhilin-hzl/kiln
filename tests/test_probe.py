@@ -182,7 +182,8 @@ def test_checked_in_b300_profile():
     assert cc["name"] == "B300"
     assert set(cc["peak_tflops"]) == {"bf16", "fp8", "fp4"}
     assert cc["peak_tflops"]["fp4"] > cc["peak_tflops"]["fp8"] > cc["peak_tflops"]["bf16"] > 0
-    assert cc["spec_tflops"] == {"bf16": 2250.0, "fp8": 4500.0, "fp4": 9000.0}
+    assert cc["spec_tflops"] == {"bf16": 2250.0, "fp8": 4500.0, "fp4": 13500.0}
+    assert cc["link_bw_gbps"] == 900.0 and cc["link_bidir_bw_gbps"] == 1800.0
     assert all(0 < cc["flops_eff"][dt] <= 1.0 for dt in ("bf16", "fp8", "fp4"))
     assert prof.topology["interconnect"] == "NVLink/NVSwitch (NV18)"
     rows = rank(MODELS["deepseek-v4.1-flash"], prof.to_chip_spec(), Workload(), max_chips=8)

@@ -1,0 +1,46 @@
+.gitignore
+  h_7339bf36ecd0bc 6
+README.md
+  h_7339bf36ecd0bc 31-32,63
+configs/dsv41_flash_h20.yaml
+  h_7339bf36ecd0bc 1,3,9-10,16,20-28,32,45,47-50,63-64
+configs/dsv41_flash_h20_1node.yaml
+  h_7339bf36ecd0bc 15,19-27,43,45-48,61
+configs/dsv41_flash_h20_1node_tp4.yaml
+  h_7339bf36ecd0bc 10,23
+configs/llama1b_vllm.yaml
+  h_7339bf36ecd0bc 5
+kiln/agents/launcher.py
+  h_7339bf36ecd0bc 3-5,32-36,60-70,72-74,80-81
+kiln/agents/prompt.md
+  h_7339bf36ecd0bc 13
+kiln/config.py
+  h_7339bf36ecd0bc 13-15,27-28,46
+kiln/engine/factory.py
+  h_7339bf36ecd0bc 13-15
+kiln/engine/vllm_offline.py
+  h_7339bf36ecd0bc 1,17,25,55,144
+kiln/engine/vllm_profiler.py
+  h_7339bf36ecd0bc 1-43
+kiln/engine/vllm_server.py
+  h_7339bf36ecd0bc 30,73,167
+profiles/h20_3e_hw_profile.json
+  h_7339bf36ecd0bc 1-528
+pyproject.toml
+  h_7339bf36ecd0bc 30-32
+tests/test_kiln.py
+  h_7339bf36ecd0bc 71-72,76,261-273
+tests/test_regressions.py
+  h_7339bf36ecd0bc 300-312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4ded5c53a78c296df54c582fb439958944563f55",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

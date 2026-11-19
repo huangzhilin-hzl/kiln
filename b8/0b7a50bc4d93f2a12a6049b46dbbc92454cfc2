@@ -1,0 +1,22 @@
+configs/dsv41_flash_h20.yaml
+  h_7339bf36ecd0bc 55-56,65
+kiln/bench/agentx.py
+  h_7339bf36ecd0bc 159,164-171,222-223
+kiln/engine/vllm_server.py
+  h_7339bf36ecd0bc 220-221,228-231
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 480-481
+tests/test_regressions.py
+  h_7339bf36ecd0bc 20-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b80b7a50bc4d93f2a12a6049b46dbbc92454cfc2",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

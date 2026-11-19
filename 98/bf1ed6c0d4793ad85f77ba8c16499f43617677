@@ -1,0 +1,20 @@
+README.md
+  h_7339bf36ecd0bc 39
+kiln/costmodel/probe.py
+  h_7339bf36ecd0bc 71,88-89,94-96,260-261
+profiles/b300_hw_profile.json
+  h_7339bf36ecd0bc 1-612
+tests/test_probe.py
+  h_7339bf36ecd0bc 20,172-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "98bf1ed6c0d4793ad85f77ba8c16499f43617677",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

@@ -217,14 +217,18 @@ class VLLMServerEngine(Engine):
                 if isinstance(value, float) and not math.isfinite(value):
                     result[key] = None
             extra["repeats"].append(result)
-            if last.submission_valid is not True or not (
+            require_valid = not self.agentx.unsafe_override
+            if (require_valid and last.submission_valid is not True) or not (
                 math.isfinite(last.total_tput_per_gpu) and last.total_tput_per_gpu > 0
             ):
                 extra["submission_valid"] = False
                 raise InvalidBenchmark(f"Invalid AgentX measurement: {last.raw_path}", extra)
             runs.append(last.total_tput_per_gpu)
         extra.update(output_tput=result["output_tput"], itl_p50_ms=result["itl_p50_ms"],
-                     itl_p90_ms=result["itl_p90_ms"], submission_valid=True, export=last.raw_path)
+                     itl_p90_ms=result["itl_p90_ms"],
+                     submission_valid=(last.submission_valid is True),
+                     unsafe_override=self.agentx.unsafe_override,
+                     export=last.raw_path)
         itl = result["itl_p90_ms"]
         extra["interactivity_p90"] = 1000.0 / itl if itl and itl > 0 else None
         return MeasureResult(

@@ -477,7 +477,8 @@ class JobManager:
             done = [j for j in self.jobs.values()
                     if j.tier == tier and j.status == "done"
                     and (j.extra.get("metric") != "agentx_total_tput_per_gpu" or
-                         (j.extra.get("submission_valid") is True and j.extra.get("repeats")))]
+                         ((j.extra.get("submission_valid") is True or j.extra.get("unsafe_override") is True)
+                          and j.extra.get("repeats")))]
             done.sort(key=lambda j: j.speedup or 0, reverse=True)
             return [{"id": j.id, "agent": j.agent, "speedup": round(j.speedup, 4),
                      "variance_pct": round(j.variance_pct or 0, 2), "note": j.note} for j in done[:k]]

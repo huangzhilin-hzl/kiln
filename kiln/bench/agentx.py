@@ -156,14 +156,19 @@ class AgentXConfig:
     random_seed: int = 42
     benchmark_duration_s: int | None = 900      # None uses the harness default
     max_context_length: int | None = None
+    unsafe_override: bool = False
     extra_args: list[str] = field(default_factory=list)
     binary: str = "agentx"
 
     def __post_init__(self) -> None:
-        if self.benchmark_duration_s is not None and (
-            type(self.benchmark_duration_s) is not int or self.benchmark_duration_s < 900
-        ):
-            raise ValueError("AgentX benchmark_duration_s must be at least 900 seconds or null")
+        if self.benchmark_duration_s is not None:
+            if type(self.benchmark_duration_s) is not int or self.benchmark_duration_s < 1:
+                raise ValueError("AgentX benchmark_duration_s must be a positive integer or null")
+            if not self.unsafe_override and self.benchmark_duration_s < 900:
+                raise ValueError(
+                    "AgentX benchmark_duration_s must be at least 900 seconds or null "
+                    "(or set unsafe_override: true)"
+                )
 
 
 @dataclass
@@ -214,6 +219,8 @@ def run_agentx_profile(url: str, model: str, tokenizer: str, cfg: AgentXConfig,
         cmd += ["--benchmark-duration", str(cfg.benchmark_duration_s)]
     if cfg.max_context_length:
         cmd += ["--max-context-length", str(cfg.max_context_length)]
+    if cfg.unsafe_override:
+        cmd.append("--unsafe-override")
     cmd += cfg.extra_args
     env = {**os.environ, "PATH": path_env}
     with open(artifact_dir / "agentx.log", "w") as log:

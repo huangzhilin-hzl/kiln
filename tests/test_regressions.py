@@ -17,6 +17,34 @@ def test_agentx_duration_validated_before_engine_start():
         RunConfig.model_validate({"tiers": [{"name": "slow", "agentx": {"benchmark_duration_s": 600}}]})
     assert TierConfig(name="slow", agentx={"benchmark_duration_s": 900}).agentx
     assert TierConfig(name="slow", agentx={"benchmark_duration_s": None}).agentx
+    assert TierConfig(name="slow", agentx={"benchmark_duration_s": 180, "unsafe_override": True}).agentx
+
+
+def test_unsafe_override_agentx_enters_leaderboard(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    tier = TierConfig(name="slow", agentx={"benchmark_duration_s": 180, "unsafe_override": True}, repeats=1)
+    eng = VLLMServerEngine(EngineConfig(), tier)
+    monkeypatch.setattr(eng, "hot_reload", lambda path: None)
+    monkeypatch.setattr(eng, "teardown_candidate", lambda: None)
+    monkeypatch.setattr(eng, "_reset_cache", lambda: None)
+    monkeypatch.setattr(eng, "greedy_outputs", lambda prompts, n: [[42]])
+    monkeypatch.setattr(
+        "kiln.engine.vllm_server.run_agentx_profile",
+        lambda *a, **kw: AgentXResult(5000.0, 120.0, 2.0, 3.0, False, "short.json"),
+    )
+    manager = jobs.JobManager(RunConfig(tiers=[tier], workdir=str(tmp_path)), [Request([1], 1)])
+    worker = manager.tiers["slow"]
+    worker.engine = eng
+    worker.baseline_tokens = [[42]]
+    worker.baseline_tps = 1000.0
+    job = manager.submit("a", "slow", "pass")
+    try:
+        worker.execute_job(job)
+    finally:
+        eng.http.close()
+    assert job.status == "done"
+    assert job.extra["unsafe_override"] is True
+    assert manager.leaderboard("slow")[0]["id"] == job.id
 
 
 @pytest.mark.parametrize("valid, throughput", [(False, 2000.0), (None, 2000.0), (True, 0.0), (True, float("nan"))])

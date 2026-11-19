@@ -1,0 +1,24 @@
+configs/dsv41_flash_h20.yaml
+  h_7339bf36ecd0bc 24-26,58-60
+configs/dsv41_flash_h20_1node.yaml
+  h_7339bf36ecd0bc 23-25,56-58
+kiln/engine/vllm_ext.py
+  h_7339bf36ecd0bc 194-199,209-210
+kiln/engine/vllm_offline.py
+  h_7339bf36ecd0bc 150-155
+tests/test_kiln.py
+  h_7339bf36ecd0bc 71
+tests/test_regressions.py
+  h_7339bf36ecd0bc 293-294,298-304,308-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7a09852eb96301e279e23a0afa5dae9e673783fd",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

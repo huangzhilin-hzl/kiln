@@ -348,3 +348,25 @@ def test_spawn_agent_substitutes_prompt_placeholder(tmp_path):
     assert proc.wait(timeout=5) == 0
     log.close()
     assert (tmp_path / "agent.log").read_text() == "hello\nmulti-line $prompt True\n"
+
+
+def test_parse_quota_backoff(tmp_path):
+    from kiln.agents.launcher import _parse_quota_backoff
+
+    log = tmp_path / "agent.log"
+    assert _parse_quota_backoff(log) is None
+
+    log.write_text("ok run\nerror: Individual quota reached. Resets in 1h2m12s.\n")
+    assert _parse_quota_backoff(log, slot_idx=0) == 3732.0
+    assert _parse_quota_backoff(log, slot_idx=2) == 3762.0
+
+    log.write_text("AGY_ERROR: {\"error_code\":429,\"message\":\"Resets in 55m50s.\"}\n")
+    assert _parse_quota_backoff(log, slot_idx=0) == 3350.0
+
+    log.write_text("AGY_ERROR: RESOURCE_EXHAUSTED (no reset timer)\n")
+    assert _parse_quota_backoff(log, slot_idx=1) == 315.0
+
+    log.write_text(
+        "old RESOURCE_EXHAUSTED Resets in 50m0s\n[kiln] respawned\nnormal non-429 crash\n"
+    )
+    assert _parse_quota_backoff(log, slot_idx=0) is None

@@ -7,6 +7,7 @@ or via an argv `{prompt}` placeholder (Antigravity `agy ... -p {prompt}`) works.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -25,6 +26,31 @@ CONTINUE_NOTE = (
     "You are resuming an ongoing optimization run in this workspace. Inspect your current `forward.py`, "
     "check `kiln board` and `kiln leaderboard`, and continue iterating on new speedups.\n"
 )
+
+_QUOTA_MARKERS = ("RESOURCE_EXHAUSTED", '"error_code":429', "Individual quota reached")
+_RESET_RE = re.compile(r"Resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
+
+
+def _parse_quota_backoff(log_path: Path, slot_idx: int = 0) -> float | None:
+    """Return backoff seconds if the latest agent run ended with a 429 quota error."""
+    if not log_path.exists():
+        return None
+    with open(log_path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 8192))
+        tail = f.read().decode("utf-8", errors="ignore")
+    segment = tail.rsplit("[kiln]", 1)[-1][-4096:] if "[kiln]" in tail else tail[-4096:]
+    if not any(m in segment for m in _QUOTA_MARKERS):
+        return None
+    base_wait = 300.0
+    m = _RESET_RE.search(segment)
+    if m and any(g is not None for g in m.groups()):
+        hours = int(m.group(1) or 0)
+        mins = int(m.group(2) or 0)
+        secs = int(m.group(3) or 0)
+        base_wait = max(60.0, min(3900.0, float(hours * 3600 + mins * 60 + secs)))
+    return base_wait + 15.0 * slot_idx
 
 
 def _spawn_agent(cmd: list[str], ws: Path, env: dict[str, str], prompt_text: str):
@@ -74,6 +100,8 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
         cmd = [cmd[0], "--add-dir", str(refs_dir), *cmd[1:]]
     slots: list[dict] = []
     for i in range(1, n + 1):
+        if i > 1:
+            time.sleep(2.0)
         name = f"agent_{i}"
         ws = root / name
         ws.mkdir(exist_ok=True)
@@ -98,42 +126,76 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
             "TRITON_CACHE_DIR": str(triton_dir),
         }
         p, log = _spawn_agent(cmd, ws, env, prompt)
-        slots.append({"name": name, "ws": ws, "env": env, "prompt": prompt,
-                      "proc": p, "log": log, "failures": 0, "active": True})
+        slots.append({
+            "idx": i - 1, "name": name, "ws": ws, "env": env, "prompt": prompt,
+            "proc": p, "log": log, "failures": 0, "quota_retries": 0,
+            "wake_at": None, "active": True,
+        })
         print(f"[kiln] started {name} (pid {p.pid}) in {ws}")
 
     deadline = time.time() + run.agents.budget_hours * 3600
     try:
         while time.time() < deadline and any(s["active"] for s in slots):
             time.sleep(5)
+            now = time.time()
             for s in slots:
                 if not s["active"]:
+                    continue
+                if s["proc"] is None:
+                    if now >= deadline:
+                        s["active"] = False
+                        continue
+                    if s["wake_at"] is not None and now >= s["wake_at"]:
+                        p, log = _spawn_agent(cmd, s["ws"], s["env"], s["prompt"] + CONTINUE_NOTE)
+                        s.update(proc=p, log=log, wake_at=None)
+                        print(f"[kiln] respawned {s['name']} (pid {p.pid})")
                     continue
                 rc = s["proc"].poll()
                 if rc is None:
                     continue
                 s["log"].close()
-                if not run.agents.respawn_on_exit or time.time() >= deadline:
+                s["proc"] = None
+                if not run.agents.respawn_on_exit or now >= deadline:
                     s["active"] = False
                     continue
                 if rc != 0:
+                    wait_s = _parse_quota_backoff(s["ws"] / "agent.log", slot_idx=s["idx"])
+                    if wait_s is not None:
+                        s["quota_retries"] += 1
+                        if s["quota_retries"] > 24:
+                            print(f"[kiln] {s['name']} exceeded 24 quota retries; stopping")
+                            s["active"] = False
+                            continue
+                        with open(s["ws"] / "agent.log", "a", encoding="utf-8") as lf:
+                            lf.write(f"\n[kiln] {s['name']} hit 429 quota limit; backing off {wait_s:.0f}s\n")
+                        print(f"[kiln] {s['name']} hit 429 quota limit; backing off {wait_s:.0f}s")
+                        s["wake_at"] = now + wait_s
+                        continue
                     s["failures"] += 1
                     if s["failures"] >= 3:
                         print(f"[kiln] {s['name']} failed {s['failures']} times in a row (rc={rc}); "
                               f"see {s['ws'] / 'agent.log'}")
                         s["active"] = False
                         continue
-                else:
-                    s["failures"] = 0
+                    wait_s = 5.0 * s["failures"]
+                    with open(s["ws"] / "agent.log", "a", encoding="utf-8") as lf:
+                        lf.write(f"\n[kiln] {s['name']} exited (rc={rc}); retrying in {wait_s:.0f}s\n")
+                    s["wake_at"] = now + wait_s
+                    continue
+                s["failures"] = 0
+                s["quota_retries"] = 0
+                with open(s["ws"] / "agent.log", "a", encoding="utf-8") as lf:
+                    lf.write(f"\n[kiln] {s['name']} exited cleanly; respawning\n")
                 p, log = _spawn_agent(cmd, s["ws"], s["env"], s["prompt"] + CONTINUE_NOTE)
-                s.update(proc=p, log=log)
+                s.update(proc=p, log=log, wake_at=None)
                 print(f"[kiln] respawned {s['name']} (pid {p.pid})")
     except KeyboardInterrupt:
         pass
     finally:
         for s in slots:
             p = s["proc"]
-            if p.poll() is None:
+            if p is not None and p.poll() is None:
                 p.send_signal(signal.SIGTERM)
                 print(f"[kiln] stopped {s['name']}")
-            s["log"].close()
+            if s.get("log") is not None and not s["log"].closed:
+                s["log"].close()

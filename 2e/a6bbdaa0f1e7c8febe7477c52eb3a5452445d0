@@ -1,0 +1,16 @@
+candidates/dsv41_flash_h20_tp8_forward.py
+  h_7339bf36ecd0bc 1-5213
+configs/dsv41_flash_h20.yaml
+  h_7339bf36ecd0bc 55-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2ea6bbdaa0f1e7c8febe7477c52eb3a5452445d0",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

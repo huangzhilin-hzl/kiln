@@ -1,0 +1,14 @@
+README.md
+  h_7339bf36ecd0bc 3,5,16,20,27-28,31,35,37,41,43-46,52-70,72-75,77,80-83,86-90,93-97,99-101,104-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "58d7d684a148a4bcf498e8ac1a7b1ffa26dc57ad",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

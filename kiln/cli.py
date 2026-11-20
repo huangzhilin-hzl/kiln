@@ -88,9 +88,13 @@ def cmd_board(a):
 
 
 def cmd_agents(a):
-    from kiln.agents.launcher import launch
+    from kiln.agents.launcher import describe_slots, launch
     from kiln.config import RunConfig
-    launch(RunConfig.load(a.config))
+    run = RunConfig.load(a.config)
+    if a.dry_run:
+        _print(describe_slots(run))
+        return
+    launch(run)
 
 
 def cmd_costmodel(a):
@@ -188,6 +192,34 @@ def cmd_synth(a):
     print(f"wrote {a.out}")
 
 
+def cmd_index_refs(a):
+    from pathlib import Path
+    from kiln.agents.refs_index import ensure_refs_index
+    from kiln.config import RunConfig
+
+    model = a.model
+    engine = a.engine
+    if a.config:
+        run = RunConfig.load(a.config)
+        model = model or run.engine.model
+        engine = engine or run.engine.kind
+
+    out = ensure_refs_index(
+        a.refs,
+        model_hint=model,
+        engine_hint=engine,
+        out_path=a.out,
+        max_lines=a.max_lines,
+        force=a.force,
+    )
+    if out is None:
+        raise SystemExit(f"Refs directory does not exist: {a.refs}")
+    if a.print_index:
+        print(Path(out).read_text(encoding="utf-8"), end="")
+    else:
+        print(out)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="kiln")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -220,7 +252,9 @@ def main(argv=None):
     s.set_defaults(f=cmd_board)
 
     s = sp.add_parser("agents", help="launch N parallel coding agents")
-    s.add_argument("-c", "--config", required=True); s.set_defaults(f=cmd_agents)
+    s.add_argument("-c", "--config", required=True)
+    s.add_argument("--dry-run", action="store_true", help="print resolved per-slot CLI commands and exit")
+    s.set_defaults(f=cmd_agents)
 
     s = sp.add_parser("costmodel", help="rank parallelism configs")
     s.add_argument("--model", default="qwen3-30b-a3b"); s.add_argument("--chip", default="B200")
@@ -261,6 +295,17 @@ def main(argv=None):
     s.add_argument("--traces", type=int, default=32); s.add_argument("--turns", type=int, default=4)
     s.add_argument("--seed", type=int, default=42); s.add_argument("--max-context", type=int)
     s.set_defaults(f=cmd_agentx_export)
+
+    s = sp.add_parser("index-refs", help="generate a compact source index (refs/INDEX.md) for agents")
+    s.add_argument("--refs", default="refs", help="refs directory path")
+    s.add_argument("-c", "--config", help="optional run config YAML to infer model and engine")
+    s.add_argument("--model", help="model name or path hint (overrides --config)")
+    s.add_argument("--engine", help="engine kind hint (overrides --config)")
+    s.add_argument("-o", "--out", help="output index path (defaults to <refs>/INDEX.md)")
+    s.add_argument("--max-lines", type=int, default=85, help="maximum lines in generated INDEX.md")
+    s.add_argument("--force", action="store_true", help="overwrite even an existing or manual INDEX.md")
+    s.add_argument("--print", dest="print_index", action="store_true", help="print generated INDEX.md")
+    s.set_defaults(f=cmd_index_refs)
 
     a = p.parse_args(argv)
     a.f(a)

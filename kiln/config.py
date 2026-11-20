@@ -1,11 +1,13 @@
 """Run configuration (loaded from configs/*.yaml)."""
 from __future__ import annotations
 
+import shlex
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from kiln.bench.agentx import AgentXConfig
 
@@ -67,11 +69,189 @@ class CorrectnessConfig(BaseModel):
     max_new_tokens: int = 64
 
 
+AgentProvider = Literal["agy", "codex", "claude", "custom"]
+
+PROVIDER_COMMANDS: dict[str, str] = {
+    "agy": (
+        "agy --dangerously-skip-permissions --disable-slash-commands "
+        "--settings '{\"enableTerminalSandbox\":false}' -p {prompt}"
+    ),
+    "codex": (
+        "codex exec --dangerously-bypass-approvals-and-sandbox "
+        "--skip-git-repo-check -c shell_environment_policy.inherit=all -"
+    ),
+    "claude": "claude -p --dangerously-skip-permissions",
+}
+
+
+def _infer_provider(argv: list[str]) -> str:
+    exe = Path(argv[0]).name if argv else ""
+    return exe if exe in ("agy", "codex", "claude") else "custom"
+
+
+def _insert_provider_args(argv: list[str], provider: str, extra: list[str]) -> list[str]:
+    if not extra:
+        return list(argv)
+    if provider == "agy":
+        for i, tok in enumerate(argv):
+            if tok == "-p" and i + 1 < len(argv) and "{prompt}" in argv[i + 1]:
+                return [*argv[:i], *extra, *argv[i:]]
+        for i, tok in enumerate(argv):
+            if "{prompt}" in tok:
+                return [*argv[:i], *extra, *argv[i:]]
+    if provider == "codex" or (argv and argv[-1] == "-"):
+        if argv and argv[-1] == "-":
+            return [*argv[:-1], *extra, "-"]
+    return [*argv, *extra]
+
+
+def _apply_model_to_argv(
+    argv: list[str],
+    model: str,
+    provider: str | None = None,
+    allow_insert: bool = False,
+) -> list[str]:
+    if any("{model}" in tok for tok in argv):
+        return [tok.replace("{model}", model) for tok in argv]
+    out: list[str] = []
+    replaced = False
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--model", "-m") and i + 1 < len(argv):
+            out.extend([tok, model])
+            replaced = True
+            i += 2
+            continue
+        if tok.startswith("--model="):
+            out.append(f"--model={model}")
+            replaced = True
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    if replaced:
+        return out
+    if allow_insert and provider in ("agy", "codex", "claude"):
+        return _insert_provider_args(argv, provider, ["--model", model])
+    raise ValueError(
+        "agents.models requires '{model}' placeholder or '--model'/'-m' flag in agents.command(s)"
+    )
+
+
+def _extract_model(argv: list[str]) -> str | None:
+    for i, tok in enumerate(argv):
+        if tok in ("--model", "-m") and i + 1 < len(argv):
+            return argv[i + 1] or None
+        if tok.startswith("--model="):
+            return tok.split("=", 1)[1] or None
+    return None
+
+
+@dataclass(frozen=True)
+class ResolvedAgentSlot:
+    argv: list[str]
+    provider: str
+    model: str | None
+    env: dict[str, str]
+    label: str | None = None
+
+
+class AgentSlotConfig(BaseModel):
+    provider: AgentProvider | None = None
+    model: str | None = None
+    command: str | None = None
+    extra_args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    count: int = Field(default=1, ge=1)
+    name: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_slot(self) -> "AgentSlotConfig":
+        if self.provider is None and not (self.command and self.command.strip()):
+            raise ValueError("AgentSlotConfig requires 'provider' or non-empty 'command'")
+        if self.provider == "custom" and not (self.command and self.command.strip()):
+            raise ValueError("AgentSlotConfig with provider='custom' requires non-empty 'command'")
+        if self.command is not None and not self.command.strip():
+            raise ValueError("AgentSlotConfig.command must not be blank")
+        if self.model is not None and not self.model.strip():
+            raise ValueError("AgentSlotConfig.model must not be blank")
+        if any(not a.strip() for a in self.extra_args):
+            raise ValueError("AgentSlotConfig.extra_args entries must not be blank")
+        return self
+
+
 class AgentConfig(BaseModel):
-    num_agents: int = 4
+    num_agents: int = Field(default=4, ge=1)
     command: str = "codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -c shell_environment_policy.inherit=all -"
+    models: list[str] = Field(default_factory=list)
+    commands: list[str] = Field(default_factory=list)
+    slots: list[AgentSlotConfig] = Field(default_factory=list)
     budget_hours: float = 12.0
     respawn_on_exit: bool = True     # re-launch single-turn CLI agents (e.g. `codex exec`) until budget_hours
+
+    def resolve_slot(self, slot_idx: int) -> ResolvedAgentSlot:
+        """Return resolved CLI argv, provider, model, and env overrides for `slot_idx`."""
+        if self.slots:
+            expanded = [s for s in self.slots for _ in range(s.count)]
+            spec = expanded[slot_idx % len(expanded)]
+            raw_cmd = spec.command or PROVIDER_COMMANDS[spec.provider]  # type: ignore[index]
+            argv = shlex.split(raw_cmd)
+            if not argv:
+                raise ValueError("agents slot command must not be empty")
+            provider = spec.provider or _infer_provider(argv)
+            if spec.model is not None:
+                argv = _apply_model_to_argv(argv, spec.model, provider=provider, allow_insert=True)
+                slot_model: str | None = spec.model
+            else:
+                if any("{model}" in tok for tok in argv):
+                    raise ValueError("'{model}' placeholder in slot command requires 'model'")
+                slot_model = _extract_model(argv)
+            if spec.extra_args:
+                argv = _insert_provider_args(argv, provider, spec.extra_args)
+            return ResolvedAgentSlot(
+                argv=argv,
+                provider=provider,
+                model=slot_model,
+                env=dict(spec.env),
+                label=spec.name,
+            )
+
+        raw_cmd = self.commands[slot_idx % len(self.commands)] if self.commands else self.command
+        argv = shlex.split(raw_cmd)
+        if not argv:
+            raise ValueError("agents command must not be empty")
+        provider = _infer_provider(argv)
+        slot_model = self.models[slot_idx % len(self.models)] if self.models else None
+        if slot_model is not None:
+            argv = _apply_model_to_argv(argv, slot_model, provider=provider, allow_insert=False)
+        else:
+            if any("{model}" in tok for tok in argv):
+                raise ValueError("'{model}' placeholder in agents.command(s) requires non-empty agents.models")
+            slot_model = _extract_model(argv)
+        return ResolvedAgentSlot(argv=argv, provider=provider, model=slot_model, env={})
+
+    def resolve_slot_command(self, slot_idx: int) -> tuple[list[str], str | None]:
+        """Return (argv, model) for agent slot `slot_idx`, cycling through `commands` and `models`."""
+        slot = self.resolve_slot(slot_idx)
+        return slot.argv, slot.model
+
+    @model_validator(mode="after")
+    def _validate_slots(self) -> "AgentConfig":
+        if self.slots:
+            expanded = [s for s in self.slots for _ in range(s.count)]
+            if "num_agents" not in self.model_fields_set:
+                self.num_agents = len(expanded)
+            for i in range(max(self.num_agents, len(expanded))):
+                self.resolve_slot(i)
+            return self
+        if any(not m.strip() for m in self.models):
+            raise ValueError("agents.models entries must not be blank")
+        if any(not c.strip() for c in self.commands):
+            raise ValueError("agents.commands entries must not be blank")
+        for i in range(max(self.num_agents, len(self.models), len(self.commands))):
+            self.resolve_slot(i)
+        return self
 
 
 class RunConfig(BaseModel):

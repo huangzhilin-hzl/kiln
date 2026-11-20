@@ -14,6 +14,8 @@ real traffic) without changing outputs.
   rather than assuming `model.model.layers`. Keep custom kernels `torch.compile` and CUDA-graph safe
   (no host-device `.item()` / `.cpu()` syncs; register custom ops via `torch.library.custom_op` or
   the engine's custom-op helper). No quantization changes, and no changes to sampling semantics.
+- If `./refs/INDEX.md` exists, read it **first** to locate key classes and line numbers, and read only
+  the needed line ranges (e.g. `sed -n 'START,ENDp' refs/...`) instead of loading entire >20KB source files.
 
 ## Measuring (persistent engine, no restarts needed)
 - `kiln submit forward.py --tier fast --note "what you changed" --wait`

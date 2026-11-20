@@ -69,8 +69,16 @@ def test_dsv41_h20_config_and_costmodel():
     run = RunConfig.load("configs/dsv41_flash_h20.yaml")
     assert run.engine.tensor_parallel_size == 8
     assert run.engine.extra_args["engram_config"] == {"cpu_offload": False}
-    assert "agy" in run.agents.command and "gemini-4-neon" in run.agents.command
+    assert "agy" in run.agents.command and "{model}" in run.agents.command
     assert "{prompt}" in run.agents.command
+    assert run.agents.models == [
+        "gemini-4-neon-high",
+        "gemini-4-neon-high",
+        "gemini-4-carbon-high",
+        "claude-opus-5-5-high",
+    ]
+    resolved_models = [run.agents.resolve_slot_command(i)[1] for i in range(4)]
+    assert resolved_models == run.agents.models
     assert run.client_url == "http://127.0.0.1:8765"
     fast, slow = run.tiers
     assert fast.max_requests == 16 and fast.num_layers is None

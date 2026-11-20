@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash on 2x8 H20-3e GPUs (SM90, 141 GB HBM3e/GPU = 1,128 GB/node), vLLM main, AgentX + agy.
 #   Node 0 (8x H20-3e, TP8): job server + fast tier (full 40-layer CED/CSA2 model, 16-request AgentX slice,
-#                            kernel profiler, no spec decode) + 4 parallel agy (Gemini 4 Neon) agents.
+#                            kernel profiler, no spec decode) + 4 parallel mixed-model agy agents.
 #   Node 1 (8x H20-3e, TP8): slow tier via `kiln worker --tier slow --server http://<NODE0_IP>:8765`
 #                            (`vllm serve` + DSpark + real AgentX harness, 393-trace corpus, seed 42).
 #   (If all 16 GPUs live on a single host, change slow.gpus to [8,9,10,11,12,13,14,15] and run `kiln serve`.)
@@ -61,7 +61,17 @@ correctness:
   max_new_tokens: 8
 agents:
   num_agents: 4
-  command: "agy --model gemini-4-neon-high --dangerously-skip-permissions --disable-slash-commands --settings '{\"enableTerminalSandbox\":false}' -p {prompt}"
+  command: "agy --model {model} --dangerously-skip-permissions --disable-slash-commands --settings '{\"enableTerminalSandbox\":false}' -p {prompt}"
+  models:
+    - gemini-4-neon-high
+    - gemini-4-neon-high
+    - gemini-4-carbon-high
+    - claude-opus-5-5-high
+  # Or mix agy + codex + claude in one fleet using `slots:` (replace `command`/`models` above):
+  # slots:
+  #   - {provider: agy, model: gemini-4-neon-high, count: 2}
+  #   - {provider: codex, model: o3, extra_args: ["-c", "model_reasoning_effort=high"]}
+  #   - {provider: claude, model: claude-opus-4-5}
   budget_hours: 24
   respawn_on_exit: true
 workdir: runs

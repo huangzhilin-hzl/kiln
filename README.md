@@ -91,7 +91,7 @@ kiln agents -c configs/dsv41_flash_h20_1node.yaml
 ```
 
 - Multi-node requires a shared `KILN_TOKEN` on a private network (submissions execute Python over HTTP).
-- `agents.command` supports any stdin (`codex`, `claude`) or `{prompt}` (`agy`) CLI; agents coordinate via `kiln submit / status / board / leaderboard / hw`, and run state persists under `runs/<name>/` across restarts.
+- `agents.slots` mixes `agy`, `codex`, `claude`, and custom CLIs (or use `agents.command` + `models`); preview with `kiln agents -c <config> --dry-run`. Agents coordinate via `kiln submit / status / board / leaderboard / hw`, and run state persists under `runs/<name>/`.
 
 ## Hardware Probe & Cost Model
 

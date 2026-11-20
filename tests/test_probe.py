@@ -112,6 +112,11 @@ def test_cli_probe_costmodel_and_hw(tmp_path: Path, capsys):
 
 
 def test_launcher_injects_hardware_into_agent_workspace(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "candidates").mkdir(parents=True)
+    (repo / "candidates" / "baseline_forward.py").write_text("def make_forward(m): return None\n")
+    monkeypatch.setattr(launcher, "REPO", repo)
+
     prof = probe_hardware(suite="deep", mock_chip="H20-3e", progress=False)
     prof.save(tmp_path / "hw_profile.json")
 

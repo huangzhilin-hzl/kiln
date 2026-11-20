@@ -180,6 +180,11 @@ def test_smoke_test_fails_if_hot_reload_has_no_effect():
 def test_launcher_preserves_venv_directory_and_stops_failing_agents(tmp_path, monkeypatch):
     from kiln.agents import launcher
 
+    repo = tmp_path / "repo"
+    (repo / "candidates").mkdir(parents=True)
+    (repo / "candidates" / "baseline_forward.py").write_text("def make_forward(m): return None\n")
+    monkeypatch.setattr(launcher, "REPO", repo)
+
     venv_bin = tmp_path / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     python = venv_bin / "python"
@@ -370,3 +375,413 @@ def test_parse_quota_backoff(tmp_path):
         "old RESOURCE_EXHAUSTED Resets in 50m0s\n[kiln] respawned\nnormal non-429 crash\n"
     )
     assert _parse_quota_backoff(log, slot_idx=0) is None
+
+
+def test_agent_config_multi_model_and_commands():
+    from kiln.config import AgentConfig
+
+    cfg = AgentConfig(
+        num_agents=4,
+        command="agy --model {model} -p {prompt}",
+        models=["m-a", "m-b"],
+    )
+    assert cfg.resolve_slot_command(0) == (["agy", "--model", "m-a", "-p", "{prompt}"], "m-a")
+    assert cfg.resolve_slot_command(1) == (["agy", "--model", "m-b", "-p", "{prompt}"], "m-b")
+    assert cfg.resolve_slot_command(2) == (["agy", "--model", "m-a", "-p", "{prompt}"], "m-a")
+
+    cfg_override = AgentConfig(
+        num_agents=3,
+        commands=[
+            "agy --model default-m -p {prompt}",
+            "claude -p --model=old-m",
+        ],
+        models=["m1", "m2", "m3"],
+    )
+    assert cfg_override.resolve_slot_command(0) == (["agy", "--model", "m1", "-p", "{prompt}"], "m1")
+    assert cfg_override.resolve_slot_command(1) == (["claude", "-p", "--model=m2"], "m2")
+    assert cfg_override.resolve_slot_command(2) == (["agy", "--model", "m3", "-p", "{prompt}"], "m3")
+
+    with pytest.raises(ValueError, match="models"):
+        AgentConfig(num_agents=1, command="agy --model {model} -p {prompt}")
+    with pytest.raises(ValueError, match="requires"):
+        AgentConfig(num_agents=1, command="claude -p", models=["opus"])
+    with pytest.raises(ValueError, match="blank"):
+        AgentConfig(num_agents=1, command="agy --model {model}", models=["  "])
+
+
+def test_launcher_per_slot_models_commands_respawn_and_refs_index(tmp_path, monkeypatch):
+    import io
+    from pathlib import Path
+    from kiln.agents import launcher
+    from kiln.config import AgentConfig
+
+    repo = tmp_path / "repo"
+    (repo / "candidates").mkdir(parents=True)
+    (repo / "candidates" / "baseline_forward.py").write_text("def make_forward(m): return None\n")
+    model_dir = repo / "refs" / "vllm" / "models" / "demo_v1"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.py").write_text(
+        "class DemoModel:\n"
+        + "".join(f"    x{i} = {i}\n" for i in range(65))
+        + "    def forward(self, x):\n        return x\n"
+    )
+
+    monkeypatch.setattr(launcher, "REPO", repo)
+    monkeypatch.setattr(launcher.time, "sleep", lambda s: None)
+
+    spawned = []
+    stop_flag = [False]
+
+    class FakeProc:
+        def __init__(self, pid, exits):
+            self.pid = pid
+            self._exits = iter(exits)
+
+        def poll(self):
+            if stop_flag[0]:
+                return 0
+            nxt = next(self._exits, "interrupt")
+            if nxt == "interrupt":
+                stop_flag[0] = True
+                raise KeyboardInterrupt
+            return nxt
+
+    slot_runs = {0: 0, 1: 0}
+
+    def fake_spawn(cmd, ws, env, prompt):
+        slot_idx = int(env["KILN_AGENT"].split("_")[1]) - 1
+        run_no = slot_runs[slot_idx]
+        slot_runs[slot_idx] += 1
+        spawned.append((env["KILN_AGENT"], list(cmd), env.get("KILN_AGENT_MODEL"), prompt))
+        if slot_idx == 0 and run_no == 0:
+            return FakeProc(1000 + slot_idx, [0]), io.BytesIO()
+        return FakeProc(2000 + slot_idx, []), io.BytesIO()
+
+    monkeypatch.setattr(launcher, "_spawn_agent", fake_spawn)
+
+    run = RunConfig(
+        name="mixed",
+        workdir=str(tmp_path / "runs"),
+        engine=EngineConfig(kind="vllm_offline", model="Demo-v1"),
+        agents=AgentConfig(
+            num_agents=2,
+            commands=[
+                "agy --model {model} -p {prompt}",
+                "claude -p --model {model}",
+            ],
+            models=["neon-high", "opus-high"],
+            respawn_on_exit=True,
+        ),
+    )
+    launcher.launch(run)
+
+    # refs/INDEX.md auto-generated and symlinked
+    index_text = (repo / "refs" / "INDEX.md").read_text()
+    assert "DemoModel" in index_text
+    assert (Path(run.workdir) / "mixed" / "agents" / "agent_1" / "refs" / "INDEX.md").exists()
+
+    # Initial spawns: agent_1 (agy) and agent_2 (claude) both receive --add-dir <refs>
+    a1_init, a2_init, a1_respawn = spawned[0], spawned[1], spawned[2]
+    assert a1_init[0] == "agent_1" and a1_init[2] == "neon-high"
+    assert a1_init[1][:4] == ["agy", "--add-dir", str(repo / "refs"), "--model"]
+    assert "neon-high" in a1_init[1]
+
+    assert a2_init[0] == "agent_2" and a2_init[2] == "opus-high"
+    assert a2_init[1] == ["claude", "--add-dir", str(repo / "refs"), "-p", "--model", "opus-high"]
+
+    # Respawn preserves slot 0's own cmd & model and includes INDEX.md reminder
+    assert a1_respawn[0] == "agent_1"
+    assert a1_respawn[1] == a1_init[1]
+    assert a1_respawn[2] == "neon-high"
+    assert "refs/INDEX.md" in a1_respawn[3]
+
+
+def test_refs_index_ast_budget_preserve_and_cli(tmp_path, capsys):
+    from kiln.agents.refs_index import GENERATED_PREFIX, build_refs_index, ensure_refs_index
+    from kiln.cli import main
+
+    refs = tmp_path / "refs"
+    pkg = refs / "vllm" / "models" / "deepseek_v41"
+    (pkg / "amd").mkdir(parents=True)
+    (pkg / "nvidia" / "ops").mkdir(parents=True)
+    layers = refs / "vllm" / "model_executor" / "layers"
+    layers.mkdir(parents=True)
+
+    (pkg / "amd" / "model.py").write_text("class AmdOnly:\n" + "    pass\n" * 80)
+    (pkg / "nvidia" / "model.py").write_text(
+        "from vllm.model_executor.layers.custom_mhc import MHCBenchLayer\n"
+        "class DeepseekV4Model:\n"
+        + "".join(f"    a{i} = {i}\n" for i in range(60))
+        + "    def forward(self, x):\n        return x\n"
+    )
+    (pkg / "attention.py").write_text(
+        "class DeepseekV4Attention:\n"
+        + "".join(f"    b{i} = {i}\n" for i in range(60))
+        + "    def forward(self, q, k, v):\n        return q\n"
+    )
+    (pkg / "nvidia" / "ops" / "mhc.py").write_text(
+        "def mhc_op(x):\n" + "".join(f"    y{i} = x\n" for i in range(60)) + "    return x\n"
+    )
+    (layers / "custom_mhc.py").write_text(
+        "class MHCBenchLayer:\n"
+        + "".join(f"    c{i} = {i}\n" for i in range(85))
+        + "    def forward(self, x):\n        return x\n"
+    )
+
+    out = build_refs_index(refs, model_hint="/models/DeepSeek-V4.1-Flash", engine_hint="vllm_offline")
+    assert out.startswith(GENERATED_PREFIX)
+    assert "vllm/models/deepseek_v41/nvidia/model.py" in out
+    assert "DeepseekV4Model" in out and "`forward`:" in out
+    assert "vllm/models/deepseek_v41/attention.py" in out
+    assert "vllm/model_executor/layers/custom_mhc.py" in out
+    assert "AmdOnly" not in out
+
+    # Strict max_lines enforcement
+    tight = build_refs_index(refs, model_hint="DeepSeek-V4.1-Flash", max_lines=10)
+    assert len(tight.splitlines()) <= 10
+
+    # Hand-written INDEX.md must be preserved when force=False
+    idx_path = refs / "INDEX.md"
+    idx_path.write_text("# My custom manual index\n")
+    ensure_refs_index(refs, model_hint="DeepSeek-V4.1-Flash", force=False)
+    assert idx_path.read_text() == "# My custom manual index\n"
+
+    # CLI --force overwrites and prints; subsequent ensure without force keeps matching model, updates on model change
+    main(["index-refs", "--refs", str(refs), "--model", "DeepSeek-V4.1-Flash", "--force", "--print"])
+    captured = capsys.readouterr().out
+    assert "DeepseekV4Model" in captured
+    assert "model=DeepSeek-V4.1-Flash -->" in idx_path.read_text()
+
+    idx_path.write_text(idx_path.read_text() + "<!-- marker -->\n")
+    ensure_refs_index(refs, model_hint="DeepSeek-V4.1-Flash", force=False)
+    assert "<!-- marker -->" in idx_path.read_text()
+
+    ensure_refs_index(refs, model_hint="Other-Model", force=False)
+    assert "model=Other-Model -->" in idx_path.read_text()
+
+
+def test_agent_slots_multi_provider_config():
+    from kiln.config import AgentConfig, AgentSlotConfig
+
+    cfg = AgentConfig(
+        slots=[
+            AgentSlotConfig(provider="agy", model="gemini-4-neon-high", count=2),
+            AgentSlotConfig(
+                provider="codex",
+                model="o3",
+                extra_args=["-c", "model_reasoning_effort=high"],
+                env={"OPENAI_BASE_URL": "https://proxy.example/v1"},
+            ),
+            AgentSlotConfig(
+                provider="claude",
+                model="claude-opus-4-5",
+                extra_args=["--max-turns", "25"],
+                env={"ANTHROPIC_API_KEY": "sk-ant-test"},
+            ),
+            AgentSlotConfig(
+                provider="custom",
+                command="my-agent -m {model} --run",
+                model="deepseek-r1",
+            ),
+        ]
+    )
+    assert cfg.num_agents == 5
+
+    s0 = cfg.resolve_slot(0)
+    s1 = cfg.resolve_slot(1)
+    assert s0.provider == "agy" and s0.model == "gemini-4-neon-high"
+    assert s1.provider == "agy" and s1.model == "gemini-4-neon-high"
+    assert s0.argv[-2:] == ["-p", "{prompt}"]
+    assert s0.argv[s0.argv.index("--model") + 1] == "gemini-4-neon-high"
+
+    s2 = cfg.resolve_slot(2)
+    assert s2.provider == "codex" and s2.model == "o3"
+    assert s2.argv[:2] == ["codex", "exec"]
+    assert s2.argv[-1] == "-"
+    assert s2.argv[s2.argv.index("--model") + 1] == "o3"
+    assert s2.argv[-3:-1] == ["model_reasoning_effort=high", "-"][:1] or "model_reasoning_effort=high" in s2.argv[:-1]
+    assert s2.env == {"OPENAI_BASE_URL": "https://proxy.example/v1"}
+
+    s3 = cfg.resolve_slot(3)
+    assert s3.provider == "claude" and s3.model == "claude-opus-4-5"
+    assert s3.argv[:3] == ["claude", "-p", "--dangerously-skip-permissions"]
+    assert s3.argv[s3.argv.index("--model") + 1] == "claude-opus-4-5"
+    assert s3.argv[-2:] == ["--max-turns", "25"]
+    assert s3.env == {"ANTHROPIC_API_KEY": "sk-ant-test"}
+
+    s4 = cfg.resolve_slot(4)
+    assert s4.provider == "custom" and s4.model == "deepseek-r1"
+    assert s4.argv == ["my-agent", "-m", "deepseek-r1", "--run"]
+
+    # Explicit num_agents overrides sum(count), cycling slots; -m flag replacement works too
+    cfg_short = AgentConfig(
+        num_agents=3,
+        slots=[
+            AgentSlotConfig(command="codex exec -m old-model -", model="gpt-5"),
+            AgentSlotConfig(provider="claude", model="sonnet"),
+        ],
+    )
+    assert cfg_short.num_agents == 3
+    assert cfg_short.resolve_slot(0).argv == ["codex", "exec", "-m", "gpt-5", "-"]
+    assert cfg_short.resolve_slot(2).argv == ["codex", "exec", "-m", "gpt-5", "-"]
+
+    with pytest.raises(ValueError, match="requires 'provider'"):
+        AgentSlotConfig(model="o3")
+    with pytest.raises(ValueError, match="custom"):
+        AgentSlotConfig(provider="custom", model="o3")
+
+
+def test_launcher_mixed_providers_add_dir_env_and_missing_cli_cleanup(tmp_path, monkeypatch):
+    import signal
+    from kiln.agents import launcher
+    from kiln.config import AgentConfig, AgentSlotConfig
+
+    repo = tmp_path / "repo"
+    (repo / "candidates").mkdir(parents=True)
+    (repo / "candidates" / "baseline_forward.py").write_text("def make_forward(m): return None\n")
+    (repo / "refs").mkdir(parents=True)
+    monkeypatch.setattr(launcher, "REPO", repo)
+    monkeypatch.setattr(launcher.time, "sleep", lambda s: None)
+
+    spawned = []
+    signals = []
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return 0
+
+        def send_signal(self, sig):
+            signals.append((self.pid, sig))
+
+    def fake_spawn(cmd, ws, env, prompt):
+        spawned.append((env["KILN_AGENT"], list(cmd), dict(env)))
+        return FakeProc(3000 + len(spawned)), open(ws / "agent.log", "ab")
+
+    monkeypatch.setattr(launcher, "_spawn_agent", fake_spawn)
+
+    run = RunConfig(
+        name="multi-provider",
+        workdir=str(tmp_path / "runs"),
+        agents=AgentConfig(
+            respawn_on_exit=False,
+            slots=[
+                AgentSlotConfig(provider="agy", model="gemini-4-neon-high"),
+                AgentSlotConfig(
+                    provider="codex",
+                    model="o3",
+                    env={"OPENAI_API_KEY": "sk-openai-slot"},
+                ),
+                AgentSlotConfig(
+                    provider="claude",
+                    model="claude-opus-4-5",
+                    env={"ANTHROPIC_API_KEY": "sk-claude-slot"},
+                ),
+            ],
+        ),
+    )
+    launcher.launch(run)
+
+    assert len(spawned) == 3
+    refs_str = str(repo / "refs")
+
+    # agent_1: agy gets `--add-dir <refs>` right after binary
+    a1_name, a1_cmd, a1_env = spawned[0]
+    assert a1_name == "agent_1"
+    assert a1_cmd[:3] == ["agy", "--add-dir", refs_str]
+    assert a1_env["KILN_AGENT_PROVIDER"] == "agy"
+    assert a1_env["KILN_AGENT_MODEL"] == "gemini-4-neon-high"
+
+    # agent_2: codex exec gets `--add-dir <refs>` after `exec` and before trailing `-`
+    a2_name, a2_cmd, a2_env = spawned[1]
+    assert a2_name == "agent_2"
+    assert a2_cmd[:4] == ["codex", "exec", "--add-dir", refs_str]
+    assert a2_cmd[-1] == "-"
+    assert a2_env["KILN_AGENT_PROVIDER"] == "codex"
+    assert a2_env["KILN_AGENT_MODEL"] == "o3"
+    assert a2_env["OPENAI_API_KEY"] == "sk-openai-slot"
+
+    # agent_3: claude gets `--add-dir <refs>` right after binary
+    a3_name, a3_cmd, a3_env = spawned[2]
+    assert a3_name == "agent_3"
+    assert a3_cmd[:3] == ["claude", "--add-dir", refs_str]
+    assert a3_env["KILN_AGENT_PROVIDER"] == "claude"
+    assert a3_env["KILN_AGENT_MODEL"] == "claude-opus-4-5"
+    assert a3_env["ANTHROPIC_API_KEY"] == "sk-claude-slot"
+
+    # If a later slot's CLI is missing, earlier running slots must be terminated via SIGTERM
+    running_signals = []
+
+    class StillRunningProc:
+        pid = 4001
+
+        def poll(self):
+            return None
+
+        def send_signal(self, sig):
+            running_signals.append((self.pid, sig))
+
+    def spawn_second_missing(cmd, ws, env, prompt):
+        if cmd[0] == "codex":
+            raise FileNotFoundError(cmd[0])
+        return StillRunningProc(), open(ws / "agent.log", "ab")
+
+    monkeypatch.setattr(launcher, "_spawn_agent", spawn_second_missing)
+    run_fail = RunConfig(
+        name="missing-cli",
+        workdir=str(tmp_path / "runs2"),
+        agents=AgentConfig(
+            respawn_on_exit=False,
+            slots=[
+                AgentSlotConfig(provider="agy", model="gemini-4-neon-high"),
+                AgentSlotConfig(provider="codex", model="o3"),
+            ],
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not found on PATH"):
+        launcher.launch(run_fail)
+    assert running_signals == [(4001, signal.SIGTERM)]
+
+
+def test_parse_quota_backoff_codex_and_claude(tmp_path):
+    from kiln.agents.launcher import _parse_quota_backoff
+
+    log = tmp_path / "agent.log"
+
+    log.write_text("openai.RateLimitError: rate_limit_exceeded. Please try again in 2m30s.\n")
+    assert _parse_quota_backoff(log, slot_idx=0) == 150.0
+    assert _parse_quota_backoff(log, slot_idx=1) == 165.0
+
+    log.write_text("Error: insufficient_quota (HTTP 429)\n")
+    assert _parse_quota_backoff(log, slot_idx=0) == 300.0
+
+    log.write_text('{"type":"error","error":{"type":"rate_limit_error"}}\nretry-after: 45\n')
+    assert _parse_quota_backoff(log, slot_idx=0) == 45.0
+
+    log.write_text("Claude error: You've hit your limit · resets in 1h5m\n")
+    assert _parse_quota_backoff(log, slot_idx=0) == 3900.0
+
+    log.write_text("API Error: 529 overloaded_error\n")
+    assert _parse_quota_backoff(log, slot_idx=2) == 330.0
+
+
+def test_cli_agents_dry_run(tmp_path, capsys):
+    import json
+    from kiln.cli import main
+
+    cfg_path = tmp_path / "run.yaml"
+    cfg_path.write_text(
+        "name: dryrun\n"
+        "agents:\n"
+        "  slots:\n"
+        "    - {provider: agy, model: gemini-4-neon-high}\n"
+        "    - {provider: codex, model: o3}\n"
+        "    - {provider: claude, model: claude-opus-4-5}\n"
+    )
+    main(["agents", "-c", str(cfg_path), "--dry-run"])
+    rows = json.loads(capsys.readouterr().out)
+    assert [r["agent"] for r in rows] == ["agent_1", "agent_2", "agent_3"]
+    assert [r["provider"] for r in rows] == ["agy", "codex", "claude"]
+    assert [r["model"] for r in rows] == ["gemini-4-neon-high", "o3", "claude-opus-4-5"]

@@ -25,30 +25,60 @@ from kiln.engine import make_engine
 
 BROKEN = '''
 CORRUPT = True
+_patched_compute_logits = False
 _original_instance_logits = None
 _had_instance_logits = False
 
-def make_forward(model):
+def _force_token(logits):
     import torch
-    global _original_instance_logits, _had_instance_logits
-    _had_instance_logits = "compute_logits" in vars(model)
-    _original_instance_logits = vars(model).get("compute_logits")
-    original = model.compute_logits
+    forced = torch.full_like(logits, -float("inf"))
+    forced[..., REPLACEMENT_TOKEN] = 0
+    return forced
 
-    def incorrect_logits(*args, **kwargs):
-        logits = original(*args, **kwargs)
-        if logits is None:
+def make_forward(model):
+    import dataclasses
+    import torch
+    global _patched_compute_logits, _original_instance_logits, _had_instance_logits
+    if hasattr(model, "compute_logits"):
+        _patched_compute_logits = True
+        _had_instance_logits = "compute_logits" in vars(model)
+        _original_instance_logits = vars(model).get("compute_logits")
+        original = model.compute_logits
+
+        def incorrect_logits(*args, **kwargs):
+            logits = original(*args, **kwargs)
+            if logits is None:
+                return None
+            return _force_token(logits)
+
+        model.compute_logits = incorrect_logits
+        return None
+
+    _patched_compute_logits = False
+    original_fwd = model.forward
+
+    def incorrect_forward(*args, **kwargs):
+        out = original_fwd(*args, **kwargs)
+        if out is None:
             return None
-        forced = torch.full_like(logits, -float("inf"))
-        forced[..., REPLACEMENT_TOKEN] = 0
-        return forced
+        logits = getattr(out, "next_token_logits", None)
+        if logits is not None:
+            forced = _force_token(logits)
+            if dataclasses.is_dataclass(out):
+                return dataclasses.replace(out, next_token_logits=forced)
+            out.next_token_logits = forced
+            return out
+        if isinstance(out, torch.Tensor):
+            return _force_token(out)
+        return out
 
-    model.compute_logits = incorrect_logits
+    return incorrect_forward
 
 def restore(model):
-    del model.compute_logits
-    if _had_instance_logits:
-        model.compute_logits = _original_instance_logits
+    if _patched_compute_logits:
+        del model.compute_logits
+        if _had_instance_logits:
+            model.compute_logits = _original_instance_logits
 '''
 
 

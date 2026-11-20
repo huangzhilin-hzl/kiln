@@ -10,7 +10,15 @@ from pydantic import BaseModel, Field, field_validator
 from kiln.bench.agentx import AgentXConfig
 
 
-EngineKind = Literal["mock", "vllm_offline", "vllm_server", "vllm"]
+EngineKind = Literal[
+    "mock",
+    "vllm_offline",
+    "vllm_server",
+    "vllm",
+    "sglang_offline",
+    "sglang_server",
+    "sglang",
+]
 
 
 class TierConfig(BaseModel):
@@ -24,11 +32,11 @@ class TierConfig(BaseModel):
     # Extra LLM(...) kwargs for this tier only, merged over engine.extra_args.
     # e.g. fast tier: {speculative_config: null} -- truncated models break MTP/DSpark layers.
     engine_overrides: dict = Field(default_factory=dict)
-    # Per-tier engine kind (defaults to engine.kind): "vllm_offline" (`vllm.LLM`) or "vllm_server" (`vllm serve`).
+    # Per-tier engine kind (defaults to engine.kind): "vllm_offline", "vllm_server", "sglang_offline", or "sglang_server".
     engine_kind: EngineKind | None = None
     share_engine: str | None = None              # reuse another local tier's engine (single-node mode)
-    port: int | None = None                      # vllm_server only
-    agentx: dict | None = None                   # vllm_server only: AgentXConfig fields
+    port: int | None = None                      # *_server only
+    agentx: dict | None = None                   # *_server only: AgentXConfig fields
     timeout_s: float = 600.0
 
     @field_validator("agentx")

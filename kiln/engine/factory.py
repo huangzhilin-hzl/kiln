@@ -16,4 +16,10 @@ def make_engine(cfg: EngineConfig, tier: TierConfig) -> Engine:
     if kind == "vllm_server":
         from .vllm_server import VLLMServerEngine
         return VLLMServerEngine(cfg, tier)
+    if kind in ("sglang_offline", "sglang"):
+        from .sglang_offline import SGLangOfflineEngine
+        return SGLangOfflineEngine(cfg, tier)
+    if kind == "sglang_server":
+        from .sglang_server import SGLangServerEngine
+        return SGLangServerEngine(cfg, tier)
     raise ValueError(f"unknown engine kind {kind}")

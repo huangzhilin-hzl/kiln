@@ -1,4 +1,4 @@
-"""Shared torch.profiler helpers for persistent vLLM engines (`vllm_offline` and `vllm_server`)."""
+"""Shared torch.profiler helpers for persistent engines (vLLM and SGLang)."""
 from __future__ import annotations
 
 import gzip
@@ -21,7 +21,7 @@ def configure_torch_profiler(kwargs: dict, tier_name: str) -> str:
 
 def summarize_trace(trace_dir: str | Path, top_k: int = 12) -> str:
     p = Path(trace_dir)
-    files = sorted(p.glob("*.pt.trace.json*"), key=lambda f: f.stat().st_mtime)
+    files = sorted(p.glob("*.trace.json*"), key=lambda f: f.stat().st_mtime)
     if not files:
         return f"trace written to {trace_dir}"
     latest = files[-1]

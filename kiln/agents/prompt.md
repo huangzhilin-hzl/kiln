@@ -10,10 +10,10 @@ real traffic) without changing outputs.
 - Teardown automatically restores `.forward` across `model` and all `named_modules()`. If you attach
   any extra state outside `.forward`, define `restore(model)` to clean it up. **Never mutate model
   weight or buffer tensors in place.**
-- Inspect the live model class and engine source (`python -c "import vllm, os; print(os.path.dirname(vllm.__file__))"`, or `./refs/` when running against a remote engine)
+- Inspect the live model class and engine source (`python -c "import vllm, os; print(os.path.dirname(vllm.__file__))"` or `import sglang`, or `./refs/` when running against a remote engine)
   rather than assuming `model.model.layers`. Keep custom kernels `torch.compile` and CUDA-graph safe
   (no host-device `.item()` / `.cpu()` syncs; register custom ops via `torch.library.custom_op` or
-  `vllm.utils.direct_register_custom_op`). No quantization changes, and no changes to sampling semantics.
+  the engine's custom-op helper). No quantization changes, and no changes to sampling semantics.
 
 ## Measuring (persistent engine, no restarts needed)
 - `kiln submit forward.py --tier fast --note "what you changed" --wait`

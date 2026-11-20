@@ -52,8 +52,8 @@ tiers:
       concurrency: 8           # sessions; compile once per parallel config, check several later
       public_dataset: semianalysis_cc_traces_weka_062126
       random_seed: 42
-      benchmark_duration_s: 180   # 3-min fast dev window (use 900 + unsafe_override: false for official score)
-      unsafe_override: true
+      benchmark_duration_s: 900   # Official InferenceX 900s submission-valid benchmark window
+      unsafe_override: false
 traffic_file: traffic/agentx.jsonl   # kiln agentx-export --tokenizer <model path> --max-context 262144
 correctness:
   min_token_match: 0.85        # MXFP4 + fp8_ds_mla 1-ULP tie-breaks on 150k prompts; short horizon avoids cascade

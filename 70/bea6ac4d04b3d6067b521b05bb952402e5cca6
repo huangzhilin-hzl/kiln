@@ -1,0 +1,32 @@
+README.md
+  h_7339bf36ecd0bc 94
+configs/dsv41_flash_h20.yaml
+  h_7339bf36ecd0bc 3,64-74
+kiln/agents/launcher.py
+  h_7339bf36ecd0bc 3-4,17,27,30-47,51,60,69-77,81-116,119-129,162-163,166-214,226,228-229,267,269-270
+kiln/agents/prompt.md
+  h_7339bf36ecd0bc 17-18
+kiln/agents/refs_index.py
+  h_7339bf36ecd0bc 1-390
+kiln/cli.py
+  h_7339bf36ecd0bc 91,93-97,195-222,255-257,299-309
+kiln/config.py
+  h_7339bf36ecd0bc 4-5,10,72-183,185,187-189,193-255
+tests/test_kiln.py
+  h_7339bf36ecd0bc 72,74-81
+tests/test_probe.py
+  h_7339bf36ecd0bc 115-119
+tests/test_regressions.py
+  h_7339bf36ecd0bc 183-187,378-787
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "70bea6ac4d04b3d6067b521b05bb952402e5cca6",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

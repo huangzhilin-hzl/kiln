@@ -1,0 +1,44 @@
+configs/dsv41_flash_h20_sglang.yaml
+  h_7339bf36ecd0bc 1-57
+configs/llama1b_sglang.yaml
+  h_7339bf36ecd0bc 1-35
+kiln/agents/prompt.md
+  h_7339bf36ecd0bc 13,16
+kiln/config.py
+  h_7339bf36ecd0bc 13-21,35,38-39
+kiln/engine/_sglang_bootstrap/sitecustomize.py
+  h_7339bf36ecd0bc 1-29
+kiln/engine/factory.py
+  h_7339bf36ecd0bc 19-24
+kiln/engine/patching.py
+  h_7339bf36ecd0bc 1-28
+kiln/engine/sglang_ext.py
+  h_7339bf36ecd0bc 1-700
+kiln/engine/sglang_offline.py
+  h_7339bf36ecd0bc 1-232
+kiln/engine/sglang_server.py
+  h_7339bf36ecd0bc 1-362
+kiln/engine/vllm_ext.py
+  h_7339bf36ecd0bc 32-33
+kiln/engine/vllm_profiler.py
+  h_7339bf36ecd0bc 1,24
+pyproject.toml
+  h_7339bf36ecd0bc 18
+scripts/smoke_sglang.py
+  h_7339bf36ecd0bc 1-21
+scripts/smoke_vllm.py
+  h_7339bf36ecd0bc 28,32-37,39,41-62,64-73,75,78-81
+tests/test_sglang.py
+  h_7339bf36ecd0bc 1-667
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "291d4db92b77771ba64c5868bd368373e725fde1",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

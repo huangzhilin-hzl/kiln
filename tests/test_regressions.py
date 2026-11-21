@@ -950,3 +950,97 @@ def test_job_invalidate_cli_and_cross_tier_cascade(tmp_path, monkeypatch):
         main(["withdraw", j_other, "--reason", "manual cleanup"])
         assert client.get(f"/jobs/{j_other}").json()["status"] == "invalidated"
         assert client.get("/leaderboard", params={"tier": "fast"}).json() == []
+
+
+def test_agentx_paired_compare_and_multi_metric_leaderboard_and_promote(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    from kiln.bench.agentx import compare_agentx_paired
+    from kiln.cli import main
+    from kiln.server.app import create_app
+
+    base_dir = tmp_path / "base"
+    cand_dir = tmp_path / "cand"
+    base_dir.mkdir()
+    cand_dir.mkdir()
+    (base_dir / "profile_export_aiperf.json").write_text("{}")
+    (cand_dir / "profile_export_aiperf.json").write_text("{}")
+
+    (base_dir / "profile_export.jsonl").write_text(
+        json.dumps({"metadata": {"benchmark_phase": "warmup", "conversation_id": "c0", "turn_index": 0}, "metrics": {"decode_duration": 9999.0, "output_token_count": 100}}) + "\n"
+        + json.dumps({"metadata": {"benchmark_phase": "profile", "conversation_id": "c1", "turn_index": 0, "was_cancelled": False}, "metrics": {"decode_duration": 2000.0, "output_token_count": 500}}) + "\n"
+        + json.dumps({"metadata": {"benchmark_phase": "profile", "conversation_id": "c1", "turn_index": 1, "was_cancelled": False}, "metrics": {"decode_duration": 3000.0, "output_token_count": 700}}) + "\n"
+    )
+    (cand_dir / "profile_export.jsonl").write_text(
+        json.dumps({"metadata": {"benchmark_phase": "profile", "conversation_id": "c1", "turn_index": 0, "was_cancelled": False}, "metrics": {"decode_duration": 1600.0, "output_token_count": 500}}) + "\n"
+        + json.dumps({"metadata": {"benchmark_phase": "profile", "conversation_id": "c1", "turn_index": 1, "was_cancelled": False}, "metrics": {"decode_duration": 2400.0, "output_token_count": 700}}) + "\n"
+        + json.dumps({"metadata": {"benchmark_phase": "profile", "conversation_id": "c2", "turn_index": 0, "was_cancelled": True}, "metrics": {"decode_duration": 20000.0, "output_token_count": 0}}) + "\n"
+    )
+    paired = compare_agentx_paired(base_dir / "profile_export_aiperf.json", cand_dir / "profile_export_aiperf.json")
+    assert paired is not None
+    assert paired["paired_requests"] == 2
+    assert paired["baseline_decode_s"] == 5.0
+    assert paired["candidate_decode_s"] == 4.0
+    assert paired["decode_duration_speedup"] == 1.25
+    assert paired["paired_output_tps_speedup"] == 1.25
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2],"output_len":2}\n')
+    run = RunConfig(name="multimetric", traffic_file=str(traffic), workdir=str(tmp_path))
+    app = create_app(run, local_tiers=set())
+    with TestClient(app) as client:
+        client.post("/workers/fast/heartbeat", json={"worker_id": "wf", "ready": True, "baseline_tps": 400.0, "crashes": 0})
+        client.post("/workers/slow/heartbeat", json={"worker_id": "ws", "ready": True, "baseline_tps": 1000.0, "crashes": 0})
+
+        j_fast = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.29\n", "note": "fast #1"}).json()["id"]
+        cl_f = client.post("/workers/fast/claim", params={"worker_id": "wf", "wait_s": 0}).json()["job"]
+        client.post("/workers/fast/complete", json={
+            "id": j_fast, "worker_id": "wf", "attempt_id": cl_f["attempt_id"],
+            "status": "done", "speedup": 1.29, "decode_tps": 516.0, "prefill_tps": 29500.0, "token_match": 0.98, "crashes": 0,
+        }).raise_for_status()
+
+        j_tput = client.post("/jobs", json={"agent": "a1", "tier": "slow", "source": "SPEEDUP = 1.10\n", "note": "tput"}).json()["id"]
+        j_lat = client.post("/jobs", json={"agent": "a2", "tier": "slow", "source": "SPEEDUP = 0.99\n", "note": "low itl"}).json()["id"]
+        j_nolat = client.post("/jobs", json={"agent": "a3", "tier": "slow", "source": "SPEEDUP = 1.05\n", "note": "no itl"}).json()["id"]
+
+        for jid, sp, extra in (
+            (j_tput, 1.10, {"metric": "agentx_total_tput_per_gpu", "unsafe_override": True, "repeats": [{}], "output_tput": 195.0, "itl_p90_ms": 5.7, "interactivity_p90": 175.4, "paired": {"decode_duration_speedup": 1.08}}),
+            (j_lat, 0.99, {"metric": "agentx_total_tput_per_gpu", "unsafe_override": True, "repeats": [{}], "output_tput": 182.0, "itl_p90_ms": 4.0, "interactivity_p90": 250.0, "paired": {"decode_duration_speedup": 1.16}}),
+            (j_nolat, 1.05, {"metric": "agentx_total_tput_per_gpu", "unsafe_override": True, "repeats": [{}], "output_tput": 188.0}),
+        ):
+            cl = client.post("/workers/slow/claim", params={"worker_id": "ws", "wait_s": 0}).json()["job"]
+            client.post("/workers/slow/complete", json={
+                "id": cl["id"], "worker_id": "ws", "attempt_id": cl["attempt_id"],
+                "status": "done", "speedup": sp, "decode_tps": 1000.0 * sp, "token_match": 0.91, "extra": extra, "crashes": 0,
+            }).raise_for_status()
+
+        by_itl = client.get("/leaderboard", params={"tier": "slow", "sort_by": "itl_p90_ms"}).json()
+        # None sorts last even in ascending mode!
+        assert [r["id"] for r in by_itl] == [j_lat, j_tput, j_nolat]
+        assert by_itl[0]["interactivity_p90"] == 250.0
+        assert by_itl[0]["paired_decode_speedup"] == 1.16
+
+        by_paired = client.get("/leaderboard", params={"tier": "slow", "sort_by": "paired_speedup"}).json()
+        assert [r["id"] for r in by_paired] == [j_lat, j_tput, j_nolat]
+
+        assert client.get("/leaderboard", params={"tier": "slow", "sort_by": "bogus_key"}).status_code == 400
+
+        # Promote fast winner to slow & generate official 900s config
+        import kiln.cli as cli_mod
+        monkeypatch.setattr(cli_mod, "http", client)
+        monkeypatch.setenv("KILN_SERVER", "http://testserver")
+        official_yaml = tmp_path / "official_900s.yaml"
+        main([
+            "promote", "--top", "1", "--from-tier", "fast", "--to-tier", "slow",
+            "-c", "configs/dsv41_flash_h20_sglang.yaml",
+            "--write-official-config", str(official_yaml),
+        ])
+        assert official_yaml.exists()
+        off_cfg = RunConfig.load(official_yaml)
+        slow_cfg = next(t for t in off_cfg.tiers if t.name == "slow")
+        assert slow_cfg.agentx["benchmark_duration_s"] == 900
+        assert slow_cfg.agentx["unsafe_override"] is False
+        cl_promoted = client.post("/workers/slow/claim", params={"worker_id": "ws", "wait_s": 0}).json()["job"]
+        assert "SPEEDUP = 1.29" in cl_promoted["source"]
+        assert "Promote fast job" in cl_promoted["note"]

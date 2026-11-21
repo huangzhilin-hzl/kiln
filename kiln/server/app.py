@@ -60,6 +60,12 @@ class InvalidateReq(BaseModel):
     cascade: bool = True
 
 
+class PromoteReq(BaseModel):
+    target_tier: str = "slow"
+    agent: str | None = None
+    note: str = ""
+
+
 def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
     if run.hw_profile:
         run.resolve_hw_profile()
@@ -124,9 +130,22 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
             raise HTTPException(409, str(e))
         return {"invalidated": ids}
 
+    @app.post("/jobs/{jid}/promote")
+    def promote_job(jid: str, req: PromoteReq):
+        try:
+            promoted = mgr.promote_job(jid, target_tier=req.target_tier, agent=req.agent, note=req.note)
+        except KeyError as e:
+            raise HTTPException(404, str(e))
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(400, str(e))
+        return {"id": promoted.id, "tier": promoted.tier, "promoted_from": jid}
+
     @app.get("/leaderboard")
-    def leaderboard(tier: str = "slow", k: int = 10):
-        return mgr.leaderboard(tier, k)
+    def leaderboard(tier: str = "slow", k: int = 10, sort_by: str = "speedup"):
+        try:
+            return mgr.leaderboard(tier, k, sort_by=sort_by)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
 
     @app.post("/board")
     def post(req: PostReq):

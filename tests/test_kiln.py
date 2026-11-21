@@ -56,12 +56,28 @@ def test_parse_agentx_export(tmp_path: Path):
         "warmup_metrics": {"total_token_throughput": {"unit": "tokens/sec", "avg": 1.0}},
         "total_token_throughput": {"unit": "tokens/sec", "avg": 80000.0},
         "output_token_throughput": {"unit": "tokens/sec", "avg": 2000.0},
+        "active_decode_throughput": {"unit": "tokens/sec", "avg": 280.5},
+        "effective_concurrency": {"unit": "requests", "avg": 1.75},
+        "request_count": {"unit": "requests", "avg": 24.0},
+        "decode_duration": {"unit": "ms", "sum": 95000.0, "count": 24},
+        "time_to_first_token": {"unit": "ms", "p50": 540.2},
+        "benchmark_duration": {"unit": "sec", "avg": 180.5},
         "inter_token_latency": {"unit": "ms", "avg": 9.0, "p50": 8.0, "p90": 12.5},
+        "error_summary": [],
+        "was_cancelled": False,
         "submission_valid": True,
     }))
     r = parse_agentx_export(p, num_gpus=4)
     assert r.total_tput_per_gpu == 20000.0
     assert r.itl_p90_ms == 12.5 and abs(r.interactivity_p90 - 80.0) < 1e-9
+    assert r.active_decode_tps == 280.5
+    assert r.effective_concurrency == 1.75
+    assert r.request_count == 24
+    assert r.decode_duration_sum_ms == 95000.0
+    assert r.ttft_p50_ms == 540.2
+    assert r.benchmark_duration_s == 180.5
+    assert r.error_count == 0
+    assert r.was_cancelled is False
     assert r.submission_valid is True
 
 

@@ -85,7 +85,65 @@ def cmd_status(a):
 
 
 def cmd_leaderboard(a):
-    _print(http.get(f"{_url()}/leaderboard", params={"tier": a.tier, "k": a.k}).json())
+    _print(http.get(f"{_url()}/leaderboard", params={"tier": a.tier, "k": a.k, "sort_by": a.sort}).json())
+
+
+def write_official_agentx_config(src_path: str | Path, out_path: str | Path, duration_s: int = 900) -> Path:
+    """Create an official `submission_valid=true` (`unsafe_override: false`, `>=900s`) copy of a RunConfig YAML."""
+    import yaml
+    from pathlib import Path
+    from kiln.config import RunConfig
+
+    if duration_s < 900:
+        raise ValueError("Official AgentX duration must be at least 900 seconds")
+    raw = yaml.safe_load(Path(src_path).read_text()) or {}
+    updated_tiers = 0
+    for tier in raw.get("tiers") or []:
+        if isinstance(tier, dict) and isinstance(tier.get("agentx"), dict):
+            tier["agentx"]["benchmark_duration_s"] = int(duration_s)
+            tier["agentx"]["unsafe_override"] = False
+            tier["timeout_s"] = max(float(tier.get("timeout_s") or 600.0), float(duration_s * 3))
+            updated_tiers += 1
+    if updated_tiers == 0:
+        raise ValueError(f"No agentx tier found in {src_path}")
+    dest = Path(out_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(yaml.safe_dump(raw, sort_keys=False))
+    RunConfig.load(dest)
+    return dest
+
+
+def cmd_promote(a):
+    out: dict = {}
+    if a.write_official_config:
+        if not a.config:
+            raise SystemExit("--write-official-config requires -c/--config")
+        dest = write_official_agentx_config(a.config, a.write_official_config, duration_s=a.duration)
+        out["official_config"] = str(dest)
+
+    target_ids = list(a.ids or [])
+    if not target_ids and a.top:
+        r = http.get(
+            f"{_url()}/leaderboard",
+            params={"tier": a.from_tier, "k": a.top, "sort_by": a.sort},
+        )
+        r.raise_for_status()
+        target_ids = [row["id"] for row in r.json()]
+
+    if target_ids:
+        promoted = []
+        for jid in target_ids:
+            r = http.post(
+                f"{_url()}/jobs/{jid}/promote",
+                json={"target_tier": a.to_tier, "agent": a.agent, "note": a.note},
+            )
+            r.raise_for_status()
+            promoted.append(r.json())
+        out["promoted"] = promoted
+
+    if not out:
+        raise SystemExit("Provide job IDs, --top K, or --write-official-config")
+    _print(out)
 
 
 def cmd_board(a):
@@ -259,7 +317,25 @@ def main(argv=None):
     s = sp.add_parser("status"); s.set_defaults(f=cmd_status)
 
     s = sp.add_parser("leaderboard"); s.add_argument("--tier", default="slow")
-    s.add_argument("-k", type=int, default=10); s.set_defaults(f=cmd_leaderboard)
+    s.add_argument("-k", type=int, default=10)
+    s.add_argument("--sort", default="speedup",
+                   help="sort key: speedup, decode_tps, prefill_tps, output_tput, active_decode_tps, "
+                        "itl_p50_ms, itl_p90_ms, interactivity_p90, paired_speedup")
+    s.set_defaults(f=cmd_leaderboard)
+
+    s = sp.add_parser("promote", help="promote winning jobs to another tier or generate 900s official config")
+    s.add_argument("ids", nargs="*", help="specific job IDs to promote")
+    s.add_argument("--top", type=int, help="promote top K jobs from --from-tier leaderboard")
+    s.add_argument("--from-tier", default="fast")
+    s.add_argument("--to-tier", default="slow")
+    s.add_argument("--sort", default="speedup")
+    s.add_argument("--agent")
+    s.add_argument("--note", default="")
+    s.add_argument("-c", "--config", help="source YAML config for --write-official-config")
+    s.add_argument("--write-official-config", metavar="OUT_YAML",
+                   help="write an official submission_valid=true (>=900s, unsafe_override=false) YAML config")
+    s.add_argument("--duration", type=int, default=900, help="official AgentX benchmark_duration_s (>=900)")
+    s.set_defaults(f=cmd_promote)
 
     s = sp.add_parser("board"); s.add_argument("--post"); s.add_argument("--agent")
     s.add_argument("--since", type=float, default=0.0); s.add_argument("--limit", type=int, default=50)

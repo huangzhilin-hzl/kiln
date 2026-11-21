@@ -20,6 +20,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Callable
 
+from kiln.bench.agentx import compare_agentx_paired
 from kiln.bench.correctness import evaluate_correctness
 from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
@@ -115,6 +116,7 @@ class TierWorker:
         self.owner: TierWorker | None = None
         self.engine_lock = threading.RLock()
         self.baseline_tps: float | None = None
+        self.baseline_extra: dict = {}
         self.baseline_tokens: list[list[int]] | None = None
         self.baseline_logprobs: list[list[dict[int, float]]] | None = None
         self.durations: list[float] = []
@@ -165,6 +167,7 @@ class TierWorker:
                 self.baseline_tokens = tokens
                 self.baseline_logprobs = logprobs
                 self.baseline_tps = base.decode_tps
+                self.baseline_extra = dict(base.extra or {})
                 print(f"[kiln] {self.tier.name}: baseline decode {base.decode_tps:.1f} tok/s "
                       f"(variance {base.variance_pct:.2f}%)")
             self.boot_error = None
@@ -264,9 +267,14 @@ class TierWorker:
             if not math.isfinite(m.decode_tps) or m.decode_tps <= 0:
                 job.status, job.error = "invalid", "Candidate throughput must be finite and positive"
                 return
+            extra = dict(m.extra or {})
+            if self.baseline_extra.get("export") and extra.get("export"):
+                paired = compare_agentx_paired(self.baseline_extra["export"], extra["export"])
+                if paired is not None:
+                    extra["paired"] = paired
             job.decode_tps, job.prefill_tps = m.decode_tps, m.prefill_tps
             job.variance_pct, job.kernel_report = m.variance_pct, m.kernel_report
-            job.extra = m.extra
+            job.extra = extra
             job.speedup = m.decode_tps / self.baseline_tps
         finally:
             eng.teardown_candidate()
@@ -564,16 +572,98 @@ class JobManager:
                 worker.crashes = data["crashes"]
             self._maybe_cascade_invalidate_locked(job)
 
-    def leaderboard(self, tier: str = "slow", k: int = 10) -> list[dict]:
+    def promote_job(
+        self, jid: str, target_tier: str = "slow", agent: str | None = None, note: str = ""
+    ) -> Job:
+        with self.lock:
+            orig = self.jobs[jid]
+            if target_tier not in self.tiers:
+                raise KeyError(f"unknown tier {target_tier}; have {list(self.tiers)}")
+            source = Path(orig.candidate_path).read_text()
+            who = agent or orig.agent
+            desc = note.strip() or f"Promote {orig.tier} job {orig.id}: {orig.note}".strip()
+        return self.submit(who, target_tier, source, desc)
+
+    _LEADERBOARD_SORTS = {
+        "speedup",
+        "decode_tps",
+        "prefill_tps",
+        "output_tput",
+        "active_decode_tps",
+        "itl_p50_ms",
+        "itl_p90_ms",
+        "interactivity_p90",
+        "paired_speedup",
+    }
+
+    @staticmethod
+    def _leaderboard_metric(j: Job, key: str) -> float | None:
+        if key == "speedup":
+            return j.speedup
+        if key == "decode_tps":
+            return j.decode_tps
+        if key == "prefill_tps":
+            return j.prefill_tps
+        if key == "paired_speedup":
+            paired = j.extra.get("paired") if isinstance(j.extra, dict) else None
+            return paired.get("decode_duration_speedup") if isinstance(paired, dict) else None
+        val = j.extra.get(key) if isinstance(j.extra, dict) else None
+        return float(val) if isinstance(val, (int, float)) else None
+
+    @staticmethod
+    def _leaderboard_row(j: Job) -> dict:
+        row: dict = {
+            "id": j.id,
+            "agent": j.agent,
+            "speedup": round(j.speedup, 4),
+            "variance_pct": round(j.variance_pct or 0, 2),
+            "note": j.note,
+            "decode_tps": round(j.decode_tps, 2) if j.decode_tps is not None else None,
+            "prefill_tps": round(j.prefill_tps, 2) if j.prefill_tps is not None else None,
+            "token_match": round(j.token_match, 4) if j.token_match is not None else None,
+            "max_logit_abs_diff": (
+                round(j.max_logit_abs_diff, 4) if j.max_logit_abs_diff is not None else None
+            ),
+        }
+        ex = j.extra if isinstance(j.extra, dict) else {}
+        for key, digits in (
+            ("output_tput", 2),
+            ("active_decode_tps", 2),
+            ("itl_p50_ms", 3),
+            ("itl_p90_ms", 3),
+            ("interactivity_p90", 2),
+            ("effective_concurrency", 3),
+        ):
+            val = ex.get(key)
+            if isinstance(val, (int, float)):
+                row[key] = round(float(val), digits)
+        for key in ("request_count", "submission_valid"):
+            if key in ex and ex[key] is not None:
+                row[key] = ex[key]
+        paired = ex.get("paired")
+        if isinstance(paired, dict) and isinstance(paired.get("decode_duration_speedup"), (int, float)):
+            row["paired_decode_speedup"] = round(float(paired["decode_duration_speedup"]), 4)
+        return row
+
+    def leaderboard(self, tier: str = "slow", k: int = 10, sort_by: str = "speedup") -> list[dict]:
+        if sort_by not in self._LEADERBOARD_SORTS:
+            raise ValueError(f"unsupported sort_by {sort_by!r}; choose from {sorted(self._LEADERBOARD_SORTS)}")
+        asc = sort_by in ("itl_p50_ms", "itl_p90_ms")
         with self.lock:
             done = [j for j in self.jobs.values()
                     if j.tier == tier and j.status == "done"
                     and (j.extra.get("metric") != "agentx_total_tput_per_gpu" or
                          ((j.extra.get("submission_valid") is True or j.extra.get("unsafe_override") is True)
                           and j.extra.get("repeats")))]
-            done.sort(key=lambda j: j.speedup or 0, reverse=True)
-            return [{"id": j.id, "agent": j.agent, "speedup": round(j.speedup, 4),
-                     "variance_pct": round(j.variance_pct or 0, 2), "note": j.note} for j in done[:k]]
+
+            def _sort_key(j: Job) -> tuple[int, float]:
+                val = self._leaderboard_metric(j, sort_by)
+                if val is None or not math.isfinite(val):
+                    return (1, 0.0)
+                return (0, float(val) if asc else -float(val))
+
+            done.sort(key=_sort_key)
+            return [self._leaderboard_row(j) for j in done[:k]]
 
 
 def run_remote_worker(run: RunConfig, tier_name: str, server_url: str) -> None:

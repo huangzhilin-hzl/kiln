@@ -22,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-from kiln.bench.agentx import AgentXConfig, run_agentx_profile
+from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_profile
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
@@ -321,16 +321,7 @@ class SGLangServerEngine(Engine):
                 extra["submission_valid"] = False
                 raise InvalidBenchmark(f"Invalid AgentX measurement: {last.raw_path}", extra)
             runs.append(last.total_tput_per_gpu)
-        extra.update(
-            output_tput=result["output_tput"],
-            itl_p50_ms=result["itl_p50_ms"],
-            itl_p90_ms=result["itl_p90_ms"],
-            submission_valid=(last.submission_valid is True),
-            unsafe_override=self.agentx.unsafe_override,
-            export=last.raw_path,
-        )
-        itl = result["itl_p90_ms"]
-        extra["interactivity_p90"] = 1000.0 / itl if itl and itl > 0 else None
+        extra = agentx_result_to_extra(last, extra["repeats"], self.agentx.unsafe_override)
         return MeasureResult(
             decode_tps=sum(runs) / len(runs),           # score = InferenceX throughput / GPU
             prefill_tps=0.0, ttft_s=0.0, runs_decode_tps=runs,

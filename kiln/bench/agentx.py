@@ -179,27 +179,187 @@ class AgentXResult:
     itl_p90_ms: float | None
     submission_valid: bool | None
     raw_path: str
+    active_decode_tps: float | None = None
+    effective_concurrency: float | None = None
+    request_count: int | None = None
+    decode_duration_sum_ms: float | None = None
+    ttft_p50_ms: float | None = None
+    benchmark_duration_s: float | None = None
+    error_count: int | None = None
+    was_cancelled: bool | None = None
 
     @property
     def interactivity_p90(self) -> float | None:   # InferenceX: 1 / P90 ITL (tok/s/user)
         return 1000.0 / self.itl_p90_ms if self.itl_p90_ms else None
 
 
+def _num(val) -> float | None:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        f = float(val)
+        return f if f == f and abs(f) != float("inf") else None
+    return None
+
+
+def _metric(data: dict, name: str, key: str = "avg") -> float | None:
+    sec = data.get(name)
+    if not isinstance(sec, dict):
+        return None
+    v = sec.get(key)
+    if v is None and key == "avg":
+        v = sec.get("value")
+    return _num(v)
+
+
+def _error_count(data: dict) -> int | None:
+    if "error_summary" not in data:
+        return None
+    es = data["error_summary"]
+    if isinstance(es, list):
+        total = 0
+        for item in es:
+            if isinstance(item, dict) and item.get("count") is not None:
+                total += int(item["count"])
+            else:
+                total += 1
+        return total
+    if isinstance(es, dict):
+        if es.get("total") is not None:
+            return int(es["total"])
+        return sum(int(v) for v in es.values() if isinstance(v, (int, float)))
+    return None
+
+
 def parse_agentx_export(path: str | Path, num_gpus: int) -> AgentXResult:
     data = json.loads(Path(path).read_text())
     # Per-run exports keep measured metrics at the root. Warmup metrics
     # cannot substitute for a missing measurement.
-    total = data.get("total_token_throughput") or {}
-    out = data.get("output_token_throughput") or {}
+    tot = _metric(data, "total_token_throughput", "avg") or 0.0
+    out = _metric(data, "output_token_throughput", "avg") or 0.0
     itl = data.get("inter_token_latency") or {}
-    tot = total.get("avg") or total.get("value") or 0.0
+    req_cnt = _metric(data, "request_count", "avg")
+    if req_cnt is None:
+        req_cnt = _metric(data, "decode_duration", "count")
+    cancelled = data.get("was_cancelled") if isinstance(data.get("was_cancelled"), bool) else None
     return AgentXResult(
         total_tput_per_gpu=float(tot) / max(num_gpus, 1),
-        output_tput=float(out.get("avg") or out.get("value") or 0.0),
-        itl_p50_ms=itl.get("p50"), itl_p90_ms=itl.get("p90"),
+        output_tput=float(out),
+        itl_p50_ms=_num(itl.get("p50")),
+        itl_p90_ms=_num(itl.get("p90")),
         submission_valid=(data.get("metadata") or {}).get("submission_valid", data.get("submission_valid")),
         raw_path=str(path),
+        active_decode_tps=_metric(data, "active_decode_throughput", "avg"),
+        effective_concurrency=_metric(data, "effective_concurrency", "avg"),
+        request_count=int(round(req_cnt)) if req_cnt is not None else None,
+        decode_duration_sum_ms=_metric(data, "decode_duration", "sum"),
+        ttft_p50_ms=_metric(data, "time_to_first_token", "p50"),
+        benchmark_duration_s=_metric(data, "benchmark_duration", "avg"),
+        error_count=_error_count(data),
+        was_cancelled=cancelled,
     )
+
+
+def parse_agentx_requests(export_path: str | Path) -> dict[str, dict]:
+    """Read sibling `profile_export.jsonl` keyed by `(conversation_id, turn_index)` (excluding warmup/cancelled)."""
+    jsonl_path = Path(export_path).with_name("profile_export.jsonl")
+    if not jsonl_path.is_file():
+        return {}
+    out: dict[str, dict] = {}
+    for line in jsonl_path.read_text(errors="ignore").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        meta = obj.get("metadata") or {}
+        metrics = obj.get("metrics") or {}
+        if meta.get("benchmark_phase") == "warmup" or meta.get("was_cancelled") is True:
+            continue
+        conv = meta.get("conversation_id")
+        turn = meta.get("turn_index")
+        if conv is not None and turn is not None:
+            key = f"{conv}:{turn}"
+        elif meta.get("source_trace_id") is not None and turn is not None:
+            key = f"{meta['source_trace_id']}:{turn}"
+        elif meta.get("x_correlation_id") is not None:
+            key = str(meta["x_correlation_id"])
+        else:
+            continue
+
+        def _val(v):
+            return _num(v.get("value") if isinstance(v, dict) else v)
+
+        dec_ms = _val(metrics.get("decode_duration"))
+        tok = _val(metrics.get("output_token_count"))
+        if tok is None:
+            tok = _val(metrics.get("usage_completion_tokens"))
+        if dec_ms is None and tok is None:
+            continue
+        out[key] = {
+            "decode_ms": dec_ms or 0.0,
+            "output_tokens": tok or 0.0,
+        }
+    return out
+
+
+def compare_agentx_paired(baseline_export: str | Path, candidate_export: str | Path) -> dict | None:
+    """Compare completed requests shared between baseline and candidate AgentX exports."""
+    base = parse_agentx_requests(baseline_export)
+    cand = parse_agentx_requests(candidate_export)
+    common = sorted(base.keys() & cand.keys())
+    if not common:
+        return None
+    base_ms = sum(base[k]["decode_ms"] for k in common)
+    cand_ms = sum(cand[k]["decode_ms"] for k in common)
+    base_tok = sum(base[k]["output_tokens"] for k in common)
+    cand_tok = sum(cand[k]["output_tokens"] for k in common)
+    base_s = base_ms / 1000.0
+    cand_s = cand_ms / 1000.0
+    decode_sp = (base_s / cand_s) if cand_s > 0 and base_s > 0 else None
+    base_tps = (base_tok / base_s) if base_s > 0 else None
+    cand_tps = (cand_tok / cand_s) if cand_s > 0 else None
+    tput_sp = (cand_tps / base_tps) if (cand_tps is not None and base_tps and base_tps > 0) else None
+    return {
+        "paired_requests": len(common),
+        "baseline_decode_s": round(base_s, 4),
+        "candidate_decode_s": round(cand_s, 4),
+        "decode_duration_speedup": round(decode_sp, 4) if decode_sp is not None else None,
+        "baseline_output_tokens": int(round(base_tok)),
+        "candidate_output_tokens": int(round(cand_tok)),
+        "paired_output_tps_speedup": round(tput_sp, 4) if tput_sp is not None else None,
+    }
+
+
+def agentx_result_to_extra(
+    last: AgentXResult, repeats: list[dict], unsafe_override: bool
+) -> dict:
+    """Build normalized `MeasureResult.extra` payload for an AgentX evaluation."""
+    itl = last.itl_p90_ms
+    extra: dict = {
+        "metric": "agentx_total_tput_per_gpu",
+        "repeats": repeats,
+        "output_tput": last.output_tput,
+        "itl_p50_ms": last.itl_p50_ms,
+        "itl_p90_ms": last.itl_p90_ms,
+        "submission_valid": (last.submission_valid is True),
+        "unsafe_override": unsafe_override,
+        "export": last.raw_path,
+        "interactivity_p90": 1000.0 / itl if itl and itl > 0 else None,
+    }
+    for attr in (
+        "active_decode_tps",
+        "effective_concurrency",
+        "request_count",
+        "decode_duration_sum_ms",
+        "ttft_p50_ms",
+        "benchmark_duration_s",
+        "error_count",
+        "was_cancelled",
+    ):
+        val = getattr(last, attr, None)
+        if val is not None:
+            extra[attr] = val
+    return extra
 
 
 def run_agentx_profile(url: str, model: str, tokenizer: str, cfg: AgentXConfig,

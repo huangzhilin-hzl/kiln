@@ -1,0 +1,20 @@
+kiln/config.py
+  h_7339bf36ecd0bc 45
+kiln/server/app.py
+  h_7339bf36ecd0bc 39-40,54-55
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 57-58,157-159,193,197-199,229-230,311-320,324-363,366-367,439-440,687-689,699-702,766-767,907
+tests/test_regressions.py
+  h_7339bf36ecd0bc 1292-1352
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "29b90a1c288f0a8a5fe3b27de899cd276fe0d477",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

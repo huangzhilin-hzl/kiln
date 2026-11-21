@@ -1289,3 +1289,64 @@ def test_slot_roles_and_formal_sglang_config_governance(tmp_path, monkeypatch):
     p2 = (tmp_path / "roles" / "agents" / "agent_2" / "PROMPT.md").read_text()
     assert "Role: `explorer`" in p1 and "Focus on WGMMA" in p1
     assert "Role: `auditor`" in p2 and "bitwise/numerical verification" in p2
+
+
+def test_per_job_baseline_boot_id_and_periodic_canary(tmp_path, capsys):
+    import json
+    from fastapi.testclient import TestClient
+    from kiln.server.app import create_app
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2],"output_len":2}\n')
+    tier = TierConfig(name="fast", repeats=2, canary_every_n_jobs=2)
+    run = RunConfig(name="canaryrun", traffic_file=str(traffic), workdir=str(tmp_path), tiers=[tier])
+    app = create_app(run, local_tiers={"fast"})
+    with TestClient(app) as client:
+        worker = app.state.mgr.tiers["fast"]
+        assert worker.ready.wait(timeout=5)
+        boot1 = worker.boot_id
+        base1 = worker.baseline_tps
+        assert boot1 and base1
+
+        j1 = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.05\n", "note": "c1"}).json()["id"]
+        j2 = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.10\n", "note": "c2"}).json()["id"]
+
+        for jid in (j1, j2):
+            job_obj = app.state.mgr.jobs[jid]
+            t0 = __import__("time").time()
+            while job_obj.finished_at is None and __import__("time").time() - t0 < 5:
+                __import__("time").sleep(0.02)
+            assert job_obj.status == "done"
+
+        d1 = client.get(f"/jobs/{j1}").json()
+        d2 = client.get(f"/jobs/{j2}").json()
+        assert d1["engine_boot_id"] == boot1 and d1["baseline_tps"] == base1
+        assert d2["engine_boot_id"] == boot1 and d2["baseline_tps"] == base1
+
+        # Canary should have fired after 2nd done job
+        canary_file = tmp_path / "canaryrun" / "canary_fast.jsonl"
+        assert canary_file.exists()
+        rows = [json.loads(line) for line in canary_file.read_text().splitlines() if line.strip()]
+        assert len(rows) == 1
+        assert rows[0]["boot_id"] == boot1
+        st = client.get("/status").json()
+        fast_st = st["tiers"][0]
+        assert fast_st["boot_id"] == boot1
+        assert fast_st["last_canary"]["boot_id"] == boot1
+
+        # Engine crash -> restart rotates boot_id
+        jc = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "CRASH = True\n", "note": "boom"}).json()["id"]
+        job_c = app.state.mgr.jobs[jc]
+        t0 = __import__("time").time()
+        while job_c.finished_at is None and __import__("time").time() - t0 < 5:
+            __import__("time").sleep(0.02)
+        assert job_c.status == "crashed"
+        boot2 = worker.boot_id
+        assert boot2 and boot2 != boot1
+
+        j3 = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.15\n", "note": "after"}).json()["id"]
+        job_3 = app.state.mgr.jobs[j3]
+        t0 = __import__("time").time()
+        while job_3.finished_at is None and __import__("time").time() - t0 < 5:
+            __import__("time").sleep(0.02)
+        assert client.get(f"/jobs/{j3}").json()["engine_boot_id"] == boot2

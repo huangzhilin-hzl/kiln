@@ -54,6 +54,8 @@ class Job:
     error: str | None = None
     source_sha256: str | None = None
     invalidated_reason: str | None = None
+    baseline_tps: float | None = None
+    engine_boot_id: str | None = None
     worker_id: str | None = None
     attempt_id: str | None = None
     lease_expires_at: float | None = None
@@ -152,6 +154,9 @@ class TierWorker:
         self.baseline_extra: dict = {}
         self.baseline_tokens: list[list[int]] | None = None
         self.baseline_logprobs: list[list[dict[int, float]]] | None = None
+        self.boot_id: str | None = None
+        self.last_canary: dict | None = None
+        self._jobs_since_canary: int = 0
         self.durations: list[float] = []
         self.crashes = 0
         self.boot_error: str | None = None
@@ -185,9 +190,13 @@ class TierWorker:
             self.ready.clear()
             if self.owner is None:
                 self._ensure_own_engine()
+                self.boot_id = uuid.uuid4().hex[:8]
             else:
                 self.owner._ensure_own_engine()
                 self.engine = SharedEngineAdapter(self.owner, self.tier)
+                if not self.owner.boot_id:
+                    self.owner.boot_id = uuid.uuid4().hex[:8]
+                self.boot_id = self.owner.boot_id
             if self.baseline_tokens is None or self.baseline_tps is None:
                 cc = self.run.correctness
                 probe = [r.prompt_ids for r in self.requests[: cc.num_prompts]]
@@ -217,6 +226,8 @@ class TierWorker:
                 self.owner.ready.clear()
                 self.owner._shutdown_own_engine()
                 self.owner._ensure_own_engine()
+                self.owner.boot_id = uuid.uuid4().hex[:8]
+                self.boot_id = self.owner.boot_id
                 if owner_was_ready:
                     self.owner.ready.set()
                 self.ready.set()
@@ -297,11 +308,63 @@ class TierWorker:
                 self._save(result)
                 job.__dict__.update(result.__dict__)
                 self.durations.append(result.finished_at - result.started_at)
+                if (
+                    result.status == "done"
+                    and self.tier.canary_every_n_jobs is not None
+                ):
+                    self._jobs_since_canary += 1
+                    if self._jobs_since_canary >= self.tier.canary_every_n_jobs:
+                        try:
+                            self._run_canary()
+                        except Exception as exc:
+                            print(f"[kiln] {self.tier.name}: canary calibration skipped ({exc})")
                 if self.on_job_finished is not None:
                     self.on_job_finished(job)
 
+    def _run_canary(self) -> dict | None:
+        if self.engine is None or not self.baseline_tps or self.baseline_tps <= 0:
+            return None
+        timeout_s = float(self.tier.timeout_s or 0)
+        ax_dur = ((self.tier.agentx or {}).get("benchmark_duration_s") or 0)
+        measure_timeout = (
+            max(timeout_s, float(ax_dur) * 3 + 300.0)
+            if (self.tier.agentx is not None and timeout_s > 0)
+            else timeout_s
+        )
+        m = _run_with_timeout(
+            lambda: self.engine.measure(self.requests, repeats=1, trace=False),
+            measure_timeout,
+            f"{self.tier.name} canary",
+        )
+        tps = float(m.decode_tps)
+        if not math.isfinite(tps) or tps <= 0:
+            raise RuntimeError("Canary throughput must be finite and positive")
+        drift_pct = 100.0 * (tps - self.baseline_tps) / self.baseline_tps
+        rec = {
+            "ts": time.time(),
+            "tier": self.tier.name,
+            "boot_id": self.boot_id,
+            "baseline_tps": round(self.baseline_tps, 4),
+            "measured_tps": round(tps, 4),
+            "drift_pct": round(drift_pct, 3),
+        }
+        self.last_canary = rec
+        self._jobs_since_canary = 0
+        cpath = self.jobs_dir.parent / f"canary_{self.tier.name}.jsonl"
+        cpath.parent.mkdir(parents=True, exist_ok=True)
+        with open(cpath, "a", encoding="utf-8") as cf:
+            cf.write(json.dumps(rec) + "\n")
+        if abs(drift_pct) > 3.0:
+            print(
+                f"[kiln] WARNING {self.tier.name}: baseline canary drift {drift_pct:+.2f}% "
+                f"({tps:.1f} vs {self.baseline_tps:.1f} tok/s)"
+            )
+        return rec
+
     def _run_job(self, job: Job) -> None:
         eng, cc = self.engine, self.run.correctness
+        job.baseline_tps = self.baseline_tps
+        job.engine_boot_id = self.boot_id
         reload_timeout = float(self.tier.timeout_s or 0)
         ax_dur = ((self.tier.agentx or {}).get("benchmark_duration_s") or 0)
         measure_timeout = (
@@ -373,6 +436,8 @@ class TierWorker:
             "queue_depth": q_depth,
             "median_job_s": statistics.median(self.durations) if self.durations else None,
             "baseline_decode_tps": self.baseline_tps,
+            "boot_id": self.boot_id,
+            "last_canary": self.last_canary,
             "crashes": self.crashes,
             "layers": self.tier.num_layers or "all",
         }
@@ -619,7 +684,9 @@ class JobManager:
 
     def heartbeat_remote(self, tier: str, worker_id: str, ready: bool,
                          baseline_tps: float | None, crashes: int,
-                         attempt_id: str | None = None) -> None:
+                         attempt_id: str | None = None,
+                         boot_id: str | None = None,
+                         last_canary: dict | None = None) -> None:
         worker = self.tiers[tier]
         with self.lock:
             self._expire_remote(tier)
@@ -629,6 +696,10 @@ class JobManager:
                 worker.ready.set()
                 worker.baseline_tps = baseline_tps
                 worker.crashes = crashes
+                if boot_id is not None:
+                    worker.boot_id = boot_id
+                if last_canary is not None:
+                    worker.last_canary = last_canary
             else:
                 self.remote_workers[tier].pop(worker_id, None)
                 if not self.remote_workers[tier]:
@@ -692,7 +763,8 @@ class JobManager:
 
             changes = {key: data[key] for key in (
                 "status", "speedup", "decode_tps", "prefill_tps", "variance_pct",
-                "token_match", "max_logit_abs_diff", "kernel_report", "extra", "error",
+                "token_match", "max_logit_abs_diff", "baseline_tps", "engine_boot_id",
+                "kernel_report", "extra", "error",
             ) if key in data}
             result = replace(job, finished_at=time.time(), lease_expires_at=None, **changes)
             worker._save(result)
@@ -832,6 +904,7 @@ def run_remote_worker(run: RunConfig, tier_name: str, server_url: str) -> None:
                     "worker_id": worker_id, "attempt_id": attempt_id,
                     "ready": worker.ready.is_set(), "baseline_tps": worker.baseline_tps,
                     "crashes": worker.crashes,
+                    "boot_id": worker.boot_id, "last_canary": worker.last_canary,
                 }).raise_for_status()
             except httpx.HTTPError as exc:
                 print(f"[kiln] {tier_name}: heartbeat failed ({exc})")

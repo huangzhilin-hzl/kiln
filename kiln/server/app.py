@@ -36,6 +36,8 @@ class HeartbeatReq(BaseModel):
     ready: bool
     baseline_tps: FiniteFloat | None = None
     crashes: int = 0
+    boot_id: str | None = None
+    last_canary: dict | None = None
 
 
 class CompleteReq(BaseModel):
@@ -49,6 +51,8 @@ class CompleteReq(BaseModel):
     variance_pct: FiniteFloat | None = None
     token_match: FiniteFloat | None = None
     max_logit_abs_diff: FiniteFloat | None = None
+    baseline_tps: FiniteFloat | None = None
+    engine_boot_id: str | None = None
     kernel_report: str | None = None
     extra: dict = Field(default_factory=dict)
     error: str | None = None

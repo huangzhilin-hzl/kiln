@@ -42,6 +42,7 @@ class TierConfig(BaseModel):
     timeout_s: float = 600.0
     max_queued_per_agent: int | None = Field(default=None, ge=1)
     deduplicate_queued: bool = False
+    canary_every_n_jobs: int | None = Field(default=None, ge=1)
 
     @field_validator("agentx")
     @classmethod

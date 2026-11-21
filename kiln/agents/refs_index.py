@@ -92,10 +92,18 @@ def _find_target_root(
     """Return (target_path, is_matched_package) for indexing."""
     stems = _model_stems(model_hint)
     roots = _engine_model_roots(refs_dir, engine_hint)
+    wanted_engine = (
+        "sglang"
+        if (engine_hint and engine_hint.startswith("sglang"))
+        else ("vllm" if (engine_hint and engine_hint.startswith("vllm")) else None)
+    )
     best_score = -1
     best_path: Path | None = None
 
     for root in roots:
+        engine_bonus = (
+            2000 if (wanted_engine and root.relative_to(refs_dir).parts[:1] == (wanted_engine,)) else 0
+        )
         for entry in sorted(root.iterdir()):
             if entry.name.startswith((".", "_")) or entry.name == "__pycache__":
                 continue
@@ -110,9 +118,11 @@ def _find_target_root(
                     score = 500 - idx * 20 + min(len(entry_norm), len(stem))
                 elif stem in entry_norm:
                     score = 200 - idx * 20 + len(stem)
-                if score > best_score:
-                    best_score = score
-                    best_path = entry
+                if score >= 0:
+                    total = score + engine_bonus
+                    if total > best_score:
+                        best_score = total
+                        best_path = entry
 
     if best_path is not None:
         return best_path, True
@@ -269,6 +279,14 @@ def _summarize_file(path: Path, nvidia_focused: bool) -> tuple[int, int, list[st
     return n_lines, size_bytes, details
 
 
+def _header_comment(model_hint: str | None, engine_hint: str | None) -> str:
+    header_model = (model_hint or "auto").replace("-->", "").replace("\n", " ").strip() or "auto"
+    header_engine = (engine_hint or "").replace("-->", "").replace("\n", " ").strip()
+    if header_engine:
+        return f"{GENERATED_PREFIX}; engine={header_engine}; model={header_model} -->"
+    return f"{GENERATED_PREFIX}; model={header_model} -->"
+
+
 def build_refs_index(
     refs_dir: str | Path,
     model_hint: str | None = None,
@@ -278,14 +296,22 @@ def build_refs_index(
     """Build a compact Markdown source index for `refs_dir` within `max_lines`."""
     refs = Path(refs_dir)
     max_lines = max(10, int(max_lines))
-    header_model = (model_hint or "auto").replace("-->", "").replace("\n", " ").strip() or "auto"
 
     target, matched_pkg = _find_target_root(refs, model_hint, engine_hint)
     nvidia_focused = True
     skipped_deep = 0
 
     if target.is_file():
-        primary_files = [target]
+        siblings = sorted(
+            [
+                p
+                for p in target.parent.glob("*.py")
+                if p != target and p.name != "__init__.py" and p.stem.startswith(target.stem)
+            ],
+            key=lambda p: p.stat().st_size,
+            reverse=True,
+        )
+        primary_files = [target, *siblings]
     elif matched_pkg and target.is_dir():
         primary_files, nvidia_focused, skipped_deep = _collect_package_files(target)
     else:
@@ -301,7 +327,8 @@ def build_refs_index(
         )
         primary_files = all_py[:12]
 
-    extra_layers = _resolve_local_layer_imports(refs, primary_files, limit=4) if primary_files else []
+    layer_limit = 6 if target.is_file() else 4
+    extra_layers = _resolve_local_layer_imports(refs, primary_files, limit=layer_limit) if primary_files else []
     ordered_files: list[Path] = []
     seen_files: set[Path] = set()
     for p in [*primary_files[:12], *extra_layers]:
@@ -310,7 +337,7 @@ def build_refs_index(
             ordered_files.append(p)
 
     header = [
-        f"{GENERATED_PREFIX}; model={header_model} -->",
+        _header_comment(model_hint, engine_hint),
         "# Refs Source Index",
         "> Read this index first instead of whole >20KB files. Inspect ranges with `sed -n 'START,ENDp' refs/<path>`.",
         "",
@@ -373,15 +400,14 @@ def ensure_refs_index(
         return None
 
     target = Path(out_path) if out_path else refs / "INDEX.md"
-    header_model = (model_hint or "auto").replace("-->", "").replace("\n", " ").strip() or "auto"
+    expected_header = _header_comment(model_hint, engine_hint)
 
     if target.exists() and not force:
         existing_first = target.read_text(encoding="utf-8", errors="ignore").splitlines()[:1]
         first = existing_first[0] if existing_first else ""
         if not first.startswith(GENERATED_PREFIX):
             return target
-        m = re.search(r";\s*model=(.*?)\s*-->", first)
-        if m and m.group(1) == header_model:
+        if first == expected_header:
             return target
 
     content = build_refs_index(refs, model_hint=model_hint, engine_hint=engine_hint, max_lines=max_lines)

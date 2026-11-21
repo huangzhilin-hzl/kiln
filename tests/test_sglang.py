@@ -475,6 +475,27 @@ def test_sglang_server_engine_http_and_agentx(tmp_path: Path, monkeypatch):
         slow_eng.measure(reqs, repeats=1, trace=False)
     slow_eng.http.close()
 
+    # Short AgentX duration (180s) must still respect tier.timeout_s so warmup is not killed prematurely.
+    short_tier = TierConfig(
+        name="slow",
+        agentx={"benchmark_duration_s": 180, "unsafe_override": True},
+        repeats=1,
+        timeout_s=3600,
+    )
+    short_eng = SGLangServerEngine(cfg, short_tier)
+    short_eng.http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    seen_timeouts: list[float] = []
+
+    def fake_agentx_short(*args, **kwargs):
+        seen_timeouts.append(kwargs["timeout_s"])
+        return AgentXResult(3100.0, 90.0, 6.0, 9.0, False, "short.json")
+
+    monkeypatch.setattr("kiln.engine.sglang_server.run_agentx_profile", fake_agentx_short)
+    short_res = short_eng.measure(reqs, repeats=1, trace=False)
+    assert short_res.decode_tps == 3100.0
+    assert seen_timeouts == [3600]
+    short_eng.http.close()
+
 
 def test_smoke_broken_candidate_supports_sglang_logits_output(monkeypatch):
     import numpy as np
@@ -551,6 +572,7 @@ def test_sglang_c859d701_weight_updater_and_backend_cleanup(tmp_path: Path, monk
             self.eager_runner = eager
             self.prefill_cuda_graph_runner = eager
             self.decode_cuda_graph_runner = FakeDecodeRunner("target_decode")
+            self.capture_tail_hooks = ["target_verify_hook"]
 
         def init_prefill_cuda_graph(self):
             events.append("init_prefill_cuda_graph")
@@ -564,14 +586,18 @@ def test_sglang_c859d701_weight_updater_and_backend_cleanup(tmp_path: Path, monk
             self.eager_runner = EagerRunner()
             self.prefill_cuda_graph_runner = self.eager_runner
             self.decode_cuda_graph_runner = FakeDecodeRunner("draft_decode")
+            self.capture_tail_hooks = ["draft_sampler_hook"]
 
     class FakeDraftWorker:
         def __init__(self):
             self.draft_model_runner = FakeDraftRunner()
             self.cuda_graph_runner = FakeDecodeRunner("dspark_draft")
+            self._draft_sampler = "initial_sampler"
 
         def init_cuda_graphs(self):
             events.append("draft_init_cuda_graphs")
+            self._draft_sampler = "new_sampler"
+            self.draft_model_runner.capture_tail_hooks.append("draft_sampler_hook")
             self.cuda_graph_runner = FakeDecodeRunner("dspark_draft_new")
 
     target_runner = FakeTargetRunner()
@@ -618,10 +644,14 @@ def test_sglang_c859d701_weight_updater_and_backend_cleanup(tmp_path: Path, monk
     assert events.index("cleanup:target_decode") < events.index("init_decode_cuda_graph")
     assert events.index("init_decode_cuda_graph") < events.index("draft_init_cuda_graphs")
     assert pool_calls == [None]
+    assert target_runner.capture_tail_hooks == ["target_verify_hook"]
+    assert scheduler.draft_worker.draft_model_runner.capture_tail_hooks == ["draft_sampler_hook"]
 
     td_out = mgr.update_weights_from_disk(SimpleNamespace(model_path=encode_rpc("kiln_teardown")))
     assert td_out.success is True
     assert model.forward(4) == 5
+    assert target_runner.capture_tail_hooks == ["target_verify_hook"]
+    assert scheduler.draft_worker.draft_model_runner.capture_tail_hooks == ["draft_sampler_hook"]
 
     # TokenizerManager _update_model_path_info must skip mutating served_model_name on kiln RPCs
     # and _restore_tm_paths must not write to read-only ServerArgs (c859d701)

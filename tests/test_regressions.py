@@ -785,3 +785,90 @@ def test_cli_agents_dry_run(tmp_path, capsys):
     assert [r["agent"] for r in rows] == ["agent_1", "agent_2", "agent_3"]
     assert [r["provider"] for r in rows] == ["agy", "codex", "claude"]
     assert [r["model"] for r in rows] == ["gemini-4-neon-high", "o3", "claude-opus-4-5"]
+
+
+def test_codex_default_model_and_reasoning_effort_override():
+    from kiln.config import AgentConfig, AgentSlotConfig
+
+    cfg_default = AgentConfig(slots=[AgentSlotConfig(provider="codex")])
+    s0 = cfg_default.resolve_slot(0)
+    assert s0.provider == "codex"
+    assert s0.model == "gpt-6.2-sol"
+    assert s0.argv[s0.argv.index("--model") + 1] == "gpt-6.2-sol"
+    assert "-c" in s0.argv and "model_reasoning_effort=high" in s0.argv
+
+    cfg_override = AgentConfig(
+        slots=[AgentSlotConfig(provider="codex", extra_args=["-c", "model_reasoning_effort=ultra"])]
+    )
+    s_ultra = cfg_override.resolve_slot(0)
+    effort_args = [tok for tok in s_ultra.argv if tok.startswith("model_reasoning_effort=")]
+    assert effort_args == ["model_reasoning_effort=ultra"]
+
+    run_sglang = RunConfig.load("configs/dsv41_flash_h20_sglang.yaml")
+    assert run_sglang.agents.num_agents == 5
+    s4 = run_sglang.agents.resolve_slot(4)
+    assert s4.provider == "codex"
+    assert s4.model == "gpt-6.2-sol"
+    assert [tok for tok in s4.argv if tok.startswith("model_reasoning_effort=")] == ["model_reasoning_effort=high"]
+
+
+def test_refs_index_prefers_engine_root_and_includes_sglang_siblings(tmp_path):
+    from kiln.agents.refs_index import ensure_refs_index
+
+    refs = tmp_path / "refs"
+    vllm_model = refs / "vllm" / "models" / "deepseek_v41" / "nvidia" / "model.py"
+    vllm_model.parent.mkdir(parents=True)
+    vllm_model.write_text("class DeepseekV41LLMForCausalLM:\n    def forward(self, x):\n        return x\n" + "\n" * 65)
+
+    sg_models = refs / "sglang" / "srt" / "models"
+    sg_models.mkdir(parents=True)
+    (sg_models / "deepseek_v4.py").write_text(
+        "class DeepseekV4ForCausalLM:\n    def forward(self, input_ids):\n        return input_ids\n"
+    )
+    (sg_models / "deepseek_v4_dspark.py").write_text(
+        "class DeepseekV4DSparkForCausalLM:\n    def forward(self, input_ids):\n        return input_ids\n"
+    )
+
+    idx_vllm = ensure_refs_index(refs, model_hint="DeepSeek-V4.1-Flash-1017", engine_hint="vllm_offline")
+    assert idx_vllm is not None
+    vllm_text = idx_vllm.read_text()
+    assert "engine=vllm_offline; model=DeepSeek-V4.1-Flash-1017 -->" in vllm_text
+    assert "vllm/models/deepseek_v41/nvidia/model.py" in vllm_text
+
+    # Switching engine_hint on the same model refreshes INDEX.md automatically even with force=False.
+    idx_sg = ensure_refs_index(refs, model_hint="DeepSeek-V4.1-Flash-1017", engine_hint="sglang_offline", force=False)
+    assert idx_sg is not None
+    sg_text = idx_sg.read_text()
+    assert "engine=sglang_offline; model=DeepSeek-V4.1-Flash-1017 -->" in sg_text
+    assert "sglang/srt/models/deepseek_v4.py" in sg_text
+    assert "sglang/srt/models/deepseek_v4_dspark.py" in sg_text
+    assert "vllm/models/deepseek_v41" not in sg_text
+
+
+def test_normalize_proxy_env():
+    from kiln.agents.launcher import _normalize_proxy_env
+
+    # Lowercase mirrors to uppercase and merges loopback into NO_PROXY / no_proxy without duplicates.
+    env_lo = {
+        "http_proxy": "http://127.0.0.1:7897",
+        "https_proxy": "http://127.0.0.1:7897",
+        "no_proxy": "10.0.0.0/8,localhost",
+    }
+    out_lo = _normalize_proxy_env(env_lo)
+    assert out_lo["HTTP_PROXY"] == "http://127.0.0.1:7897"
+    assert out_lo["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert "all_proxy" not in out_lo and "ALL_PROXY" not in out_lo
+    assert out_lo["NO_PROXY"].split(",") == ["10.0.0.0/8", "localhost", "127.0.0.1", "::1"]
+    assert out_lo["no_proxy"] == out_lo["NO_PROXY"]
+
+    # Uppercase mirrors to lowercase without overwriting distinct existing pairs.
+    env_hi = {
+        "HTTP_PROXY": "http://proxy.internal:8080",
+        "ALL_PROXY": "socks5://127.0.0.1:7897",
+        "NO_PROXY": "127.0.0.1,*.internal",
+    }
+    out_hi = _normalize_proxy_env(env_hi)
+    assert out_hi["http_proxy"] == "http://proxy.internal:8080"
+    assert out_hi["all_proxy"] == "socks5://127.0.0.1:7897"
+    assert out_hi["NO_PROXY"].split(",") == ["127.0.0.1", "*.internal", "localhost", "::1"]
+    assert out_hi["no_proxy"] == out_hi["NO_PROXY"]

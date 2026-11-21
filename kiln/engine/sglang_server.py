@@ -306,7 +306,7 @@ class SGLangServerEngine(Engine):
             last = run_agentx_profile(
                 self.url, self.served_name, self.cfg.tokenizer or self.cfg.model, self.agentx,
                 artifact_dir, n_gpus,
-                timeout_s=(self.agentx.benchmark_duration_s or 7200) * 3,
+                timeout_s=max(self.tier.timeout_s, (self.agentx.benchmark_duration_s or 7200) * 3),
             )
             result = asdict(last)
             for key, value in result.items():

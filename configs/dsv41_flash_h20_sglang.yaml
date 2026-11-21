@@ -1,24 +1,22 @@
-# DeepSeek-V4.1-Flash-1017 on 2x8 H20-3e GPUs (SM90, 141 GB HBM3e/GPU) using SGLang.
-#   Node 0 (8x H20-3e, TP8+EP8): `kiln serve` + fast tier (`sglang_offline`, kernel profiler).
+# DeepSeek-V4.1-Flash-1017 on 2x8 H20-3e GPUs (SM90, 141 GB HBM3e/GPU) using SGLang + AgentX + DSpark.
+#   Node 0 (8x H20-3e, TP8+EP8): `kiln serve` + fast tier (`sglang_offline`, kernel profiler, 256k context).
 #   Node 1 (8x H20-3e, TP8+EP8): slow tier via `kiln worker --tier slow --server http://<NODE0_IP>:18765`
-#                                (`sglang.launch_server`).
+#                                (`sglang.launch_server` + DSPARK + real AgentX harness).
 # Leave `gpus: []` when running under sched/k8s so scheduler-injected CUDA_VISIBLE_DEVICES is preserved.
-name: dsv41-flash-h20-sglang
+name: dsv41-flash-h20-sglang-agentx
 engine:
   kind: sglang_offline
   model: /home/models/DeepSeek-V4.1-Flash-1017
   tensor_parallel_size: 8
-  max_model_len: 16384
+  max_model_len: 1048576
   extra_args:
     ep_size: 8
     moe_a2a_backend: none
     attention_backend: dsv4
     image_processor_backend: pil
-    chunked_prefill_size: 1024
-    max_running_requests: 16
-    cuda_graph_max_bs_decode: 16
-    max_total_tokens: 65536
-    mem_fraction_static: 0.85
+    chunked_prefill_size: 4096
+    max_running_requests: 64
+    mem_fraction_static: 0.84
     moe_runner_backend: flashinfer_mxfp4
     flashinfer_mxfp4_moe_precision: fp8
     random_seed: 0
@@ -30,28 +28,42 @@ tiers:
     repeats: 3
     trace_kernels: true
     timeout_s: 900
+    engine_overrides:
+      context_length: 262144
+      cuda_graph_max_bs_decode: 32
   - name: slow
     engine_kind: sglang_server
     gpus: []
     port: 31400
-    max_requests: 16
-    repeats: 3
+    repeats: 1
     trace_kernels: false
-    timeout_s: 1200
-traffic_file: traffic/dsv41_smoke.jsonl
+    timeout_s: 3600
+    engine_overrides:
+      mem_fraction_static: 0.74
+      enable_cache_report: true
+      cuda_graph_max_bs_decode: 64
+      speculative_algorithm: DSPARK
+      speculative_dspark_block_size: 5
+      tool_call_parser: deepseekv41
+      reasoning_parser: deepseek-v41
+    agentx:
+      concurrency: 8
+      public_dataset: semianalysis_cc_traces_weka_062126
+      random_seed: 42
+      benchmark_duration_s: 900
+      unsafe_override: false
+traffic_file: traffic/agentx.jsonl
 correctness:
   min_token_match: 0.85        # MXFP4 + FP8 tie-breaks; short horizon avoids cascade
-  num_prompts: 8
+  num_prompts: 16
   max_new_tokens: 8
+hw_profile: runs/hw_profile.json
 agents:
-  num_agents: 4
-  command: "agy --model {model} --dangerously-skip-permissions --disable-slash-commands --settings '{\"enableTerminalSandbox\":false}' -p {prompt}"
-  models:
-    - gemini-4-neon-high
-    - gemini-4-neon-high
-    - gemini-4-carbon-high
-    - claude-opus-5-5-high
-  budget_hours: 12
+  slots:
+    - {provider: agy, model: gemini-4-neon-high, count: 2}
+    - {provider: agy, model: gemini-4-carbon-high}
+    - {provider: codex, model: gpt-6.2-sol, count: 2, extra_args: ["-c", "model_reasoning_effort=high"]}
+  budget_hours: 24
   respawn_on_exit: true
 workdir: runs
 server_url: http://0.0.0.0:18765

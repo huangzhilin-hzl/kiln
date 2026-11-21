@@ -93,6 +93,36 @@ def _inject_refs_dir(argv: list[str], provider: str, refs_dir: Path) -> list[str
     return list(argv)
 
 
+def _normalize_proxy_env(env: dict[str, str]) -> dict[str, str]:
+    """Mirror proxy env vars between lower/uppercase and bypass proxy for loopback."""
+    for lo, hi in (
+        ("http_proxy", "HTTP_PROXY"),
+        ("https_proxy", "HTTPS_PROXY"),
+        ("all_proxy", "ALL_PROXY"),
+    ):
+        if env.get(lo) and not env.get(hi):
+            env[hi] = env[lo]
+        elif env.get(hi) and not env.get(lo):
+            env[lo] = env[hi]
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for raw in (env.get("NO_PROXY", ""), env.get("no_proxy", "")):
+        for item in raw.split(","):
+            entry = item.strip()
+            if entry and entry not in seen:
+                seen.add(entry)
+                merged.append(entry)
+    for host in ("127.0.0.1", "localhost", "::1"):
+        if host not in seen:
+            seen.add(host)
+            merged.append(host)
+    joined = ",".join(merged)
+    env["NO_PROXY"] = joined
+    env["no_proxy"] = joined
+    return env
+
+
 def describe_slots(run: RunConfig) -> list[dict]:
     """Return resolved per-slot CLI metadata without spawning any agent processes."""
     refs_dir = REPO / "refs"
@@ -196,6 +226,7 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
             }
             if slot.model:
                 env["KILN_AGENT_MODEL"] = slot.model
+            _normalize_proxy_env(env)
             try:
                 p, log = _spawn_agent(slot_cmd, ws, env, prompt)
             except FileNotFoundError as exc:

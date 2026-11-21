@@ -78,7 +78,8 @@ PROVIDER_COMMANDS: dict[str, str] = {
     ),
     "codex": (
         "codex exec --dangerously-bypass-approvals-and-sandbox "
-        "--skip-git-repo-check -c shell_environment_policy.inherit=all -"
+        "--skip-git-repo-check --model gpt-6.2-sol "
+        "-c model_reasoning_effort=high -c shell_environment_policy.inherit=all -"
     ),
     "claude": "claude -p --dangerously-skip-permissions",
 }
@@ -181,9 +182,29 @@ class AgentSlotConfig(BaseModel):
         return self
 
 
+def _strip_codex_reasoning_effort(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-c", "--config") and i + 1 < len(argv) and "model_reasoning_effort=" in argv[i + 1]:
+            i += 2
+            continue
+        if (tok.startswith("-c=") or tok.startswith("--config=")) and "model_reasoning_effort=" in tok:
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 class AgentConfig(BaseModel):
     num_agents: int = Field(default=4, ge=1)
-    command: str = "codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -c shell_environment_policy.inherit=all -"
+    command: str = (
+        "codex exec --dangerously-bypass-approvals-and-sandbox "
+        "--skip-git-repo-check --model gpt-6.2-sol "
+        "-c model_reasoning_effort=high -c shell_environment_policy.inherit=all -"
+    )
     models: list[str] = Field(default_factory=list)
     commands: list[str] = Field(default_factory=list)
     slots: list[AgentSlotConfig] = Field(default_factory=list)
@@ -208,6 +229,8 @@ class AgentConfig(BaseModel):
                     raise ValueError("'{model}' placeholder in slot command requires 'model'")
                 slot_model = _extract_model(argv)
             if spec.extra_args:
+                if provider == "codex" and any("model_reasoning_effort=" in a for a in spec.extra_args):
+                    argv = _strip_codex_reasoning_effort(argv)
                 argv = _insert_provider_args(argv, provider, spec.extra_args)
             return ResolvedAgentSlot(
                 argv=argv,

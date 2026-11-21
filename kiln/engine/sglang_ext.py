@@ -490,6 +490,13 @@ class SGLangHotReloadController:
         had_draft_runner_graphs = any(
             [any([_release_graph_attr(dr, a) for a in _MODEL_RUNNER_GRAPH_ATTRS]) for dr in draft_runners]
         )
+        if spec_worker is not None:
+            for dr in draft_runners:
+                hooks = getattr(dr, "capture_tail_hooks", None)
+                if isinstance(hooks, list):
+                    hooks.clear()
+            if hasattr(spec_worker, "_draft_sampler"):
+                spec_worker._draft_sampler = None
 
         _reset_torch_compiler()
         _reset_global_graph_pool()

@@ -22,6 +22,7 @@ class MockEngine(Engine):
         self.tier = tier
         self.speedup = 1.0
         self.corrupt = False
+        self.logit_diff = 0.0
 
     def start(self) -> None:
         time.sleep(0.05)
@@ -32,9 +33,10 @@ class MockEngine(Engine):
             raise RuntimeError("illegal memory access (mock)")
         self.speedup = float(ns.get("SPEEDUP", 1.0))
         self.corrupt = bool(ns.get("CORRUPT", False))
+        self.logit_diff = float(ns.get("LOGIT_DIFF", 0.0))
 
     def teardown_candidate(self) -> None:
-        self.speedup, self.corrupt = 1.0, False
+        self.speedup, self.corrupt, self.logit_diff = 1.0, False, 0.0
 
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
         noise = 0.002 if self.tier.name == "slow" else 0.005
@@ -55,6 +57,13 @@ class MockEngine(Engine):
                 seq = [(t + 7) % 32000 if i % 3 == 0 else t for i, t in enumerate(seq)]
             out.append(seq)
         return out
+
+    def greedy_probe(
+        self, prompts: list[list[int]], max_new_tokens: int
+    ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        tokens = self.greedy_outputs(prompts, max_new_tokens)
+        logprobs = [[{tok: -0.1 - self.logit_diff} for tok in seq] for seq in tokens]
+        return tokens, logprobs
 
     def shutdown(self) -> None:
         pass

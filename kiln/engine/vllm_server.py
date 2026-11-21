@@ -237,16 +237,47 @@ class VLLMServerEngine(Engine):
             extra=extra,
         )
 
-    def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
-        out = []
+    def greedy_probe(
+        self, prompts: list[list[int]], max_new_tokens: int
+    ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        if "greedy_outputs" in self.__dict__:
+            return self.greedy_outputs(prompts, max_new_tokens), None
+        out_ids: list[list[int]] = []
+        out_lps: list[list[dict[int, float]]] = []
+        all_have_lps = bool(prompts)
         for p in prompts:
             r = self.http.post(f"{self.url}/v1/completions", json={
                 "model": self.served_name, "prompt": p, "max_tokens": max_new_tokens,
-                "temperature": 0.0, "ignore_eos": True, "return_token_ids": True})
+                "temperature": 0.0, "ignore_eos": True, "return_token_ids": True, "logprobs": 1,
+            })
             r.raise_for_status()
             ch = r.json()["choices"][0]
             ids = ch.get("token_ids")
             if ids is None:
                 raise RuntimeError("vLLM did not return token IDs for the correctness probe")
-            out.append(list(ids))
-        return out
+            toks = list(ids)
+            out_ids.append(toks)
+            lp_obj = ch.get("logprobs") or {}
+            tok_lps = lp_obj.get("token_logprobs")
+            if isinstance(tok_lps, list) and len(tok_lps) == len(toks) and tok_lps:
+                seq_lps: list[dict[int, float]] = []
+                valid = True
+                for tid, val in zip(toks, tok_lps):
+                    if val is None:
+                        valid = False
+                        break
+                    fval = float(val)
+                    if not math.isfinite(fval):
+                        valid = False
+                        break
+                    seq_lps.append({int(tid): fval})
+                if valid:
+                    out_lps.append(seq_lps)
+                else:
+                    all_have_lps = False
+            else:
+                all_have_lps = False
+        return out_ids, (out_lps if all_have_lps else None)
+
+    def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
+        return self.greedy_probe(prompts, max_new_tokens)[0]

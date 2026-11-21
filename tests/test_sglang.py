@@ -695,3 +695,37 @@ def test_sglang_c859d701_weight_updater_and_backend_cleanup(tmp_path: Path, monk
     asyncio.run(tm.update_weights_from_disk(SimpleNamespace(model_path="/models/new", load_format="auto")))
     assert tm.served_model_name == "/models/new"
     assert tm.recorded == [("/models/new", "auto")]
+
+
+def test_sglang_greedy_probe_extracts_output_logprobs():
+    from kiln.engine.sglang_ext import extract_output_logprobs
+
+    resp = {
+        "text": "ok",
+        "output_ids": [10, 20],
+        "meta_info": {
+            "output_token_logprobs": [[-0.12, 10, "a"], [-0.34, 20, "b"]],
+            "output_top_logprobs": [
+                [[-0.12, 10, "a"], [-1.5, 11, "x"]],
+                [[-0.34, 20, "b"]],
+            ],
+        },
+    }
+    lps = extract_output_logprobs(resp)
+    assert lps == [{10: -0.12, 11: -1.5}, {20: -0.34}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/flush_cache":
+            return httpx.Response(200, json={"success": True})
+        if request.url.path == "/generate":
+            body = json.loads(request.content.decode())
+            assert body.get("return_logprob") is True
+            return httpx.Response(200, json=resp)
+        return httpx.Response(404)
+
+    eng = SGLangServerEngine(EngineConfig(kind="sglang_server", model="dummy"), TierConfig(name="slow"))
+    eng.http = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    tokens, probed_lps = eng.greedy_probe([[1, 2]], 2)
+    assert tokens == [[10, 20]]
+    assert probed_lps == [[{10: -0.12, 11: -1.5}, {20: -0.34}]]
+    eng.http.close()

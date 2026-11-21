@@ -20,6 +20,7 @@ from .sglang_ext import (
     bootstrap_env,
     encode_rpc,
     extract_output_ids,
+    extract_output_logprobs,
     install_sglang_hooks,
     merge_json_model_override_args,
     parse_rpc_message,
@@ -216,17 +217,34 @@ class SGLangOfflineEngine(Engine):
         except Exception:
             return None
 
-    def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
+    def greedy_probe(
+        self, prompts: list[list[int]], max_new_tokens: int
+    ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        if "greedy_outputs" in self.__dict__:
+            return self.greedy_outputs(prompts, max_new_tokens), None
         sp = {"max_new_tokens": max_new_tokens, "temperature": 0.0, "ignore_eos": True}
         self._flush_cache()
-        out = []
+        out_ids: list[list[int]] = []
+        out_lps: list[list[dict[int, float]]] = []
+        all_have_lps = bool(prompts)
         for p in prompts:
-            res = self.engine.generate(input_ids=p, sampling_params=sp)
+            try:
+                res = self.engine.generate(input_ids=p, sampling_params=sp, return_logprob=True)
+            except TypeError:
+                res = self.engine.generate(input_ids=p, sampling_params=sp)
             ids = extract_output_ids(res)
             if ids is None:
                 res = self.engine.generate(input_ids=p, sampling_params=sp, return_logprob=True)
                 ids = extract_output_ids(res)
             if ids is None:
                 raise RuntimeError("SGLang did not return output_ids for the correctness probe")
-            out.append(ids)
-        return out
+            out_ids.append(ids)
+            lps = extract_output_logprobs(res)
+            if lps is None:
+                all_have_lps = False
+            else:
+                out_lps.append(lps)
+        return out_ids, (out_lps if all_have_lps else None)
+
+    def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
+        return self.greedy_probe(prompts, max_new_tokens)[0]

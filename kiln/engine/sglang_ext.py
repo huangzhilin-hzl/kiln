@@ -21,6 +21,7 @@ import importlib.abc
 import importlib.util
 import inspect
 import json
+import math
 import os
 import sys
 import time
@@ -156,6 +157,38 @@ def extract_output_ids(out: dict) -> list[int] | None:
                 return None
         return extracted
     return None
+
+
+def extract_output_logprobs(out: dict) -> list[dict[int, float]] | None:
+    """Extract per-step `{token_id: logprob}` dicts from an SGLang response when present."""
+    meta = out.get("meta_info") or {}
+    entries = meta.get("output_token_logprobs")
+    if not isinstance(entries, list) or not entries:
+        return None
+    top_entries = meta.get("output_top_logprobs")
+    steps: list[dict[int, float]] = []
+    for idx, entry in enumerate(entries):
+        step: dict[int, float] = {}
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2 and entry[0] is not None and entry[1] is not None:
+            try:
+                lp = float(entry[0])
+                if math.isfinite(lp):
+                    step[int(entry[1])] = lp
+            except (TypeError, ValueError):
+                pass
+        if isinstance(top_entries, list) and idx < len(top_entries) and isinstance(top_entries[idx], list):
+            for item in top_entries[idx]:
+                if isinstance(item, (list, tuple)) and len(item) >= 2 and item[0] is not None and item[1] is not None:
+                    try:
+                        lp = float(item[0])
+                        if math.isfinite(lp):
+                            step.setdefault(int(item[1]), lp)
+                    except (TypeError, ValueError):
+                        pass
+        if not step:
+            return None
+        steps.append(step)
+    return steps
 
 
 # --------------------------------------------------------------------------- device / graph helpers

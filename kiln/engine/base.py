@@ -59,5 +59,11 @@ class Engine(abc.ABC):
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         """Greedy token ids, used for correctness checks."""
 
+    def greedy_probe(
+        self, prompts: list[list[int]], max_new_tokens: int
+    ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        """Return `(token_ids, per_step_logprobs)` when supported by the backend."""
+        return self.greedy_outputs(prompts, max_new_tokens), None
+
     @abc.abstractmethod
     def shutdown(self) -> None: ...

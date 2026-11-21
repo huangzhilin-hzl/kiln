@@ -48,10 +48,16 @@ class CompleteReq(BaseModel):
     prefill_tps: FiniteFloat | None = None
     variance_pct: FiniteFloat | None = None
     token_match: FiniteFloat | None = None
+    max_logit_abs_diff: FiniteFloat | None = None
     kernel_report: str | None = None
     extra: dict = Field(default_factory=dict)
     error: str | None = None
     crashes: int | None = None
+
+
+class InvalidateReq(BaseModel):
+    reason: str = ""
+    cascade: bool = True
 
 
 def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
@@ -107,6 +113,16 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
             return mgr.get_job(jid)
         except KeyError:
             raise HTTPException(404, "no such job")
+
+    @app.post("/jobs/{jid}/invalidate")
+    def invalidate_job(jid: str, req: InvalidateReq):
+        try:
+            ids = mgr.invalidate_job(jid, reason=req.reason, cascade_sha256=req.cascade)
+        except KeyError:
+            raise HTTPException(404, "no such job")
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        return {"invalidated": ids}
 
     @app.get("/leaderboard")
     def leaderboard(tier: str = "slow", k: int = 10):

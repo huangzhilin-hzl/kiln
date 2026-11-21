@@ -71,6 +71,15 @@ def cmd_job(a):
     _print(http.get(f"{_url()}/jobs/{a.id}").json())
 
 
+def cmd_withdraw(a):
+    r = http.post(
+        f"{_url()}/jobs/{a.id}/invalidate",
+        json={"reason": a.reason, "cascade": not a.no_cascade},
+    )
+    r.raise_for_status()
+    _print(r.json())
+
+
 def cmd_status(a):
     _print(http.get(f"{_url()}/status").json())
 
@@ -242,6 +251,11 @@ def main(argv=None):
     s.add_argument("--wait", action="store_true"); s.set_defaults(f=cmd_submit)
 
     s = sp.add_parser("job"); s.add_argument("id"); s.set_defaults(f=cmd_job)
+    s = sp.add_parser("withdraw", help="invalidate a bogus or superseded job from leaderboards")
+    s.add_argument("id")
+    s.add_argument("--reason", default="Withdrawn")
+    s.add_argument("--no-cascade", action="store_true", help="do not invalidate sibling jobs sharing source sha256")
+    s.set_defaults(f=cmd_withdraw)
     s = sp.add_parser("status"); s.set_defaults(f=cmd_status)
 
     s = sp.add_parser("leaderboard"); s.add_argument("--tier", default="slow")

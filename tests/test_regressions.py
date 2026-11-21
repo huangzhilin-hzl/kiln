@@ -872,3 +872,81 @@ def test_normalize_proxy_env():
     assert out_hi["all_proxy"] == "socks5://127.0.0.1:7897"
     assert out_hi["NO_PROXY"].split(",") == ["127.0.0.1", "*.internal", "localhost", "::1"]
     assert out_hi["no_proxy"] == out_hi["NO_PROXY"]
+
+
+def test_correctness_logprob_gate_and_mock_engine_rejection(tmp_path):
+    import time
+    from kiln.bench.correctness import evaluate_correctness
+    from kiln.config import CorrectnessConfig
+
+    cfg = CorrectnessConfig(min_token_match=0.85, max_logit_abs_diff=0.5)
+    ok_res = evaluate_correctness([[1, 2]], [[1, 2]], cfg, [[{1: -0.1}, {2: -0.2}]], [[{1: -0.3}, {2: -0.25}]])
+    assert ok_res.ok is True and abs(ok_res.max_logit_abs_diff - 0.2) < 1e-6
+
+    drift_res = evaluate_correctness([[1, 2]], [[1, 2]], cfg, [[{1: -0.1}, {2: -0.2}]], [[{1: -0.9}, {2: -0.2}]])
+    assert drift_res.ok is False and abs(drift_res.max_logit_abs_diff - 0.8) < 1e-6
+    assert "max logit abs diff" in drift_res.detail
+
+    nan_res = evaluate_correctness([[1]], [[1]], cfg, [[{1: -0.1}]], [[{1: float("nan")}]])
+    assert nan_res.ok is False and nan_res.max_logit_abs_diff is None
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2,3],"output_len":4}\n')
+    run = RunConfig(name="logit_gate", traffic_file=str(traffic), workdir=str(tmp_path))
+    mgr = jobs.JobManager(run, [Request([1, 2, 3], 4)], local_tiers={"fast"})
+    mgr.start()
+    j = mgr.submit("a1", "fast", "SPEEDUP = 1.25\nLOGIT_DIFF = 0.8\n", "drifted logits")
+    t0 = time.time()
+    while j.status in ("queued", "running") and time.time() - t0 < 5:
+        time.sleep(0.05)
+    assert j.status == "incorrect"
+    assert j.token_match == 1.0
+    assert abs(j.max_logit_abs_diff - 0.8) < 1e-6
+    assert mgr.leaderboard("fast") == []
+
+
+def test_job_invalidate_cli_and_cross_tier_cascade(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from kiln.cli import main
+    from kiln.server.app import create_app
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2],"output_len":2}\n')
+    run = RunConfig(name="cascade", traffic_file=str(traffic), workdir=str(tmp_path))
+    app = create_app(run, local_tiers=set())
+    cand_src = "SPEEDUP = 1.32\n"
+
+    with TestClient(app) as client:
+        # 1. Submit bogus candidate on both fast and slow, mark fast as done
+        j_fast = client.post("/jobs", json={"agent": "a4", "tier": "fast", "source": cand_src, "note": "bogus"}).json()["id"]
+        j_slow = client.post("/jobs", json={"agent": "a4", "tier": "slow", "source": cand_src, "note": "promote"}).json()["id"]
+        j_other = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.20\n", "note": "clean"}).json()["id"]
+
+        client.post("/workers/fast/heartbeat", json={"worker_id": "w0", "ready": True, "baseline_tps": 400.0, "crashes": 0})
+        for jid, sp in ((j_fast, 1.32), (j_other, 1.20)):
+            cl = client.post("/workers/fast/claim", params={"worker_id": "w0", "wait_s": 0}).json()["job"]
+            client.post("/workers/fast/complete", json={
+                "id": cl["id"], "worker_id": "w0", "attempt_id": cl["attempt_id"],
+                "status": "done", "speedup": sp, "decode_tps": 400.0 * sp, "token_match": 0.94, "crashes": 0,
+            }).raise_for_status()
+        assert [r["id"] for r in client.get("/leaderboard", params={"tier": "fast"}).json()] == [j_fast, j_other]
+
+        # 2. Slow fails severely (< 0.5 token_match) -> auto-cascades invalidation to matching fast sha256!
+        client.post("/workers/slow/heartbeat", json={"worker_id": "w1", "ready": True, "baseline_tps": 900.0, "crashes": 0})
+        cl_s = client.post("/workers/slow/claim", params={"worker_id": "w1", "wait_s": 0}).json()["job"]
+        assert cl_s["id"] == j_slow
+        client.post("/workers/slow/complete", json={
+            "id": j_slow, "worker_id": "w1", "attempt_id": cl_s["attempt_id"],
+            "status": "incorrect", "token_match": 0.1406, "error": "token match 0.1406", "crashes": 0,
+        }).raise_for_status()
+
+        assert client.get(f"/jobs/{j_fast}").json()["status"] == "invalidated"
+        assert [r["id"] for r in client.get("/leaderboard", params={"tier": "fast"}).json()] == [j_other]
+
+        # 3. Manual withdrawal via `kiln withdraw` removes j_other too
+        import kiln.cli as cli_mod
+        monkeypatch.setattr(cli_mod, "http", client)
+        monkeypatch.setenv("KILN_SERVER", "http://testserver")
+        main(["withdraw", j_other, "--reason", "manual cleanup"])
+        assert client.get(f"/jobs/{j_other}").json()["status"] == "invalidated"
+        assert client.get("/leaderboard", params={"tier": "fast"}).json() == []

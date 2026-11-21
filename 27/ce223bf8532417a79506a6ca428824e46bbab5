@@ -1,0 +1,22 @@
+kiln/agents/launcher.py
+  h_7339bf36ecd0bc 8,188-372,450,457-459,461,463,465-467,485,489-494,497-498,502-510,516,525,531,538,544,551-556,567-570
+kiln/cli.py
+  h_7339bf36ecd0bc 74-110,230,236-241,245-287,433-443,487-488,491-499
+kiln/server/app.py
+  h_7339bf36ecd0bc 112-120
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 816,818,846-890
+tests/test_regressions.py
+  h_7339bf36ecd0bc 1353-1465
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "27ce223bf8532417a79506a6ca428824e46bbab5",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

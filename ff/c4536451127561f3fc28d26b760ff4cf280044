@@ -1,0 +1,28 @@
+configs/dsv41_flash_h20_sglang.yaml
+  h_7339bf36ecd0bc 31-32,65-67
+kiln/agents/launcher.py
+  h_7339bf36ecd0bc 23-37,179,248,255-261,291-295
+kiln/agents/prompt.md
+  h_7339bf36ecd0bc 34-36
+kiln/cli.py
+  h_7339bf36ecd0bc 74-108,347-354
+kiln/config.py
+  h_7339bf36ecd0bc 43-44,75,162-163,174-175,249-250
+kiln/server/app.py
+  h_7339bf36ecd0bc 17,114-117,127-142
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 64-72,256-257,280-281,366-367,373,459-460,462-492,498-523,663-664
+tests/test_regressions.py
+  h_7339bf36ecd0bc 1190-1291
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ffc4536451127561f3fc28d26b760ff4cf280044",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

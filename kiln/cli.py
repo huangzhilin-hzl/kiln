@@ -71,6 +71,41 @@ def cmd_job(a):
     _print(http.get(f"{_url()}/jobs/{a.id}").json())
 
 
+def cmd_pull(a):
+    from pathlib import Path
+    r = http.get(f"{_url()}/jobs/{a.id}/source")
+    r.raise_for_status()
+    data = r.json()
+    if a.out:
+        out = Path(a.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(data["source"])
+        _print({k: v for k, v in data.items() if k != "source"} | {"saved": str(out)})
+    else:
+        print(data["source"], end="" if data["source"].endswith("\n") else "\n")
+
+
+def cmd_diff(a):
+    import difflib
+    ra = http.get(f"{_url()}/jobs/{a.id_a}/source")
+    ra.raise_for_status()
+    rb = http.get(f"{_url()}/jobs/{a.id_b}/source")
+    rb.raise_for_status()
+    diff = difflib.unified_diff(
+        ra.json()["source"].splitlines(keepends=True),
+        rb.json()["source"].splitlines(keepends=True),
+        fromfile=a.id_a,
+        tofile=a.id_b,
+    )
+    sys.stdout.write("".join(diff))
+
+
+def cmd_cancel(a):
+    r = http.post(f"{_url()}/jobs/{a.id}/cancel")
+    r.raise_for_status()
+    _print(r.json())
+
+
 def cmd_withdraw(a):
     r = http.post(
         f"{_url()}/jobs/{a.id}/invalidate",
@@ -309,6 +344,14 @@ def main(argv=None):
     s.add_argument("--wait", action="store_true"); s.set_defaults(f=cmd_submit)
 
     s = sp.add_parser("job"); s.add_argument("id"); s.set_defaults(f=cmd_job)
+    s = sp.add_parser("pull", help="fetch a job's candidate forward.py source")
+    s.add_argument("id")
+    s.add_argument("-o", "--out", help="optional path to save candidate source (e.g. forward.py)")
+    s.set_defaults(f=cmd_pull)
+    s = sp.add_parser("diff", help="unified diff between two jobs' candidate sources")
+    s.add_argument("id_a"); s.add_argument("id_b"); s.set_defaults(f=cmd_diff)
+    s = sp.add_parser("cancel", help="cancel a queued job before it runs")
+    s.add_argument("id"); s.set_defaults(f=cmd_cancel)
     s = sp.add_parser("withdraw", help="invalidate a bogus or superseded job from leaderboards")
     s.add_argument("id")
     s.add_argument("--reason", default="Withdrawn")

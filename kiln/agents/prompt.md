@@ -31,6 +31,8 @@ real traffic) without changing outputs.
 - `kiln board` reads the shared board. `kiln board --post "..."` posts to it.
 - Read the board before each experiment. Post often: what you're about to try, results (job id +
   speedup), and dead ends. Don't duplicate someone else's in-flight idea; build on winners instead.
-- `kiln leaderboard` shows the best slow-tier results. Pull winning ideas into your own forward.py.
+- `kiln leaderboard` shows the best results. Use `kiln pull <job_id>` (or `kiln diff <id_a> <id_b>`)
+  to inspect and pull winning candidates directly into your workspace, `kiln cancel <job_id>` to
+  drop a superseded queued job, and `kiln withdraw <job_id> --reason "..."` to invalidate a buggy completed job.
 
 Keep iterating until you are stopped. Spend your time on optimization, not bookkeeping.

@@ -61,7 +61,15 @@ class Job:
 
 REMOTE_LEASE_S = 90.0
 REMOTE_HEARTBEAT_S = 10.0
-TERMINAL_STATUSES = {"done", "incorrect", "invalid", "crashed", "invalidated"}
+TERMINAL_STATUSES = {"done", "incorrect", "invalid", "crashed", "invalidated", "cancelled"}
+
+
+class QueueLimitError(ValueError):
+    """Raised when an agent exceeds `TierConfig.max_queued_per_agent`."""
+
+
+class DuplicateJobError(ValueError):
+    """Raised when an identical active candidate is already queued/running on the tier."""
 
 
 _FATAL_KEYWORDS = (
@@ -245,6 +253,8 @@ class TierWorker:
         while True:
             job = self.q.get()
             with self.engine_lock:
+                if job.status != "queued":
+                    continue
                 if self.engine is not None and not self.engine.is_alive():
                     print(f"[kiln] {self.tier.name}: engine exited unexpectedly; restarting")
                     self.ready.clear()
@@ -267,6 +277,8 @@ class TierWorker:
 
     def execute_job(self, job: Job) -> None:
         with self.engine_lock:
+            if job.status == "cancelled":
+                return
             job.status, job.started_at = "running", time.time()
             self._save(job)
             result = replace(job)
@@ -351,12 +363,14 @@ class TierWorker:
 
     def stats(self) -> dict:
         mode = f"shared:{self.tier.share_engine}" if self.tier.share_engine else ("local" if self.local else "remote")
+        with self.q.mutex:
+            q_depth = sum(1 for j in self.q.queue if j.status == "queued")
         return {
             "tier": self.tier.name,
             "mode": mode,
             "ready": self.ready.is_set(),
             "boot_error": self.boot_error,
-            "queue_depth": self.q.qsize(),
+            "queue_depth": q_depth,
             "median_job_s": statistics.median(self.durations) if self.durations else None,
             "baseline_decode_tps": self.baseline_tps,
             "crashes": self.crashes,
@@ -442,20 +456,70 @@ class JobManager:
     def submit(self, agent: str, tier: str, source: str, note: str = "") -> Job:
         if tier not in self.tiers:
             raise KeyError(f"unknown tier {tier}; have {list(self.tiers)}")
-        jid = time.strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
-        d = self.jobs_dir / jid
-        d.mkdir(parents=True)
-        path = d / "candidate.py"
-        path.write_text(source)
-        job = Job(
-            id=jid, agent=agent, tier=tier, note=note,
-            candidate_path=str(path), source_sha256=_sha256_text(source),
-        )
+        src_sha = _sha256_text(source)
+        tier_cfg = self.tiers[tier].tier
         with self.lock:
+            if tier_cfg.max_queued_per_agent is not None:
+                queued_cnt = sum(
+                    1 for j in self.jobs.values()
+                    if j.tier == tier and j.agent == agent and j.status == "queued"
+                )
+                if queued_cnt >= tier_cfg.max_queued_per_agent:
+                    raise QueueLimitError(
+                        f"Agent {agent!r} already has {queued_cnt} queued jobs on {tier} "
+                        f"(max {tier_cfg.max_queued_per_agent})"
+                    )
+            if tier_cfg.deduplicate_queued:
+                dup = next(
+                    (
+                        j for j in self.jobs.values()
+                        if j.tier == tier and j.source_sha256 == src_sha and j.status in ("queued", "running")
+                    ),
+                    None,
+                )
+                if dup is not None:
+                    raise DuplicateJobError(
+                        f"Duplicate active candidate already {dup.status} as {dup.id} on {tier}"
+                    )
+            jid = time.strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
+            d = self.jobs_dir / jid
+            d.mkdir(parents=True)
+            path = d / "candidate.py"
+            path.write_text(source)
+            job = Job(
+                id=jid, agent=agent, tier=tier, note=note,
+                candidate_path=str(path), source_sha256=src_sha,
+            )
             self.tiers[tier].submit(job)
             self.jobs[jid] = job
             self.lock.notify_all()
         return job
+
+    def get_job_source(self, jid: str) -> dict:
+        with self.lock:
+            job = self.jobs[jid]
+            source = Path(job.candidate_path).read_text()
+            return {
+                "id": job.id,
+                "tier": job.tier,
+                "agent": job.agent,
+                "source_sha256": job.source_sha256,
+                "source": source,
+            }
+
+    def cancel_job(self, jid: str) -> dict:
+        with self.lock:
+            job = self.jobs[jid]
+            if job.status != "queued":
+                raise ValueError(f"Cannot cancel {job.status} job {jid}; only queued jobs can be cancelled")
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            job.invalidated_reason = "Cancelled"
+            worker = self.tiers.get(job.tier)
+            if worker is not None:
+                worker._save(job)
+            self.lock.notify_all()
+            return {"id": job.id, "status": job.status}
 
     def _invalidate_matching_sha256_locked(
         self, src_sha: str, exclude_id: str, reason: str
@@ -596,6 +660,8 @@ class JobManager:
                         return None
                     self.lock.wait(timeout=remaining)
                 else:
+                    if job.status != "queued":
+                        continue
                     job.status, job.started_at = "running", time.time()
                     job.worker_id = worker_id
                     job.attempt_id = uuid.uuid4().hex

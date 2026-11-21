@@ -20,6 +20,21 @@ from kiln.config import RunConfig
 PROMPT = Path(__file__).with_name("prompt.md")
 REPO = Path(__file__).resolve().parents[2]
 
+ROLE_PROMPTS: dict[str, str] = {
+    "explorer": (
+        "Focus on bold, high-upside algorithmic and kernel optimizations (novel operator fusions, "
+        "memory-hierarchy / SM wave scheduling, and speculative draft acceleration). Post clear hypotheses and trace gains."
+    ),
+    "auditor": (
+        "Focus on bitwise/numerical verification, tight shape specialization, isolating standalone gains "
+        "via ablation, catching numerical drift across widths, and withdrawing/reporting invalid candidates."
+    ),
+    "integrator": (
+        "Focus on pulling verified winning candidates via `kiln pull <job_id>` and `kiln diff <a> <b>`, "
+        "combining orthogonal wins cleanly into one unified `forward.py`, and checking stacked end-to-end speedups."
+    ),
+}
+
 CONTINUE_NOTE = (
     "\n\n## Continuation\n"
     "You are resuming an ongoing optimization run in this workspace. Inspect your current `forward.py`, "
@@ -161,6 +176,7 @@ def describe_slots(run: RunConfig) -> list[dict]:
             "provider": slot.provider,
             "model": slot.model,
             "label": slot.label,
+            "role": slot.role,
             "argv": argv,
             "env_keys": sorted(slot.env.keys()),
             "cli_found": cli_found,
@@ -229,14 +245,21 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
             triton_dir.mkdir(exist_ok=True)
             if not (ws / "forward.py").exists():
                 shutil.copy(REPO / baseline, ws / "forward.py")
+            slot = run.agents.resolve_slot(i - 1)
             prompt = PROMPT.read_text().format(agent=name, n=n, model=run.engine.model,
                                                engine=run.engine.kind)
             if hw_profile is not None:
                 hw_profile.save(ws / "hw_profile.json")
                 (ws / "HARDWARE.md").write_text(hw_profile.to_markdown(), encoding="utf-8")
                 prompt = prompt.rstrip() + "\n" + hw_profile.to_prompt_summary()
+            if slot.role or slot.prompt_extra:
+                role_lines = ["\n\n## Your Assigned Role"]
+                if slot.role:
+                    role_lines.append(f"- Role: `{slot.role}` — {ROLE_PROMPTS[slot.role]}")
+                if slot.prompt_extra and slot.prompt_extra.strip():
+                    role_lines.append(f"- Guidance: {slot.prompt_extra.strip()}")
+                prompt = prompt.rstrip() + "\n" + "\n".join(role_lines) + "\n"
             (ws / "PROMPT.md").write_text(prompt, encoding="utf-8")
-            slot = run.agents.resolve_slot(i - 1)
             slot_cmd = _inject_refs_dir(slot.argv, slot.provider, refs_dir)
             base_path = slot.env.get("PATH", os.environ.get("PATH", ""))
             env = {
@@ -265,7 +288,11 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                 "env": env, "prompt": prompt, "proc": p, "log": log,
                 "failures": 0, "quota_retries": 0, "wake_at": None, "active": True,
             })
-            info = f"provider={slot.provider}" + (f", model={slot.model}" if slot.model else "")
+            info = f"provider={slot.provider}"
+            if slot.model:
+                info += f", model={slot.model}"
+            if slot.role:
+                info += f", role={slot.role}"
             print(f"[kiln] started {name} (pid {p.pid}, {info}) in {ws}")
 
         deadline = time.time() + run.agents.budget_hours * 3600

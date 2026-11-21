@@ -28,6 +28,8 @@ tiers:
     repeats: 3
     trace_kernels: true
     timeout_s: 900
+    max_queued_per_agent: 2
+    deduplicate_queued: true
     engine_overrides:
       context_length: 262144
       cuda_graph_max_bs_decode: 32
@@ -60,9 +62,9 @@ correctness:
 hw_profile: runs/hw_profile.json
 agents:
   slots:
-    - {provider: agy, model: gemini-4-neon-high, count: 2}
-    - {provider: agy, model: gemini-4-carbon-high}
-    - {provider: codex, model: gpt-6.2-sol, count: 2, extra_args: ["-c", "model_reasoning_effort=high"]}
+    - {provider: agy, model: gemini-4-neon-high, count: 2, role: explorer}
+    - {provider: agy, model: gemini-4-carbon-high, role: integrator}
+    - {provider: codex, model: gpt-6.2-sol, count: 2, role: auditor, extra_args: ["-c", "model_reasoning_effort=high"]}
   budget_hours: 24
   respawn_on_exit: true
 workdir: runs

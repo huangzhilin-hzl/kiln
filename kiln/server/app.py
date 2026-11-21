@@ -14,7 +14,7 @@ from kiln.config import RunConfig
 
 from .board import Board
 from .auth import auth_headers
-from .jobs import JobManager
+from .jobs import DuplicateJobError, JobManager, QueueLimitError
 
 
 class SubmitReq(BaseModel):
@@ -111,6 +111,10 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
             job = mgr.submit(req.agent, req.tier, req.source, req.note)
         except KeyError as e:
             raise HTTPException(400, str(e))
+        except QueueLimitError as e:
+            raise HTTPException(429, str(e))
+        except DuplicateJobError as e:
+            raise HTTPException(409, str(e))
         return {"id": job.id, "tier": job.tier}
 
     @app.get("/jobs/{jid}")
@@ -119,6 +123,22 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
             return mgr.get_job(jid)
         except KeyError:
             raise HTTPException(404, "no such job")
+
+    @app.get("/jobs/{jid}/source")
+    def get_job_source(jid: str):
+        try:
+            return mgr.get_job_source(jid)
+        except (KeyError, FileNotFoundError):
+            raise HTTPException(404, "no such job or source")
+
+    @app.post("/jobs/{jid}/cancel")
+    def cancel_job(jid: str):
+        try:
+            return mgr.cancel_job(jid)
+        except KeyError:
+            raise HTTPException(404, "no such job")
+        except ValueError as e:
+            raise HTTPException(409, str(e))
 
     @app.post("/jobs/{jid}/invalidate")
     def invalidate_job(jid: str, req: InvalidateReq):

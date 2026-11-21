@@ -1187,3 +1187,105 @@ def test_strip_sensitive_env_and_launcher_isolation(tmp_path, monkeypatch):
     launch(run_no_iso)
     assert captured_envs[-1]["KUBECONFIG"] == "/tmp/host_kube"
     assert captured_envs[-1]["SSH_AUTH_SOCK"] == "/tmp/ssh.sock"
+
+
+def test_source_pull_diff_cancel_and_queue_governance(tmp_path, monkeypatch, capsys):
+    from fastapi.testclient import TestClient
+    from kiln.cli import main
+    from kiln.server.app import create_app
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2],"output_len":2}\n')
+    run = RunConfig(
+        name="gov",
+        traffic_file=str(traffic),
+        workdir=str(tmp_path),
+        tiers=[TierConfig(name="fast", max_queued_per_agent=2, deduplicate_queued=True)],
+    )
+    app = create_app(run, local_tiers=set())
+    with TestClient(app) as client:
+        # Submit 2 distinct jobs for agent_1
+        j1 = client.post("/jobs", json={"agent": "agent_1", "tier": "fast", "source": "SPEEDUP = 1.1\n", "note": "n1"}).json()["id"]
+        # Duplicate sha256 while j1 is queued -> 409
+        r_dup = client.post("/jobs", json={"agent": "agent_1", "tier": "fast", "source": "SPEEDUP = 1.1\n", "note": "dup"})
+        assert r_dup.status_code == 409
+
+        j2 = client.post("/jobs", json={"agent": "agent_1", "tier": "fast", "source": "SPEEDUP = 1.2\n", "note": "n2"}).json()["id"]
+        # 3rd queued job for agent_1 hits max_queued_per_agent=2 -> 429
+        r_lim = client.post("/jobs", json={"agent": "agent_1", "tier": "fast", "source": "SPEEDUP = 1.3\n", "note": "limit"})
+        assert r_lim.status_code == 429
+        # Different agent can still queue
+        j3 = client.post("/jobs", json={"agent": "agent_2", "tier": "fast", "source": "SPEEDUP = 1.4\n", "note": "other"}).json()["id"]
+        assert client.get("/status").json()["tiers"][0]["queue_depth"] == 3
+
+        # CLI pull, diff, cancel
+        import kiln.cli as cli_mod
+        monkeypatch.setattr(cli_mod, "http", client)
+        monkeypatch.setenv("KILN_SERVER", "http://testserver")
+
+        pulled_path = tmp_path / "pulled_forward.py"
+        main(["pull", j1, "-o", str(pulled_path)])
+        assert pulled_path.read_text() == "SPEEDUP = 1.1\n"
+        capsys.readouterr()
+
+        main(["diff", j1, j2])
+        diff_out = capsys.readouterr().out
+        assert "-SPEEDUP = 1.1" in diff_out and "+SPEEDUP = 1.2" in diff_out
+
+        # Cancel j1 -> status=cancelled, queue_depth drops to 2, remote claim skips j1 and gets j2
+        main(["cancel", j1])
+        capsys.readouterr()
+        assert client.get(f"/jobs/{j1}").json()["status"] == "cancelled"
+        assert client.get("/status").json()["tiers"][0]["queue_depth"] == 2
+        # Same source can now be resubmitted after cancellation
+        j1_resub = client.post("/jobs", json={"agent": "agent_1", "tier": "fast", "source": "SPEEDUP = 1.1\n", "note": "resub"}).json()["id"]
+        assert j1_resub != j1
+
+        client.post("/workers/fast/heartbeat", json={"worker_id": "w0", "ready": True, "baseline_tps": 100.0, "crashes": 0})
+        claimed = client.post("/workers/fast/claim", params={"worker_id": "w0", "wait_s": 0}).json()["job"]
+        assert claimed["id"] == j2
+        # Running job cannot be cancelled -> 409
+        assert client.post(f"/jobs/{j2}/cancel").status_code == 409
+
+
+def test_slot_roles_and_formal_sglang_config_governance(tmp_path, monkeypatch):
+    from kiln.agents.launcher import describe_slots, launch
+    from kiln.config import AgentConfig, AgentSlotConfig
+
+    run_sglang = RunConfig.load("configs/dsv41_flash_h20_sglang.yaml")
+    fast_tier = next(t for t in run_sglang.tiers if t.name == "fast")
+    assert fast_tier.max_queued_per_agent == 2
+    assert fast_tier.deduplicate_queued is True
+    roles = [s["role"] for s in describe_slots(run_sglang)]
+    assert roles == ["explorer", "explorer", "integrator", "auditor", "auditor"]
+
+    repo = tmp_path / "repo"
+    (repo / "candidates").mkdir(parents=True)
+    (repo / "candidates" / "baseline_forward.py").write_text("def make_forward(m): return None\n")
+    monkeypatch.setattr("kiln.agents.launcher.REPO", repo)
+
+    class FakeP:
+        pid = 55
+        def poll(self): return 0
+        def send_signal(self, sig): pass
+
+    def fake_spawn(cmd, ws, env, prompt_text):
+        (ws / "agent.log").touch()
+        return FakeP(), open(ws / "agent.log", "ab")
+
+    monkeypatch.setattr("kiln.agents.launcher._spawn_agent", fake_spawn)
+    run = RunConfig(
+        name="roles", workdir=str(tmp_path),
+        agents=AgentConfig(
+            slots=[
+                AgentSlotConfig(provider="agy", model="m1", role="explorer", prompt_extra="Focus on WGMMA"),
+                AgentSlotConfig(provider="codex", model="m2", role="auditor"),
+            ],
+            respawn_on_exit=False,
+        ),
+    )
+    launch(run)
+    p1 = (tmp_path / "roles" / "agents" / "agent_1" / "PROMPT.md").read_text()
+    p2 = (tmp_path / "roles" / "agents" / "agent_2" / "PROMPT.md").read_text()
+    assert "Role: `explorer`" in p1 and "Focus on WGMMA" in p1
+    assert "Role: `auditor`" in p2 and "bitwise/numerical verification" in p2

@@ -40,6 +40,8 @@ class TierConfig(BaseModel):
     port: int | None = None                      # *_server only
     agentx: dict | None = None                   # *_server only: AgentXConfig fields
     timeout_s: float = 600.0
+    max_queued_per_agent: int | None = Field(default=None, ge=1)
+    deduplicate_queued: bool = False
 
     @field_validator("agentx")
     @classmethod
@@ -70,6 +72,7 @@ class CorrectnessConfig(BaseModel):
 
 
 AgentProvider = Literal["agy", "codex", "claude", "custom"]
+AgentRole = Literal["explorer", "auditor", "integrator"]
 
 PROVIDER_COMMANDS: dict[str, str] = {
     "agy": (
@@ -156,6 +159,8 @@ class ResolvedAgentSlot:
     model: str | None
     env: dict[str, str]
     label: str | None = None
+    role: str | None = None
+    prompt_extra: str | None = None
 
 
 class AgentSlotConfig(BaseModel):
@@ -166,6 +171,8 @@ class AgentSlotConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     count: int = Field(default=1, ge=1)
     name: str | None = None
+    role: AgentRole | None = None
+    prompt_extra: str | None = None
 
     @model_validator(mode="after")
     def _validate_slot(self) -> "AgentSlotConfig":
@@ -239,6 +246,8 @@ class AgentConfig(BaseModel):
                 model=slot_model,
                 env=dict(spec.env),
                 label=spec.name,
+                role=spec.role,
+                prompt_extra=spec.prompt_extra,
             )
 
         raw_cmd = self.commands[slot_idx % len(self.commands)] if self.commands else self.command

@@ -109,6 +109,15 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
         from kiln.costmodel.probe import HardwareProfile
         return {"available": True, "path": str(path), "profile": HardwareProfile.load(path).to_dict()}
 
+    @app.get("/jobs")
+    def list_jobs(
+        tier: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    ):
+        return mgr.list_jobs(tier=tier, status=status, agent=agent, limit=limit)
+
     @app.post("/jobs")
     def submit(req: SubmitReq):
         try:

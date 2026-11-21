@@ -5,6 +5,7 @@ either via `agents.slots` or `agents.command` / `agents.commands` + `agents.mode
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -184,6 +185,191 @@ def describe_slots(run: RunConfig) -> list[dict]:
     return out
 
 
+def _build_slot_env(
+    run: RunConfig,
+    slot,
+    agent_name: str,
+    venv_bin: str,
+    server_url: str,
+    triton_dir: Path | None = None,
+) -> dict[str, str]:
+    base_path = slot.env.get("PATH", os.environ.get("PATH", ""))
+    env = {
+        **os.environ,
+        **slot.env,
+        "PATH": f"{venv_bin}{os.pathsep}{base_path}",
+        "PYTHONUNBUFFERED": "1",
+        "KILN_AGENT": agent_name,
+        "KILN_AGENT_PROVIDER": slot.provider,
+        "KILN_SERVER": server_url,
+    }
+    if triton_dir is not None:
+        env["TRITON_CACHE_DIR"] = str(triton_dir)
+    if slot.model:
+        env["KILN_AGENT_MODEL"] = slot.model
+    _normalize_proxy_env(env)
+    if run.agents.isolate_credentials:
+        _strip_sensitive_env(env, allowed_keys=set(slot.env.keys()))
+    return env
+
+
+def _write_slot_status(
+    ws: Path,
+    slot: dict,
+    state: str,
+    now: float | None = None,
+    rc: int | None = None,
+) -> Path:
+    ts = time.time() if now is None else now
+    log_path = ws / "agent.log"
+    log_bytes = log_path.stat().st_size if log_path.exists() else 0
+    started_at = slot.get("started_at")
+    payload = {
+        "agent": slot["name"],
+        "provider": slot["provider"],
+        "model": slot.get("model"),
+        "role": slot.get("role"),
+        "state": state,
+        "pid": slot["proc"].pid if slot.get("proc") is not None else None,
+        "started_at": started_at,
+        "updated_at": ts,
+        "elapsed_s": round(max(0.0, ts - started_at), 1) if started_at else 0.0,
+        "log_bytes": log_bytes,
+        "last_rc": rc,
+        "failures": slot.get("failures", 0),
+        "quota_retries": slot.get("quota_retries", 0),
+        "wake_at": slot.get("wake_at"),
+    }
+    status_path = ws / "status.json"
+    status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return status_path
+
+
+def doctor_slots(
+    run: RunConfig,
+    server_url: str | None = None,
+    probe_cli: bool = True,
+    probe_timeout_s: float = 20.0,
+) -> dict:
+    """Validate server connectivity, CLI availability, proxy/env, and optional minimal model probe."""
+    import httpx
+    from kiln.server.auth import auth_headers
+
+    target_url = server_url or os.environ.get("KILN_SERVER") or run.client_url
+    server_ok = False
+    server_error: str | None = None
+    try:
+        r = httpx.get(
+            f"{target_url.rstrip('/')}/status",
+            headers=auth_headers(),
+            trust_env=False,
+            timeout=5.0,
+        )
+        r.raise_for_status()
+        server_ok = True
+    except Exception as exc:
+        server_error = str(exc)
+
+    refs_dir = REPO / "refs"
+    venv_bin = str(Path(sys.executable).parent)
+    reports: list[dict] = []
+    for i in range(1, run.agents.num_agents + 1):
+        name = f"agent_{i}"
+        slot = run.agents.resolve_slot(i - 1)
+        argv = _inject_refs_dir(slot.argv, slot.provider, refs_dir)
+        env = _build_slot_env(run, slot, name, venv_bin, target_url)
+        exe = argv[0] if argv else ""
+        resolved_exe = (
+            str(Path(exe))
+            if exe and (os.sep in exe or (os.altsep and os.altsep in exe)) and Path(exe).is_file()
+            else shutil.which(exe, path=env["PATH"])
+        )
+        cli_found = bool(resolved_exe)
+        version_str: str | None = None
+        probe_ok: bool | None = None
+        err: str | None = None
+
+        if not cli_found:
+            err = f"CLI {exe!r} not found on PATH"
+        else:
+            try:
+                v = subprocess.run(
+                    [resolved_exe, "--version"],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                first = (v.stdout or v.stderr or "").strip().splitlines()
+                if v.returncode == 0 and first:
+                    version_str = first[0][:120]
+            except Exception:
+                pass
+
+            if probe_cli:
+                probe_text = "Reply with exactly OK"
+                try:
+                    if any("{prompt}" in tok for tok in argv):
+                        probe_cmd = [resolved_exe, *(tok.replace("{prompt}", probe_text) for tok in argv[1:])]
+                        p_res = subprocess.run(
+                            probe_cmd,
+                            env=env,
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            timeout=probe_timeout_s,
+                        )
+                    elif slot.provider in ("codex", "claude") or (argv and argv[-1] == "-"):
+                        probe_cmd = [resolved_exe, *argv[1:]]
+                        p_res = subprocess.run(
+                            probe_cmd,
+                            env=env,
+                            input=probe_text + "\n",
+                            capture_output=True,
+                            text=True,
+                            timeout=probe_timeout_s,
+                        )
+                    else:
+                        p_res = subprocess.run(
+                            [resolved_exe, "--help"],
+                            env=env,
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            timeout=probe_timeout_s,
+                        )
+                    probe_ok = p_res.returncode == 0
+                    if not probe_ok:
+                        out_tail = ((p_res.stderr or "") + "\n" + (p_res.stdout or "")).strip()
+                        err = out_tail[-400:] if out_tail else f"probe exited rc={p_res.returncode}"
+                except Exception as exc:
+                    probe_ok = False
+                    err = str(exc)
+
+        ok = cli_found and (True if not probe_cli else bool(probe_ok))
+        reports.append({
+            "agent": name,
+            "provider": slot.provider,
+            "model": slot.model,
+            "role": slot.role,
+            "binary": resolved_exe,
+            "cli_found": cli_found,
+            "version": version_str,
+            "probe_ok": probe_ok,
+            "ok": ok,
+            "error": err,
+        })
+
+    return {
+        "server_url": target_url,
+        "server_ok": server_ok,
+        "server_error": server_error,
+        "ok": server_ok and all(r["ok"] for r in reports),
+        "slots": reports,
+    }
+
+
 def _spawn_agent(cmd: list[str], ws: Path, env: dict[str, str], prompt_text: str):
     log = open(ws / "agent.log", "ab")
     try:
@@ -261,33 +447,24 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                 prompt = prompt.rstrip() + "\n" + "\n".join(role_lines) + "\n"
             (ws / "PROMPT.md").write_text(prompt, encoding="utf-8")
             slot_cmd = _inject_refs_dir(slot.argv, slot.provider, refs_dir)
-            base_path = slot.env.get("PATH", os.environ.get("PATH", ""))
-            env = {
-                **os.environ,
-                **slot.env,
-                "PATH": f"{venv_bin}{os.pathsep}{base_path}",
-                "KILN_AGENT": name,
-                "KILN_AGENT_PROVIDER": slot.provider,
-                "KILN_SERVER": server_url,
-                "TRITON_CACHE_DIR": str(triton_dir),
-            }
-            if slot.model:
-                env["KILN_AGENT_MODEL"] = slot.model
-            _normalize_proxy_env(env)
-            if run.agents.isolate_credentials:
-                _strip_sensitive_env(env, allowed_keys=set(slot.env.keys()))
+            env = _build_slot_env(run, slot, name, venv_bin, server_url, triton_dir=triton_dir)
             try:
                 p, log = _spawn_agent(slot_cmd, ws, env, prompt)
             except FileNotFoundError as exc:
                 raise RuntimeError(
                     f"Agent CLI {slot_cmd[0]!r} not found on PATH (slot {name}, provider={slot.provider})"
                 ) from exc
-            slots.append({
+            now_spawn = time.time()
+            log_size = (ws / "agent.log").stat().st_size if (ws / "agent.log").exists() else 0
+            slot_state = {
                 "idx": i - 1, "name": name, "ws": ws, "cmd": slot_cmd,
-                "provider": slot.provider, "model": slot.model,
+                "provider": slot.provider, "model": slot.model, "role": slot.role,
                 "env": env, "prompt": prompt, "proc": p, "log": log,
+                "started_at": now_spawn, "last_heartbeat_at": now_spawn, "last_log_bytes": log_size,
                 "failures": 0, "quota_retries": 0, "wake_at": None, "active": True,
-            })
+            }
+            _write_slot_status(ws, slot_state, "running", now=now_spawn)
+            slots.append(slot_state)
             info = f"provider={slot.provider}"
             if slot.model:
                 info += f", model={slot.model}"
@@ -305,20 +482,38 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                 if s["proc"] is None:
                     if now >= deadline:
                         s["active"] = False
+                        _write_slot_status(s["ws"], s, "stopped", now=now)
                         continue
                     if s["wake_at"] is not None and now >= s["wake_at"]:
                         p, log = _spawn_agent(s["cmd"], s["ws"], s["env"], s["prompt"] + CONTINUE_NOTE)
-                        s.update(proc=p, log=log, wake_at=None)
+                        log_bytes = (s["ws"] / "agent.log").stat().st_size if (s["ws"] / "agent.log").exists() else 0
+                        s.update(
+                            proc=p, log=log, wake_at=None,
+                            started_at=now, last_heartbeat_at=now, last_log_bytes=log_bytes,
+                        )
+                        _write_slot_status(s["ws"], s, "running", now=now)
                         info = f"provider={s['provider']}" + (f", model={s['model']}" if s.get("model") else "")
                         print(f"[kiln] respawned {s['name']} (pid {p.pid}, {info})")
+                    else:
+                        _write_slot_status(s["ws"], s, "backing_off", now=now)
                     continue
                 rc = s["proc"].poll()
                 if rc is None:
+                    cur_bytes = (s["ws"] / "agent.log").stat().st_size if (s["ws"] / "agent.log").exists() else 0
+                    if cur_bytes == s["last_log_bytes"] and now - s["last_heartbeat_at"] >= 300.0:
+                        elapsed = now - (s.get("started_at") or now)
+                        print(f"[kiln] {s['name']} running ({elapsed:.0f}s elapsed, log silent at {cur_bytes}B)")
+                        s["last_heartbeat_at"] = now
+                    elif cur_bytes != s["last_log_bytes"]:
+                        s["last_log_bytes"] = cur_bytes
+                        s["last_heartbeat_at"] = now
+                    _write_slot_status(s["ws"], s, "running", now=now)
                     continue
                 s["log"].close()
                 s["proc"] = None
                 if not run.agents.respawn_on_exit or now >= deadline:
                     s["active"] = False
+                    _write_slot_status(s["ws"], s, "exited", now=now, rc=rc)
                     continue
                 if rc != 0:
                     wait_s = _parse_quota_backoff(s["ws"] / "agent.log", slot_idx=s["idx"])
@@ -327,29 +522,38 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                         if s["quota_retries"] > 24:
                             print(f"[kiln] {s['name']} exceeded 24 quota retries; stopping")
                             s["active"] = False
+                            _write_slot_status(s["ws"], s, "stopped", now=now, rc=rc)
                             continue
                         with open(s["ws"] / "agent.log", "a", encoding="utf-8") as lf:
                             lf.write(f"\n[kiln] {s['name']} hit 429 quota limit; backing off {wait_s:.0f}s\n")
                         print(f"[kiln] {s['name']} hit 429 quota limit; backing off {wait_s:.0f}s")
                         s["wake_at"] = now + wait_s
+                        _write_slot_status(s["ws"], s, "backing_off", now=now, rc=rc)
                         continue
                     s["failures"] += 1
                     if s["failures"] >= 3:
                         print(f"[kiln] {s['name']} failed {s['failures']} times in a row (rc={rc}); "
                               f"see {s['ws'] / 'agent.log'}")
                         s["active"] = False
+                        _write_slot_status(s["ws"], s, "stopped", now=now, rc=rc)
                         continue
                     wait_s = 5.0 * s["failures"]
                     with open(s["ws"] / "agent.log", "a", encoding="utf-8") as lf:
                         lf.write(f"\n[kiln] {s['name']} exited (rc={rc}); retrying in {wait_s:.0f}s\n")
                     s["wake_at"] = now + wait_s
+                    _write_slot_status(s["ws"], s, "backing_off", now=now, rc=rc)
                     continue
                 s["failures"] = 0
                 s["quota_retries"] = 0
                 with open(s["ws"] / "agent.log", "a", encoding="utf-8") as lf:
                     lf.write(f"\n[kiln] {s['name']} exited cleanly; respawning\n")
                 p, log = _spawn_agent(s["cmd"], s["ws"], s["env"], s["prompt"] + CONTINUE_NOTE)
-                s.update(proc=p, log=log, wake_at=None)
+                log_bytes = (s["ws"] / "agent.log").stat().st_size if (s["ws"] / "agent.log").exists() else 0
+                s.update(
+                    proc=p, log=log, wake_at=None,
+                    started_at=now, last_heartbeat_at=now, last_log_bytes=log_bytes,
+                )
+                _write_slot_status(s["ws"], s, "running", now=now, rc=rc)
                 info = f"provider={s['provider']}" + (f", model={s['model']}" if s.get("model") else "")
                 print(f"[kiln] respawned {s['name']} (pid {p.pid}, {info})")
     except KeyboardInterrupt:
@@ -360,5 +564,9 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
             if p is not None and p.poll() is None:
                 p.send_signal(signal.SIGTERM)
                 print(f"[kiln] stopped {s['name']}")
+                s["proc"] = None
+                _write_slot_status(s["ws"], s, "stopped")
+            elif s["active"] or not (s["ws"] / "status.json").exists():
+                _write_slot_status(s["ws"], s, "stopped")
             if s.get("log") is not None and not s["log"].closed:
                 s["log"].close()

@@ -1350,3 +1350,116 @@ def test_per_job_baseline_boot_id_and_periodic_canary(tmp_path, capsys):
         while job_3.finished_at is None and __import__("time").time() - t0 < 5:
             __import__("time").sleep(0.02)
         assert client.get(f"/jobs/{j3}").json()["engine_boot_id"] == boot2
+
+
+def test_list_jobs_cli_summary_doctor_status_and_tunnel(tmp_path, monkeypatch, capsys):
+    import json
+    import sys
+    from fastapi.testclient import TestClient
+    from kiln.agents.launcher import doctor_slots, launch
+    from kiln.cli import build_tunnel_command, main, tunnel_env
+    from kiln.config import AgentConfig, AgentSlotConfig
+    from kiln.server.app import create_app
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2],"output_len":2}\n')
+    run = RunConfig(name="obs", traffic_file=str(traffic), workdir=str(tmp_path))
+    app = create_app(run, local_tiers=set())
+    with TestClient(app) as client:
+        client.post("/workers/fast/heartbeat", json={"worker_id": "wf", "ready": True, "baseline_tps": 400.0, "crashes": 0})
+        j1 = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.1\n", "note": "first"}).json()["id"]
+        j2 = client.post("/jobs", json={"agent": "a2", "tier": "fast", "source": "SPEEDUP = 1.2\n", "note": "second"}).json()["id"]
+        j3 = client.post("/jobs", json={"agent": "a1", "tier": "slow", "source": "SPEEDUP = 1.3\n", "note": "slow1"}).json()["id"]
+
+        cl = client.post("/workers/fast/claim", params={"worker_id": "wf", "wait_s": 0}).json()["job"]
+        client.post("/workers/fast/complete", json={
+            "id": cl["id"], "worker_id": "wf", "attempt_id": cl["attempt_id"],
+            "status": "done", "speedup": 1.1, "decode_tps": 440.0, "token_match": 0.99, "crashes": 0,
+        }).raise_for_status()
+
+        # GET /jobs filtering & newest-first ordering
+        all_fast = client.get("/jobs", params={"tier": "fast"}).json()
+        assert [r["id"] for r in all_fast] == [j2, j1]
+        assert [r["id"] for r in client.get("/jobs", params={"agent": "a1", "status": "done"}).json()] == [j1]
+        assert len(client.get("/jobs", params={"limit": 1}).json()) == 1
+
+        # kiln jobs & kiln summary CLI
+        import kiln.cli as cli_mod
+        monkeypatch.setattr(cli_mod, "http", client)
+        monkeypatch.setenv("KILN_SERVER", "http://testserver")
+        main(["jobs", "--tier", "fast", "-n", "1"])
+        listed = json.loads(capsys.readouterr().out)
+        assert len(listed) == 1 and listed[0]["id"] == j2
+
+        main(["summary", "--tier", "fast"])
+        summ = json.loads(capsys.readouterr().out)
+        assert summ["job_counts"]["fast:done"] == 1
+        assert summ["job_counts"]["fast:queued"] == 1
+        assert summ["job_counts"]["slow:queued"] == 1
+        assert summ["by_agent"] == {"a1": 2, "a2": 1}
+        assert summ["leaderboard"][0]["id"] == j1
+
+    # doctor_slots with passing script, failing script, and missing binary
+    ok_script = tmp_path / "ok_cli.py"
+    ok_script.write_text(
+        "import os, sys\n"
+        "if '--version' in sys.argv: print('mock 1.0'); sys.exit(0)\n"
+        "assert os.environ.get('PYTHONUNBUFFERED') == '1'\n"
+        "assert os.environ.get('HTTPS_PROXY') == 'http://127.0.0.1:7897'\n"
+        "assert os.environ.get('KUBECONFIG') == '/dev/null'\n"
+        "print('OK')\n"
+    )
+    bad_script = tmp_path / "bad_cli.py"
+    bad_script.write_text("import sys; sys.stderr.write('model_not_found\\n'); sys.exit(2)\n")
+
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:7897")
+    monkeypatch.setenv("KUBECONFIG", "/tmp/host_kube")
+    doc_run = RunConfig(
+        name="doc", workdir=str(tmp_path),
+        agents=AgentConfig(slots=[
+            AgentSlotConfig(provider="custom", command=f"{sys.executable} {ok_script} {{prompt}}"),
+            AgentSlotConfig(provider="custom", command=f"{sys.executable} {bad_script} {{prompt}}"),
+            AgentSlotConfig(provider="custom", command="nonexistent_kiln_binary_xyz"),
+        ]),
+    )
+    import httpx
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: SimpleNamespace(raise_for_status=lambda: None))
+    rep = doctor_slots(doc_run, server_url="http://127.0.0.1:18765", probe_cli=True)
+    assert rep["server_ok"] is True
+    assert rep["ok"] is False
+    assert rep["slots"][0]["ok"] is True and rep["slots"][0]["probe_ok"] is True
+    assert rep["slots"][1]["ok"] is False and "model_not_found" in rep["slots"][1]["error"]
+    assert rep["slots"][2]["ok"] is False and rep["slots"][2]["cli_found"] is False
+
+    # launch() writes status.json & sets PYTHONUNBUFFERED=1
+    repo = tmp_path / "repo"
+    (repo / "candidates").mkdir(parents=True)
+    (repo / "candidates" / "baseline_forward.py").write_text("def make_forward(m): return None\n")
+    monkeypatch.setattr("kiln.agents.launcher.REPO", repo)
+
+    class FakeP:
+        pid = 888
+        def poll(self): return 0
+        def send_signal(self, sig): pass
+
+    monkeypatch.setattr(
+        "kiln.agents.launcher._spawn_agent",
+        lambda cmd, ws, env, pt: ((ws / "agent.log").write_text("done\n"), (FakeP(), open(ws / "agent.log", "ab")))[1],
+    )
+    status_run = RunConfig(
+        name="statrun", workdir=str(tmp_path),
+        agents=AgentConfig(slots=[AgentSlotConfig(provider="codex", role="auditor")], respawn_on_exit=False),
+    )
+    launch(status_run)
+    st_file = tmp_path / "statrun" / "agents" / "agent_1" / "status.json"
+    assert st_file.exists()
+    st_json = json.loads(st_file.read_text())
+    assert st_json["state"] == "exited" and st_json["last_rc"] == 0 and st_json["role"] == "auditor"
+    assert st_json["log_bytes"] > 0
+
+    # tunnel command builder + proxy-free env
+    tcmd = build_tunnel_command("pod-0", namespace="ns1", kubeconfig="~/.kube/cfg", local_port=19000, remote_port=18765)
+    assert tcmd[:2] == ["kubectl", "--kubeconfig"]
+    assert tcmd[-4:] == ["-n", "ns1", "pod/pod-0", "19000:18765"]
+    tenv = tunnel_env({"HTTP_PROXY": "http://x", "https_proxy": "http://y", "KEEP": "1"})
+    assert "HTTP_PROXY" not in tenv and "https_proxy" not in tenv and tenv["KEEP"] == "1"

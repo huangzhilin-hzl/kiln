@@ -813,13 +813,9 @@ class JobManager:
         return float(val) if isinstance(val, (int, float)) else None
 
     @staticmethod
-    def _leaderboard_row(j: Job) -> dict:
+    def _job_metrics(j: Job) -> dict:
         row: dict = {
-            "id": j.id,
-            "agent": j.agent,
-            "speedup": round(j.speedup, 4),
-            "variance_pct": round(j.variance_pct or 0, 2),
-            "note": j.note,
+            "speedup": round(j.speedup, 4) if j.speedup is not None else None,
             "decode_tps": round(j.decode_tps, 2) if j.decode_tps is not None else None,
             "prefill_tps": round(j.prefill_tps, 2) if j.prefill_tps is not None else None,
             "token_match": round(j.token_match, 4) if j.token_match is not None else None,
@@ -846,6 +842,51 @@ class JobManager:
         if isinstance(paired, dict) and isinstance(paired.get("decode_duration_speedup"), (int, float)):
             row["paired_decode_speedup"] = round(float(paired["decode_duration_speedup"]), 4)
         return row
+
+    @classmethod
+    def _leaderboard_row(cls, j: Job) -> dict:
+        metrics = cls._job_metrics(j)
+        return {
+            "id": j.id,
+            "agent": j.agent,
+            "variance_pct": round(j.variance_pct or 0, 2),
+            "note": j.note,
+            **metrics,
+        }
+
+    def list_jobs(
+        self,
+        tier: str | None = None,
+        status: str | None = None,
+        agent: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        with self.lock:
+            for rtier in (self.remote_workers if tier is None else ([tier] if tier in self.remote_workers else [])):
+                self._expire_remote(rtier)
+            rows = [
+                j for j in self.jobs.values()
+                if (tier is None or j.tier == tier)
+                and (status is None or j.status == status)
+                and (agent is None or j.agent == agent)
+            ]
+            rows.sort(key=lambda j: (j.submitted_at, j.id), reverse=True)
+            out: list[dict] = []
+            for j in rows[: max(1, limit)]:
+                out.append({
+                    "id": j.id,
+                    "tier": j.tier,
+                    "agent": j.agent,
+                    "status": j.status,
+                    **self._job_metrics(j),
+                    "baseline_tps": round(j.baseline_tps, 2) if j.baseline_tps is not None else None,
+                    "engine_boot_id": j.engine_boot_id,
+                    "submitted_at": j.submitted_at,
+                    "finished_at": j.finished_at,
+                    "note": j.note,
+                    "error": j.error,
+                })
+            return out
 
     def leaderboard(self, tier: str = "slow", k: int = 10, sort_by: str = "speedup") -> list[dict]:
         if sort_by not in self._LEADERBOARD_SORTS:

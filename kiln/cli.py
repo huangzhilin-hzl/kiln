@@ -71,6 +71,43 @@ def cmd_job(a):
     _print(http.get(f"{_url()}/jobs/{a.id}").json())
 
 
+def cmd_jobs(a):
+    params: dict = {"limit": a.limit}
+    if a.tier:
+        params["tier"] = a.tier
+    if a.status:
+        params["status"] = a.status
+    if a.agent:
+        params["agent"] = a.agent
+    r = http.get(f"{_url()}/jobs", params=params)
+    r.raise_for_status()
+    _print(r.json())
+
+
+def cmd_summary(a):
+    from collections import Counter
+
+    st = http.get(f"{_url()}/status")
+    st.raise_for_status()
+    lb = http.get(f"{_url()}/leaderboard", params={"tier": a.tier, "k": a.k, "sort_by": a.sort})
+    lb.raise_for_status()
+    jl = http.get(f"{_url()}/jobs", params={"limit": 500})
+    jl.raise_for_status()
+    rows = jl.json()
+    by_tier_status: dict[str, int] = {}
+    by_agent: dict[str, int] = {}
+    for (t, s_val), cnt in Counter((r["tier"], r["status"]) for r in rows).items():
+        by_tier_status[f"{t}:{s_val}"] = cnt
+    for ag, cnt in Counter(r["agent"] for r in rows).items():
+        by_agent[ag] = cnt
+    _print({
+        "status": st.json(),
+        "job_counts": by_tier_status,
+        "by_agent": by_agent,
+        "leaderboard": lb.json(),
+    })
+
+
 def cmd_pull(a):
     from pathlib import Path
     r = http.get(f"{_url()}/jobs/{a.id}/source")
@@ -190,13 +227,62 @@ def cmd_board(a):
 
 
 def cmd_agents(a):
-    from kiln.agents.launcher import describe_slots, launch
+    from kiln.agents.launcher import describe_slots, doctor_slots, launch
     from kiln.config import RunConfig
     run = RunConfig.load(a.config)
     if a.dry_run:
         _print(describe_slots(run))
         return
+    if a.doctor:
+        res = doctor_slots(run, probe_cli=not a.no_probe)
+        _print(res)
+        if not res["ok"]:
+            raise SystemExit(1)
+        return
     launch(run)
+
+
+def build_tunnel_command(
+    pod: str,
+    namespace: str = "infer-forge-tasks",
+    kubeconfig: str | None = None,
+    local_port: int = 18765,
+    remote_port: int = 18765,
+) -> list[str]:
+    """Build `kubectl port-forward` argv targeting the coordinator pod."""
+    cmd = ["kubectl"]
+    if kubeconfig:
+        cmd += ["--kubeconfig", os.path.expanduser(kubeconfig)]
+    cmd += ["port-forward", "-n", namespace, f"pod/{pod}", f"{local_port}:{remote_port}"]
+    return cmd
+
+
+def tunnel_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Strip HTTP/SOCKS proxy variables that break Kubernetes API SPDY port-forwarding."""
+    env = dict(os.environ if base_env is None else base_env)
+    for k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        env.pop(k, None)
+    return env
+
+
+def cmd_tunnel(a):
+    import subprocess
+    cmd = build_tunnel_command(
+        pod=a.pod,
+        namespace=a.namespace,
+        kubeconfig=a.kubeconfig,
+        local_port=a.local_port,
+        remote_port=a.remote_port,
+    )
+    env = tunnel_env()
+    try:
+        while True:
+            print(f"[kiln tunnel] starting {' '.join(cmd)}", flush=True)
+            proc = subprocess.run(cmd, env=env)
+            print(f"[kiln tunnel] exited rc={proc.returncode}; reconnecting in {a.reconnect_delay}s", flush=True)
+            time.sleep(a.reconnect_delay)
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_costmodel(a):
@@ -344,6 +430,17 @@ def main(argv=None):
     s.add_argument("--wait", action="store_true"); s.set_defaults(f=cmd_submit)
 
     s = sp.add_parser("job"); s.add_argument("id"); s.set_defaults(f=cmd_job)
+    s = sp.add_parser("jobs", help="list and filter submitted jobs")
+    s.add_argument("--tier")
+    s.add_argument("--status")
+    s.add_argument("--agent")
+    s.add_argument("-n", "--limit", type=int, default=30)
+    s.set_defaults(f=cmd_jobs)
+    s = sp.add_parser("summary", help="show cluster status, job breakdown, and leaderboard summary")
+    s.add_argument("--tier", default="slow")
+    s.add_argument("-k", type=int, default=10)
+    s.add_argument("--sort", default="speedup")
+    s.set_defaults(f=cmd_summary)
     s = sp.add_parser("pull", help="fetch a job's candidate forward.py source")
     s.add_argument("id")
     s.add_argument("-o", "--out", help="optional path to save candidate source (e.g. forward.py)")
@@ -387,7 +484,18 @@ def main(argv=None):
     s = sp.add_parser("agents", help="launch N parallel coding agents")
     s.add_argument("-c", "--config", required=True)
     s.add_argument("--dry-run", action="store_true", help="print resolved per-slot CLI commands and exit")
+    s.add_argument("--doctor", action="store_true", help="verify server reachability and probe each slot CLI")
+    s.add_argument("--no-probe", action="store_true", help="with --doctor, skip launching CLI smoke prompt")
     s.set_defaults(f=cmd_agents)
+
+    s = sp.add_parser("tunnel", help="maintain an auto-reconnecting proxy-free kubectl port-forward")
+    s.add_argument("--pod", required=True)
+    s.add_argument("--namespace", default="infer-forge-tasks")
+    s.add_argument("--kubeconfig")
+    s.add_argument("--local-port", type=int, default=18765)
+    s.add_argument("--remote-port", type=int, default=18765)
+    s.add_argument("--reconnect-delay", type=float, default=3.0)
+    s.set_defaults(f=cmd_tunnel)
 
     s = sp.add_parser("costmodel", help="rank parallelism configs")
     s.add_argument("--model", default="qwen3-30b-a3b"); s.add_argument("--chip", default="B200")

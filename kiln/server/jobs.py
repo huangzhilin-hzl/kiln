@@ -70,6 +70,28 @@ _FATAL_KEYWORDS = (
 )
 
 
+def _run_with_timeout(fn, timeout_s: float, label: str):
+    """Run `fn()` in a daemon thread and raise TimeoutError if it exceeds `timeout_s` (> 0)."""
+    if not timeout_s or timeout_s <= 0:
+        return fn()
+    outcome: dict = {}
+
+    def _target() -> None:
+        try:
+            outcome["val"] = fn()
+        except BaseException as exc:  # propagate worker exceptions cleanly
+            outcome["exc"] = exc
+
+    t = threading.Thread(target=_target, name=f"watchdog-{label}", daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        raise TimeoutError(f"{label} timed out after {timeout_s:.1f}s")
+    if "exc" in outcome:
+        raise outcome["exc"]
+    return outcome.get("val")
+
+
 class SharedEngineAdapter(Engine):
     """Proxy engine that serializes onto an owning tier's persistent Engine."""
 
@@ -100,6 +122,9 @@ class SharedEngineAdapter(Engine):
         self, prompts: list[list[int]], max_new_tokens: int
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
         return self.owner.engine.greedy_probe(prompts, max_new_tokens)
+
+    def is_alive(self) -> bool:
+        return self.owner.engine.is_alive() if self.owner.engine is not None else False
 
     def shutdown(self) -> None:
         self.owner._shutdown_own_engine()
@@ -191,11 +216,22 @@ class TierWorker:
     def _recover_or_restart(self, err: Exception) -> None:
         self.crashes += 1
         msg = str(err).lower()
-        if not any(k in msg for k in _FATAL_KEYWORDS) and self.engine and self.baseline_tokens:
+        if (
+            not any(k in msg for k in _FATAL_KEYWORDS)
+            and self.engine is not None
+            and self.engine.is_alive()
+            and self.baseline_tokens
+        ):
             try:
-                self.engine.teardown_candidate()
+                wd = float(self.tier.timeout_s or 0)
+                td = min(wd, 60.0) if wd > 0 else 0.0
+                _run_with_timeout(self.engine.teardown_candidate, td, f"{self.tier.name} recover-teardown")
                 n_check = min(4, self.run.correctness.max_new_tokens)
-                got = self.engine.greedy_outputs([self.requests[0].prompt_ids], n_check)
+                got = _run_with_timeout(
+                    lambda: self.engine.greedy_outputs([self.requests[0].prompt_ids], n_check),
+                    td,
+                    f"{self.tier.name} recover-probe",
+                )
                 if got == [self.baseline_tokens[0][:n_check]] and len(got[0]) == n_check:
                     print(f"[kiln] {self.tier.name}: recovered warm engine after non-fatal candidate error")
                     return
@@ -209,6 +245,13 @@ class TierWorker:
         while True:
             job = self.q.get()
             with self.engine_lock:
+                if self.engine is not None and not self.engine.is_alive():
+                    print(f"[kiln] {self.tier.name}: engine exited unexpectedly; restarting")
+                    self.ready.clear()
+                    try:
+                        self._restart_engine()
+                    except Exception as exc:
+                        self.boot_error = str(exc)
                 self.wait_until_ready()
                 self.execute_job(job)
 
@@ -247,10 +290,27 @@ class TierWorker:
 
     def _run_job(self, job: Job) -> None:
         eng, cc = self.engine, self.run.correctness
-        eng.hot_reload(job.candidate_path)
+        reload_timeout = float(self.tier.timeout_s or 0)
+        ax_dur = ((self.tier.agentx or {}).get("benchmark_duration_s") or 0)
+        measure_timeout = (
+            max(reload_timeout, float(ax_dur) * 3 + 300.0)
+            if (self.tier.agentx is not None and reload_timeout > 0)
+            else reload_timeout
+        )
+        teardown_timeout = min(reload_timeout, 60.0) if reload_timeout > 0 else 0.0
+
+        _run_with_timeout(
+            lambda: eng.hot_reload(job.candidate_path),
+            reload_timeout,
+            f"{self.tier.name} hot_reload",
+        )
         try:
             probe = [r.prompt_ids for r in self.requests[: cc.num_prompts]]
-            cand_tokens, cand_logprobs = eng.greedy_probe(probe, cc.max_new_tokens)
+            cand_tokens, cand_logprobs = _run_with_timeout(
+                lambda: eng.greedy_probe(probe, cc.max_new_tokens),
+                reload_timeout,
+                f"{self.tier.name} greedy_probe",
+            )
             corr = evaluate_correctness(
                 self.baseline_tokens, cand_tokens, cc, self.baseline_logprobs, cand_logprobs
             )
@@ -260,7 +320,11 @@ class TierWorker:
                 job.status, job.error = "incorrect", corr.detail
                 return
             try:
-                m = eng.measure(self.requests, self.tier.repeats, trace=self.tier.trace_kernels)
+                m = _run_with_timeout(
+                    lambda: eng.measure(self.requests, self.tier.repeats, trace=self.tier.trace_kernels),
+                    measure_timeout,
+                    f"{self.tier.name} measure",
+                )
             except InvalidBenchmark as exc:
                 job.status, job.error, job.extra = "invalid", str(exc), exc.extra
                 return
@@ -277,7 +341,7 @@ class TierWorker:
             job.extra = extra
             job.speedup = m.decode_tps / self.baseline_tps
         finally:
-            eng.teardown_candidate()
+            _run_with_timeout(eng.teardown_candidate, teardown_timeout, f"{self.tier.name} teardown")
         job.status = "done"
 
     # ------------------------------------------------------------------ api

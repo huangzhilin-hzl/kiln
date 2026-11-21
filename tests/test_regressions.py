@@ -1044,3 +1044,146 @@ def test_agentx_paired_compare_and_multi_metric_leaderboard_and_promote(tmp_path
         cl_promoted = client.post("/workers/slow/claim", params={"worker_id": "ws", "wait_s": 0}).json()["job"]
         assert "SPEEDUP = 1.29" in cl_promoted["source"]
         assert "Promote fast job" in cl_promoted["note"]
+
+
+def test_tier_watchdog_timeout_and_dead_engine_restart_and_shutdown(tmp_path, monkeypatch):
+    import signal
+    import subprocess
+    import threading
+    import time
+    from kiln.engine.base import shutdown_process_group
+    from kiln.engine.mock import MockEngine
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2],"output_len":2}\n')
+    tier = TierConfig(name="fast", timeout_s=0.15)
+    run = RunConfig(name="watchdog", traffic_file=str(traffic), workdir=str(tmp_path), tiers=[tier])
+    mgr = jobs.JobManager(run, [Request([1, 2], 2)], local_tiers={"fast"})
+    worker = mgr.tiers["fast"]
+    worker.wait_until_ready()
+    eng0 = worker.engine
+
+    # 1. Hung measure hits watchdog TimeoutError and restarts engine
+    release = threading.Event()
+    monkeypatch.setattr(eng0, "measure", lambda reqs, repeats, trace: release.wait(timeout=2.0) or MeasureResult(1.0, 1.0, 1.0))
+    hung_job = mgr.submit("a1", "fast", "SPEEDUP = 1.1\n", "hangs")
+    worker.execute_job(hung_job)
+    release.set()
+    assert hung_job.status == "crashed"
+    assert "timed out" in (hung_job.error or "").lower()
+    assert worker.engine is not eng0
+
+    # 2. Dead engine skips warm recovery and triggers restart
+    eng1 = worker.engine
+    alive = [True]
+    monkeypatch.setattr(eng1, "is_alive", lambda: alive[0])
+    restarts: list[object] = []
+    orig_restart = worker._restart_engine
+
+    def tracked_restart():
+        restarts.append(worker.engine)
+        orig_restart()
+
+    monkeypatch.setattr(worker, "_restart_engine", tracked_restart)
+    def boom_then_die(path):
+        alive[0] = False
+        raise RuntimeError("minor non-fatal exception")
+
+    monkeypatch.setattr(eng1, "hot_reload", boom_then_die)
+    dead_job = mgr.submit("a1", "fast", "SPEEDUP = 1.2\n", "dead")
+    worker.execute_job(dead_job)
+    assert dead_job.status == "crashed"
+    assert restarts == [eng1]
+    assert worker.engine is not eng1
+
+    # 3. shutdown_process_group escalates SIGTERM -> SIGKILL, waits, and survives ProcessLookupError
+    signals_sent: list[tuple[int, int]] = []
+    wait_calls: list[float | None] = []
+
+    class FakeProc:
+        pid = 999999
+        _polled = None
+
+        def poll(self):
+            return self._polled
+
+        def wait(self, timeout=None):
+            wait_calls.append(timeout)
+            if len(wait_calls) == 1:
+                raise subprocess.TimeoutExpired("fake", timeout)
+            self._polled = -9
+            return -9
+
+    monkeypatch.setattr("kiln.engine.base.os.killpg", lambda pid, sig: signals_sent.append((pid, sig)))
+    shutdown_process_group(FakeProc(), timeout=1.0)
+    assert signals_sent == [(999999, signal.SIGTERM), (999999, signal.SIGKILL)]
+    assert len(wait_calls) == 2
+
+    def raise_lookup(pid, sig):
+        raise ProcessLookupError
+
+    wait_calls.clear()
+    monkeypatch.setattr("kiln.engine.base.os.killpg", raise_lookup)
+    shutdown_process_group(FakeProc(), timeout=1.0)
+    assert len(wait_calls) == 2
+
+
+def test_strip_sensitive_env_and_launcher_isolation(tmp_path, monkeypatch):
+    from kiln.agents.launcher import _strip_sensitive_env, launch
+    from kiln.config import AgentConfig, AgentSlotConfig
+
+    env = {
+        "PATH": "/usr/bin",
+        "KUBECONFIG": "/Users/me/.kube/config",
+        "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        "SCHED_KUBECONFIG": "/tmp/sched",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+    }
+    stripped = _strip_sensitive_env(dict(env))
+    assert stripped["KUBECONFIG"] == "/dev/null"
+    assert "SSH_AUTH_SOCK" not in stripped
+    assert "SCHED_KUBECONFIG" not in stripped
+    assert "AWS_SECRET_ACCESS_KEY" not in stripped
+    assert stripped["PATH"] == "/usr/bin"
+
+    kept = _strip_sensitive_env(dict(env), allowed_keys={"KUBECONFIG", "SSH_AUTH_SOCK"})
+    assert kept["KUBECONFIG"] == "/Users/me/.kube/config"
+    assert kept["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
+    assert "SCHED_KUBECONFIG" not in kept
+
+    # Verify launch() respects isolate_credentials=True vs False
+    repo = tmp_path / "repo"
+    (repo / "candidates").mkdir(parents=True)
+    (repo / "candidates" / "baseline_forward.py").write_text("def make_forward(m): return None\n")
+    monkeypatch.setattr("kiln.agents.launcher.REPO", repo)
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh.sock")
+    monkeypatch.setenv("KUBECONFIG", "/tmp/host_kube")
+
+    captured_envs: list[dict[str, str]] = []
+
+    class FakeP:
+        pid = 123
+        def poll(self): return 0
+        def send_signal(self, sig): pass
+
+    def fake_spawn(cmd, ws, slot_env, prompt_text):
+        captured_envs.append(slot_env)
+        (ws / "agent.log").touch()
+        return FakeP(), open(ws / "agent.log", "ab")
+
+    monkeypatch.setattr("kiln.agents.launcher._spawn_agent", fake_spawn)
+    run_iso = RunConfig(
+        name="iso", workdir=str(tmp_path),
+        agents=AgentConfig(slots=[AgentSlotConfig(provider="codex")], isolate_credentials=True, respawn_on_exit=False),
+    )
+    launch(run_iso)
+    assert captured_envs[-1]["KUBECONFIG"] == "/dev/null"
+    assert "SSH_AUTH_SOCK" not in captured_envs[-1]
+
+    run_no_iso = RunConfig(
+        name="no_iso", workdir=str(tmp_path),
+        agents=AgentConfig(slots=[AgentSlotConfig(provider="codex")], isolate_credentials=False, respawn_on_exit=False),
+    )
+    launch(run_no_iso)
+    assert captured_envs[-1]["KUBECONFIG"] == "/tmp/host_kube"
+    assert captured_envs[-1]["SSH_AUTH_SOCK"] == "/tmp/ssh.sock"

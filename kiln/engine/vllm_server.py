@@ -26,7 +26,7 @@ from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_p
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
-from .base import Engine, InvalidBenchmark, MeasureResult
+from .base import Engine, InvalidBenchmark, MeasureResult, shutdown_process_group
 from .vllm_profiler import configure_torch_profiler, summarize_trace
 
 
@@ -108,13 +108,11 @@ class VLLMServerEngine(Engine):
         print(f"[kiln] {self.tier.name}: server up in {time.time() - t0:.0f}s, "
               f"info {self._rpc('kiln_info')}")
 
+    def is_alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
     def shutdown(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            os.killpg(self.proc.pid, signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.proc.pid, signal.SIGKILL)
+        shutdown_process_group(self.proc, timeout=120.0)
         self.proc = None
 
     # ---------------------------------------------------------------- reload

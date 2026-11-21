@@ -15,7 +15,7 @@ from pathlib import Path
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
-from .base import Engine, MeasureResult
+from .base import Engine, MeasureResult, reap_zombies
 from .sglang_ext import (
     bootstrap_env,
     encode_rpc,
@@ -145,13 +145,52 @@ class SGLangOfflineEngine(Engine):
         self._rpc("kiln_teardown")
         self._flush_cache()
 
+    def _iter_child_procs(self) -> list:
+        if self.engine is None:
+            return []
+        procs: list = []
+        seen: set[int] = set()
+        for attr in ("procs", "_procs", "processes", "scheduler_procs", "detokenizer_proc", "tokenizer_manager"):
+            val = getattr(self.engine, attr, None)
+            items = val if isinstance(val, (list, tuple, set)) else [val]
+            for item in items:
+                if item is None or id(item) in seen:
+                    continue
+                if callable(getattr(item, "is_alive", None)) and hasattr(item, "exitcode"):
+                    seen.add(id(item))
+                    procs.append(item)
+        return procs
+
+    def is_alive(self) -> bool:
+        if self.engine is None:
+            return False
+        for p in self._iter_child_procs():
+            try:
+                if p.exitcode is not None or not p.is_alive():
+                    return False
+            except Exception:
+                return False
+        return True
+
     def shutdown(self) -> None:
         if self.engine is not None:
+            child_procs = self._iter_child_procs()
             try:
                 if hasattr(self.engine, "shutdown"):
                     self.engine.shutdown()
             except Exception:
                 pass
+            for p in child_procs:
+                try:
+                    if p.is_alive():
+                        p.terminate()
+                        p.join(timeout=5)
+                        if p.is_alive() and hasattr(p, "kill"):
+                            p.kill()
+                            p.join(timeout=2)
+                except Exception:
+                    pass
+            reap_zombies()
             del self.engine
             self.engine = None
             gc.collect()

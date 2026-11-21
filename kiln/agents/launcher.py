@@ -123,6 +123,30 @@ def _normalize_proxy_env(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+_SENSITIVE_ENV_VARS = (
+    "SSH_AUTH_SOCK",
+    "SCHED_KUBECONFIG",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "DOCKER_HOST",
+)
+
+
+def _strip_sensitive_env(
+    env: dict[str, str], allowed_keys: set[str] | None = None
+) -> dict[str, str]:
+    """Strip host cluster/cloud credentials from spawned agent environments unless allowed per-slot."""
+    allowed = allowed_keys or set()
+    for key in _SENSITIVE_ENV_VARS:
+        if key not in allowed:
+            env.pop(key, None)
+    if "KUBECONFIG" not in allowed:
+        env["KUBECONFIG"] = "/dev/null"
+    return env
+
+
 def describe_slots(run: RunConfig) -> list[dict]:
     """Return resolved per-slot CLI metadata without spawning any agent processes."""
     refs_dir = REPO / "refs"
@@ -227,6 +251,8 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
             if slot.model:
                 env["KILN_AGENT_MODEL"] = slot.model
             _normalize_proxy_env(env)
+            if run.agents.isolate_credentials:
+                _strip_sensitive_env(env, allowed_keys=set(slot.env.keys()))
             try:
                 p, log = _spawn_agent(slot_cmd, ws, env, prompt)
             except FileNotFoundError as exc:

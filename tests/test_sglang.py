@@ -729,3 +729,31 @@ def test_sglang_greedy_probe_extracts_output_logprobs():
     assert tokens == [[10, 20]]
     assert probed_lps == [[{10: -0.12, 11: -1.5}, {20: -0.34}]]
     eng.http.close()
+
+
+def test_sglang_engines_is_alive_and_zombie_reap():
+    class AliveProc:
+        exitcode = None
+        def is_alive(self): return True
+        def poll(self): return None
+
+    class DeadProc:
+        exitcode = -9
+        def is_alive(self): return False
+        def poll(self): return -9
+
+    off = SGLangOfflineEngine(EngineConfig(kind="sglang_offline", model="dummy"), TierConfig(name="fast"))
+    assert off.is_alive() is False
+    off.engine = SimpleNamespace(procs=[AliveProc()], shutdown=lambda: None)
+    assert off.is_alive() is True
+    off.engine.procs.append(DeadProc())
+    assert off.is_alive() is False
+    off.shutdown()
+    assert off.engine is None and off.is_alive() is False
+
+    srv = SGLangServerEngine(EngineConfig(kind="sglang_server", model="dummy"), TierConfig(name="slow"))
+    assert srv.is_alive() is False
+    srv.proc = AliveProc()
+    assert srv.is_alive() is True
+    srv.proc = DeadProc()
+    assert srv.is_alive() is False

@@ -7,9 +7,49 @@ agent-written forward passes into it and measure.
 from __future__ import annotations
 
 import abc
+import os
+import signal
+import subprocess
 from dataclasses import dataclass, field
 
 from kiln.bench.traffic import Request
+
+
+def reap_zombies() -> int:
+    """Reap any finished child processes without blocking; return count reaped."""
+    reaped = 0
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid <= 0:
+            break
+        reaped += 1
+    return reaped
+
+
+def shutdown_process_group(proc: subprocess.Popen | None, timeout: float = 120.0) -> None:
+    """Terminate a process group cleanly, escalate to SIGKILL if needed, wait, and reap zombies."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.wait(timeout=10)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+    reap_zombies()
 
 
 class InvalidBenchmark(ValueError):
@@ -64,6 +104,10 @@ class Engine(abc.ABC):
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
         """Return `(token_ids, per_step_logprobs)` when supported by the backend."""
         return self.greedy_outputs(prompts, max_new_tokens), None
+
+    def is_alive(self) -> bool:
+        """Return whether the backing engine/worker processes are healthy and alive."""
+        return True
 
     @abc.abstractmethod
     def shutdown(self) -> None: ...

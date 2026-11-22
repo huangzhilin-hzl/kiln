@@ -251,6 +251,19 @@ def build_pd_node_launch_spec(
     return cmd, full_env, overrides
 
 
+def _has_rust_sglang_router() -> bool:
+    """Return True when `sglang_router` has its native Rust `sglang_router_rs` extension installed."""
+    try:
+        if importlib.util.find_spec("sglang_router") is None:
+            return False
+        return (
+            importlib.util.find_spec("sglang_router_rs") is not None
+            or importlib.util.find_spec("sglang_router.sglang_router_rs") is not None
+        )
+    except (ImportError, ValueError):
+        return False
+
+
 def build_router_cmd(
     pd: PDClusterConfig,
     prefill_urls: list[str],
@@ -258,14 +271,18 @@ def build_router_cmd(
     host: str,
     port: int,
 ) -> list[str]:
-    """Build CLI argv to launch `sglang_router` in `--pd-disaggregation` mode."""
+    """Build CLI argv to launch `sglang_router` (or `kiln.engine.pd_router` fallback)."""
     if pd.router_command:
         cmd = shlex.split(pd.router_command)
-    elif importlib.util.find_spec("sglang_router") is not None:
+    elif _has_rust_sglang_router():
         cmd = [sys.executable, "-m", "sglang_router.launch_router"]
+    elif importlib.util.find_spec("sglang_router") is None and shutil.which("sglang-router"):
+        cmd = [shutil.which("sglang-router")]
     else:
-        router_bin = shutil.which("sglang-router")
-        cmd = [router_bin] if router_bin else [sys.executable, "-m", "sglang_router.launch_router"]
+        # `sglang_router` is absent or only ships Python `MiniLB` (which mismatches
+        # multi-prefill bootstrap ports and crashes on `return_logprob=True` without
+        # input logprobs); use kiln's built-in async HTTP PD router.
+        cmd = [sys.executable, "-m", "kiln.engine.pd_router"]
 
     cmd += ["--pd-disaggregation", "--host", host, "--port", str(port)]
     for node, url in zip(pd.prefill, prefill_urls):
@@ -427,9 +444,14 @@ class SGLangPDServerEngine(Engine):
             rlog = open(Path(f"sglang_pd_{self.tier.name}_router.log"), "ab")
             self._log_files.append(rlog)
             print(f"[kiln] {self.tier.name} router: {shlex.join(rcmd)}")
+            r_env = dict(os.environ)
+            pkg_root = str(Path(__file__).resolve().parents[2])
+            existing_pp = [p for p in r_env.get("PYTHONPATH", "").split(os.pathsep) if p]
+            if pkg_root not in existing_pp:
+                r_env["PYTHONPATH"] = os.pathsep.join([pkg_root, *existing_pp])
             self._router_proc = subprocess.Popen(
                 rcmd,
-                env=dict(os.environ),
+                env=r_env,
                 stdout=rlog,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,

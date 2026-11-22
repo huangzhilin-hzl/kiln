@@ -232,3 +232,90 @@ def test_sglang_pd_server_engine_broadcast_rollback_and_agentx(tmp_path: Path, m
 
     eng.shutdown()
     eng.http.close()
+
+
+def test_pd_router_fallback_and_2p1d_bootstrap_pairing(monkeypatch):
+    import sys
+    from fastapi.testclient import TestClient
+    from kiln.engine.pd_router import create_pd_router_app
+
+    pd_auto = PDClusterConfig(
+        transfer_backend="mooncake_tcp",
+        prefill=[
+            PDNodeConfig(url="http://127.0.0.1:31500", bootstrap_port=31501),
+            PDNodeConfig(url="http://127.0.0.1:31502", bootstrap_port=31503),
+        ],
+        decode=[PDNodeConfig(url="http://127.0.0.1:31504")],
+        router_policy="round_robin",
+    )
+    monkeypatch.setattr("kiln.engine.sglang_pd._has_rust_sglang_router", lambda: False)
+    monkeypatch.setattr("kiln.engine.sglang_pd.shutil.which", lambda _n: None)
+    cmd_fb = build_router_cmd(
+        pd_auto,
+        ["http://127.0.0.1:31500", "http://127.0.0.1:31502"],
+        ["http://127.0.0.1:31504"],
+        "127.0.0.1",
+        30080,
+    )
+    assert cmd_fb[:3] == [sys.executable, "-m", "kiln.engine.pd_router"]
+
+    monkeypatch.setattr("kiln.engine.sglang_pd._has_rust_sglang_router", lambda: True)
+    cmd_rs = build_router_cmd(
+        pd_auto,
+        ["http://127.0.0.1:31500", "http://127.0.0.1:31502"],
+        ["http://127.0.0.1:31504"],
+        "127.0.0.1",
+        30080,
+    )
+    assert cmd_rs[:3] == [sys.executable, "-m", "sglang_router.launch_router"]
+
+    seen: list[tuple[int, dict]] = []
+
+    def backend_handler(request: httpx.Request) -> httpx.Response:
+        port = request.url.port
+        body = json.loads(request.content.decode()) if request.content else {}
+        seen.append((port, body))
+        if port == 31500:
+            assert body["bootstrap_port"] == 31501
+        elif port == 31502:
+            assert body["bootstrap_port"] == 31503
+        elif port == 31504:
+            assert body["bootstrap_port"] in (31501, 31503)
+        return httpx.Response(
+            200,
+            json={
+                "output_ids": [101, 102],
+                "meta_info": {
+                    "completion_tokens": 2,
+                    "input_token_logprobs": None,
+                    "output_token_logprobs": [[-0.1, 101, "a"], [-0.2, 102, "b"]],
+                },
+            },
+        )
+
+    router_app = create_pd_router_app(
+        [("http://127.0.0.1:31500", 31501), ("http://127.0.0.1:31502", 31503)],
+        ["http://127.0.0.1:31504"],
+        policy="round_robin",
+        transport=httpx.MockTransport(backend_handler),
+    )
+    with TestClient(router_app) as tc:
+        for _ in range(4):
+            r = tc.post(
+                "/generate",
+                json={
+                    "input_ids": [1, 2, 3],
+                    "sampling_params": {"max_new_tokens": 2, "temperature": 0.0},
+                    "return_logprob": True,
+                    "stream": False,
+                },
+            )
+            assert r.status_code == 200
+            assert r.json()["output_ids"] == [101, 102]
+        stats = tc.get("/router_stats").json()
+        assert stats["prefill_counts"] == {
+            "http://127.0.0.1:31500": 2,
+            "http://127.0.0.1:31502": 2,
+        }
+        assert stats["decode_counts"] == {"http://127.0.0.1:31504": 4}
+

@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash-1017 on 2x8 H20-3e GPUs (SM90, 141 GB HBM3e/GPU) using SGLang + AgentX + DSpark.
 #   Node 0 (8x H20-3e, TP8+EP8): `kiln serve` + fast tier (`sglang_offline`, kernel profiler, 256k context).
-#   Node 1 (8x H20-3e, TP8+EP8): slow tier via `kiln worker --tier slow --server http://<NODE0_IP>:18765`
-#                                (`sglang.launch_server` + DSPARK + real AgentX harness).
+#   Node 1 (8x H20-3e, TP8+EP8): `kiln worker --tier slow --server http://<NODE0_IP>:18765`
+#                                serves shared DSPARK `mid` tier (fast ITL/acceptance replay) + `slow` tier (`sglang.launch_server` + DSPARK + lazy 900s AgentX baseline).
 # Leave `gpus: []` when running under sched/k8s so scheduler-injected CUDA_VISIBLE_DEVICES is preserved.
 name: dsv41-flash-h20-sglang-agentx
 engine:
@@ -38,12 +38,25 @@ tiers:
     engine_overrides:
       context_length: 262144
       cuda_graph_max_bs_decode: 32
+  - name: mid
+    engine_kind: sglang_server
+    share_engine: slow
+    gpus: []
+    max_requests: 16
+    repeats: 2
+    trace_kernels: false
+    timeout_s: 900
+    max_queued_per_agent: 1
+    max_inflight_per_agent: 2
+    supersede_queued: true
+    deduplicate_queued: true
   - name: slow
     engine_kind: sglang_server
     gpus: []
     port: 31400
     repeats: 1
     trace_kernels: false
+    lazy_baseline: true
     timeout_s: 3600
     engine_overrides:
       mem_fraction_static: 0.74

@@ -7,6 +7,7 @@ agent-written forward passes into it and measure.
 from __future__ import annotations
 
 import abc
+import math
 import os
 import signal
 import subprocess
@@ -93,6 +94,96 @@ def bucket_tps_for_requests(
     if prefill_tps > 0:
         out["prefill_large"] = prefill_tps
     return out
+
+
+def percentile(values: list[float], p: float) -> float | None:
+    """Compute linear-interpolated percentile (`p` in `[0, 1]`) over finite numeric samples."""
+    xs = sorted(float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(v))
+    if not xs:
+        return None
+    pos = max(0.0, min(1.0, float(p))) * (len(xs) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(xs) - 1)
+    frac = pos - lo
+    return xs[lo] * (1.0 - frac) + xs[hi] * frac
+
+
+def parse_prometheus_metric(text: str, metric_names: tuple[str, ...]) -> float | None:
+    """Return the first finite Prometheus sample matching any metric name in `metric_names`."""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "{" in line:
+            brace = line.rfind("}")
+            if brace < 0:
+                continue
+            name_part = line.split("{", 1)[0].strip()
+            rest = line[brace + 1 :].strip().split()
+            if not rest:
+                continue
+            val_tok = rest[0]
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name_part, val_tok = parts[0], parts[1]
+        if name_part in metric_names:
+            try:
+                val = float(val_tok)
+            except ValueError:
+                continue
+            if math.isfinite(val):
+                return val
+    return None
+
+
+def read_prometheus_metrics(
+    http, url: str, key_to_metric_names: dict[str, tuple[str, ...]], timeout_s: float = 3.0
+) -> dict[str, float]:
+    """Best-effort GET `{url}/metrics` and extract finite Prometheus samples."""
+    out: dict[str, float] = {}
+    try:
+        r = http.get(f"{url.rstrip('/')}/metrics", timeout=timeout_s)
+        if r.status_code != 200 or not r.text:
+            return out
+        for out_key, names in key_to_metric_names.items():
+            val = parse_prometheus_metric(r.text, names)
+            if val is not None:
+                out[out_key] = val
+    except Exception:
+        pass
+    return out
+
+
+def build_server_replay_extra(
+    requests: list[Request],
+    decode_tps: float,
+    prefill_tps: float,
+    itl_samples_ms: list[float],
+    spec_metrics: dict[str, float] | None = None,
+) -> dict:
+    """Assemble standardized replay telemetry (`bucket_tps`, `output_tput`, ITL, spec acceptance)."""
+    extra: dict = {}
+    buckets = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
+    if buckets:
+        extra["bucket_tps"] = buckets
+    if decode_tps > 0 and math.isfinite(decode_tps):
+        extra["output_tput"] = decode_tps
+    p50 = percentile(itl_samples_ms, 0.50)
+    p90 = percentile(itl_samples_ms, 0.90)
+    if p50 is not None:
+        extra["itl_p50_ms"] = p50
+    if p90 is not None:
+        extra["itl_p90_ms"] = p90
+        if p90 > 0:
+            extra["interactivity_p90"] = 1000.0 / p90
+    if spec_metrics:
+        for k in ("spec_accept_length", "spec_accept_rate"):
+            v = spec_metrics.get(k)
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                extra[k] = float(v)
+    return extra
 
 
 class Engine(abc.ABC):

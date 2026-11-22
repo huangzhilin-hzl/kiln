@@ -26,7 +26,14 @@ from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_p
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
-from .base import Engine, InvalidBenchmark, MeasureResult, bucket_tps_for_requests, shutdown_process_group
+from .base import (
+    Engine,
+    InvalidBenchmark,
+    MeasureResult,
+    build_server_replay_extra,
+    read_prometheus_metrics,
+    shutdown_process_group,
+)
 from .sglang_ext import (
     bootstrap_env,
     encode_rpc,
@@ -216,7 +223,8 @@ class SGLangServerEngine(Engine):
         self._reset_cache()
 
     # ---------------------------------------------------------------- measure
-    def _generate_one(self, prompt_ids: list[int], max_tokens: int) -> int:
+    def _generate_one_stats(self, prompt_ids: list[int], max_tokens: int) -> dict:
+        t0 = time.perf_counter()
         r = self.http.post(
             f"{self.url}/generate",
             json={
@@ -229,15 +237,85 @@ class SGLangServerEngine(Engine):
                 "stream": False,
             },
         )
+        dt = max(time.perf_counter() - t0, 1e-9)
         r.raise_for_status()
         body = r.json()
         meta = body.get("meta_info") or {}
         if meta.get("completion_tokens") is not None:
-            return int(meta["completion_tokens"])
-        ids = extract_output_ids(body)
-        if ids is not None:
-            return len(ids)
-        return max_tokens
+            ntok = int(meta["completion_tokens"])
+        else:
+            ids = extract_output_ids(body)
+            ntok = len(ids) if ids is not None else max_tokens
+        out: dict = {"tokens": ntok, "dt": dt}
+        for key in (
+            "spec_verify_ct",
+            "spec_accept_length",
+            "spec_accept_rate",
+            "spec_num_correct_drafts",
+            "spec_num_proposed_drafts",
+        ):
+            val = meta.get(key)
+            if isinstance(val, (int, float)) and math.isfinite(val):
+                out[key] = float(val)
+        return out
+
+    def _generate_one(self, prompt_ids: list[int], max_tokens: int) -> int:
+        return int(self._generate_one_stats(prompt_ids, max_tokens)["tokens"])
+
+    def _spec_draft_gamma(self) -> int | None:
+        merged = {**self.cfg.extra_args, **self.tier.engine_overrides}
+        dspark_bs = merged.get("speculative_dspark_block_size")
+        if isinstance(dspark_bs, (int, float)) and int(dspark_bs) >= 1:
+            return int(dspark_bs)
+        n_draft = merged.get("speculative_num_draft_tokens")
+        if isinstance(n_draft, (int, float)) and int(n_draft) > 1:
+            return int(n_draft) - 1
+        return None
+
+    def _read_spec_metrics(self) -> dict[str, float]:
+        return read_prometheus_metrics(
+            self.http,
+            self.url,
+            {
+                "spec_accept_length": ("sglang:spec_accept_length",),
+                "spec_accept_rate": ("sglang:spec_accept_rate",),
+            },
+        )
+
+    def _aggregate_spec_metrics(self, stats_list: list[dict]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        verify_stats = [s for s in stats_list if s.get("spec_verify_ct", 0) > 0]
+        if verify_stats:
+            tot_tokens = sum(int(s["tokens"]) for s in verify_stats)
+            tot_verify = sum(int(s["spec_verify_ct"]) for s in verify_stats)
+            out["spec_accept_length"] = tot_tokens / tot_verify
+        else:
+            lens = [float(s["spec_accept_length"]) for s in stats_list if "spec_accept_length" in s]
+            if lens:
+                out["spec_accept_length"] = sum(lens) / len(lens)
+
+        draft_stats = [
+            s
+            for s in stats_list
+            if s.get("spec_num_proposed_drafts", 0) > 0 and "spec_num_correct_drafts" in s
+        ]
+        if draft_stats:
+            tot_corr = sum(float(s["spec_num_correct_drafts"]) for s in draft_stats)
+            tot_prop = sum(float(s["spec_num_proposed_drafts"]) for s in draft_stats)
+            out["spec_accept_rate"] = max(0.0, min(1.0, tot_corr / tot_prop))
+        elif "spec_accept_length" in out and (gamma := self._spec_draft_gamma()):
+            out["spec_accept_rate"] = max(0.0, min(1.0, (out["spec_accept_length"] - 1.0) / gamma))
+        else:
+            rates = [float(s["spec_accept_rate"]) for s in stats_list if "spec_accept_rate" in s]
+            if rates:
+                out["spec_accept_rate"] = max(0.0, min(1.0, sum(rates) / len(rates)))
+
+        if "spec_accept_length" not in out or "spec_accept_rate" not in out:
+            prom = self._read_spec_metrics()
+            for key in ("spec_accept_length", "spec_accept_rate"):
+                if key not in out and key in prom:
+                    out[key] = prom[key]
+        return out
 
     def _kernel_report(self, pool: concurrent.futures.ThreadPoolExecutor,
                        requests: list[Request]) -> tuple[str | None, dict | None]:
@@ -289,15 +367,24 @@ class SGLangServerEngine(Engine):
                 ttft_s = prefill_s / max(len(requests), 1)
 
             decode_runs = []
+            itl_samples: list[float] = []
+            decode_stats: list[dict] = []
             for _ in range(repeats):
                 t0 = time.perf_counter()
-                ntok = sum(pool.map(lambda r: self._generate_one(r.prompt_ids, r.output_len), requests))
+                batch_stats = list(pool.map(lambda r: self._generate_one_stats(r.prompt_ids, r.output_len), requests))
                 dt = max(time.perf_counter() - t0, 1e-9)
+                ntok = sum(int(s["tokens"]) for s in batch_stats)
                 decode_runs.append(ntok / dt)
+                decode_stats.extend(batch_stats)
+                for s in batch_stats:
+                    tok = int(s["tokens"])
+                    if tok > 0:
+                        itl_samples.append(1000.0 * float(s["dt"]) / max(tok - 1, 1))
 
             report, trace_analysis = self._kernel_report(pool, requests) if trace else (None, None)
         decode_tps = sum(decode_runs) / len(decode_runs) if decode_runs else 0.0
-        buckets = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
+        spec_metrics = self._aggregate_spec_metrics(decode_stats) if repeats > 0 else {}
+        extra = build_server_replay_extra(requests, decode_tps, prefill_tps, itl_samples, spec_metrics)
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
@@ -305,7 +392,7 @@ class SGLangServerEngine(Engine):
             runs_decode_tps=decode_runs,
             kernel_report=report,
             trace_analysis=trace_analysis,
-            extra=({"bucket_tps": buckets} if buckets else {}),
+            extra=extra,
         )
 
     def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:

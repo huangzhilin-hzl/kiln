@@ -46,7 +46,14 @@ def cmd_worker(a):
     from kiln.server.jobs import run_remote_worker
     run = RunConfig.load(a.config)
     server = a.server or os.environ.get("KILN_SERVER") or run.client_url
-    run_remote_worker(run, tier_name=a.tier, server_url=server)
+    extra = [x.strip() for x in (a.tiers or "").split(",") if x.strip()] or None
+    run_remote_worker(
+        run,
+        tier_name=a.tier,
+        server_url=server,
+        extra_tiers=extra,
+        include_shared=not a.no_shared,
+    )
 
 
 def _read_checkout_lineage(file_path: str) -> list[str]:
@@ -628,6 +635,9 @@ def main(argv=None):
     s = sp.add_parser("worker", help="run a persistent tier worker on a second GPU node")
     s.add_argument("-c", "--config", required=True)
     s.add_argument("--tier", default="slow", help="tier to serve on this node")
+    s.add_argument("--tiers", help="comma-separated additional tiers to serve on this node, e.g. mid,slow")
+    s.add_argument("--no-shared", action="store_true",
+                   help="serve only --tier/--tiers without auto-including shared-engine tiers")
     s.add_argument("--server", help="central kiln server URL, e.g. http://<node0-ip>:8765")
     s.set_defaults(f=cmd_worker)
 
@@ -707,7 +717,8 @@ def main(argv=None):
     s.add_argument("-k", type=int, default=10)
     s.add_argument("--sort", default="speedup",
                    help="sort key: speedup, decode_tps, prefill_tps, decode_small, decode_mid, prefill_large, "
-                        "output_tput, active_decode_tps, itl_p50_ms, itl_p90_ms, interactivity_p90, paired_speedup")
+                        "output_tput, active_decode_tps, itl_p50_ms, itl_p90_ms, interactivity_p90, "
+                        "spec_accept_length, spec_accept_rate, paired_speedup")
     s.set_defaults(f=cmd_leaderboard)
 
     s = sp.add_parser("promote", help="promote winning jobs to another tier or generate 900s official config")

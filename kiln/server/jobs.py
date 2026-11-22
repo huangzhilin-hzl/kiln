@@ -237,33 +237,8 @@ class TierWorker:
                 if not self.owner.boot_id:
                     self.owner.boot_id = uuid.uuid4().hex[:8]
                 self.boot_id = self.owner.boot_id
-            if self.baseline_tokens is None or self.baseline_tps is None:
-                cc = self.run.correctness
-                probe = [r.prompt_ids for r in self.requests[: cc.num_prompts]]
-                tokens, logprobs = self.engine.greedy_probe(probe, cc.max_new_tokens)
-                if not probe or len(tokens) != len(probe) or not all(tokens):
-                    raise RuntimeError("Baseline returned incomplete correctness outputs")
-                base = self.engine.measure(
-                    self.requests,
-                    self.tier.repeats,
-                    trace=(self.tier.trace_kernels and self.tier.trace_policy != "never"),
-                )
-                if not math.isfinite(base.decode_tps) or base.decode_tps <= 0:
-                    raise RuntimeError("Baseline throughput must be finite and positive")
-                self.baseline_tokens = tokens
-                self.baseline_logprobs = logprobs
-                self.baseline_tps = base.decode_tps
-                self.baseline_prefill_tps = base.prefill_tps
-                self.baseline_extra = dict(base.extra or {})
-                self.baseline_bucket_tps = {
-                    str(k): float(v)
-                    for k, v in (self.baseline_extra.get("bucket_tps") or {}).items()
-                    if isinstance(v, (int, float)) and v > 0
-                }
-                if base.trace_analysis:
-                    self.baseline_trace = TraceAnalysis.from_dict(base.trace_analysis)
-                print(f"[kiln] {self.tier.name}: baseline decode {base.decode_tps:.1f} tok/s "
-                      f"(variance {base.variance_pct:.2f}%)")
+            if not self.tier.lazy_baseline and (self.baseline_tokens is None or self.baseline_tps is None):
+                self._measure_baseline()
             snap_dir = self.jobs_dir.parent / "micro_snapshots"
             if (
                 self.run.micro.enabled
@@ -277,6 +252,34 @@ class TierWorker:
                     print(f"[kiln] {self.tier.name}: cold-boot snapshot capture skipped ({exc})")
             self.boot_error = None
             self.ready.set()
+
+    def _measure_baseline(self) -> None:
+        cc = self.run.correctness
+        probe = [r.prompt_ids for r in self.requests[: cc.num_prompts]]
+        tokens, logprobs = self.engine.greedy_probe(probe, cc.max_new_tokens)
+        if not probe or len(tokens) != len(probe) or not all(tokens):
+            raise RuntimeError("Baseline returned incomplete correctness outputs")
+        base = self.engine.measure(
+            self.requests,
+            self.tier.repeats,
+            trace=(self.tier.trace_kernels and self.tier.trace_policy != "never"),
+        )
+        if not math.isfinite(base.decode_tps) or base.decode_tps <= 0:
+            raise RuntimeError("Baseline throughput must be finite and positive")
+        self.baseline_tokens = tokens
+        self.baseline_logprobs = logprobs
+        self.baseline_tps = base.decode_tps
+        self.baseline_prefill_tps = base.prefill_tps
+        self.baseline_extra = dict(base.extra or {})
+        self.baseline_bucket_tps = {
+            str(k): float(v)
+            for k, v in (self.baseline_extra.get("bucket_tps") or {}).items()
+            if isinstance(v, (int, float)) and v > 0
+        }
+        if base.trace_analysis:
+            self.baseline_trace = TraceAnalysis.from_dict(base.trace_analysis)
+        print(f"[kiln] {self.tier.name}: baseline decode {base.decode_tps:.1f} tok/s "
+              f"(variance {base.variance_pct:.2f}%)")
 
     def _restart_engine(self) -> None:
         with self.engine_lock:
@@ -314,7 +317,7 @@ class TierWorker:
                     td,
                     f"{self.tier.name} recover-probe",
                 )
-                if got == [self.baseline_tokens[0][:n_check]] and len(got[0]) == n_check:
+                if self.baseline_tokens and got == [self.baseline_tokens[0][:n_check]] and len(got[0]) == n_check:
                     print(f"[kiln] {self.tier.name}: recovered warm engine after non-fatal candidate error")
                     return
             except Exception:
@@ -474,6 +477,10 @@ class TierWorker:
         base_job_extra = dict(job.extra or {})
         threshold_override = base_job_extra.pop("_screen_threshold", None)
         job.extra = dict(base_job_extra)
+        if self.owner is not None and self.owner.boot_id:
+            self.boot_id = self.owner.boot_id
+        if self.baseline_tokens is None or self.baseline_tps is None:
+            self._measure_baseline()
         job.baseline_tps = self.baseline_tps
         job.engine_boot_id = self.boot_id
         reload_timeout = float(self.tier.timeout_s or 0)
@@ -656,7 +663,10 @@ class TierWorker:
         self.q.put(job)
 
     def stats(self) -> dict:
-        mode = f"shared:{self.tier.share_engine}" if self.tier.share_engine else ("local" if self.local else "remote")
+        if self.tier.share_engine:
+            mode = f"shared:{self.tier.share_engine}" if self.local else f"remote:shared:{self.tier.share_engine}"
+        else:
+            mode = "local" if self.local else "remote"
         with self.q.mutex:
             q_depth = sum(1 for j in self.q.queue if j.status == "queued")
         return {
@@ -686,6 +696,33 @@ class TierWorker:
                 temp.unlink(missing_ok=True)
 
 
+def _wire_shared_tiers(
+    workers: dict[str, TierWorker],
+    tiers: list[TierConfig],
+    *,
+    enforce_same_locality: bool = False,
+) -> None:
+    """Attach borrower TierWorkers to their owner engine & lock."""
+    for t in tiers:
+        if t.name not in workers or not t.share_engine:
+            continue
+        if t.share_engine == t.name or t.share_engine not in workers:
+            raise ValueError(f"invalid share_engine {t.share_engine!r} on tier {t.name!r}")
+        owner = workers[t.share_engine]
+        if owner.tier.share_engine:
+            raise ValueError(f"chained share_engine not supported: {t.name} -> {t.share_engine}")
+        borrower = workers[t.name]
+        if enforce_same_locality and borrower.local != owner.local:
+            raise ValueError(
+                f"tier {t.name} (local={borrower.local}) cannot share engine "
+                f"{t.share_engine} (local={owner.local})"
+            )
+        borrower.owner = owner
+        borrower.engine_lock = owner.engine_lock
+        if t.trace_kernels and not owner.tier.trace_kernels and (not enforce_same_locality or borrower.local):
+            owner.tier = owner.tier.model_copy(update={"trace_kernels": True})
+
+
 class JobManager:
     def __init__(self, run: RunConfig, requests: list[Request], local_tiers: set[str] | None = None):
         self.run = run
@@ -704,21 +741,7 @@ class JobManager:
             )
             for t in run.tiers
         }
-        for t in run.tiers:
-            if not t.share_engine:
-                continue
-            if t.share_engine == t.name or t.share_engine not in self.tiers:
-                raise ValueError(f"invalid share_engine {t.share_engine!r} on tier {t.name!r}")
-            owner = self.tiers[t.share_engine]
-            if owner.tier.share_engine:
-                raise ValueError(f"chained share_engine not supported: {t.name} -> {t.share_engine}")
-            if not owner.local:
-                raise ValueError(f"tier {t.name} cannot share non-local engine {t.share_engine}")
-            borrower = self.tiers[t.name]
-            borrower.owner = owner
-            borrower.engine_lock = owner.engine_lock
-            if borrower.local and t.trace_kernels and not owner.tier.trace_kernels:
-                owner.tier = owner.tier.model_copy(update={"trace_kernels": True})
+        _wire_shared_tiers(self.tiers, run.tiers, enforce_same_locality=True)
         self.lock = threading.Condition()
         self.remote_workers: dict[str, dict[str, float]] = {
             name: {} for name, worker in self.tiers.items() if not worker.local
@@ -1093,6 +1116,8 @@ class JobManager:
             worker._save(result)
             job.__dict__.update(result.__dict__)
             worker.durations.append(job.finished_at - job.started_at)
+            if isinstance(data.get("baseline_tps"), (int, float)) and data["baseline_tps"] > 0:
+                worker.baseline_tps = float(data["baseline_tps"])
             if data.get("crashes") is not None:
                 worker.crashes = data["crashes"]
             self._maybe_cascade_invalidate_locked(job)
@@ -1122,6 +1147,8 @@ class JobManager:
         "itl_p50_ms",
         "itl_p90_ms",
         "interactivity_p90",
+        "spec_accept_length",
+        "spec_accept_rate",
         "paired_speedup",
     }
 
@@ -1163,6 +1190,8 @@ class JobManager:
             ("itl_p90_ms", 3),
             ("interactivity_p90", 2),
             ("effective_concurrency", 3),
+            ("spec_accept_length", 3),
+            ("spec_accept_rate", 4),
         ):
             val = ex.get(key)
             if isinstance(val, (int, float)):
@@ -1461,104 +1490,165 @@ class JobManager:
         return compose_candidates(items, allow_target_overlap=allow_target_overlap)
 
 
-def run_remote_worker(run: RunConfig, tier_name: str, server_url: str) -> None:
-    """Run one persistent tier engine on a second GPU node, pulling jobs from `server_url`."""
+def run_remote_worker(
+    run: RunConfig,
+    tier_name: str,
+    server_url: str,
+    *,
+    extra_tiers: list[str] | None = None,
+    include_shared: bool = True,
+) -> None:
+    """Run one persistent tier engine (and any tiers sharing it) on a GPU worker node."""
     import httpx
     from kiln.bench.traffic import load_traffic
     from kiln.server.auth import auth_headers
 
-    tier = next((t for t in run.tiers if t.name == tier_name), None)
-    if tier is None:
-        raise KeyError(f"unknown tier {tier_name}; have {[t.name for t in run.tiers]}")
+    tier_by_name = {t.name: t for t in run.tiers}
+    names: list[str] = []
+
+    def _add_name(name: str) -> None:
+        if name not in names:
+            names.append(name)
+
+    for name in [tier_name, *(extra_tiers or [])]:
+        if name not in tier_by_name:
+            raise KeyError(f"unknown tier {name}; have {[t.name for t in run.tiers]}")
+        _add_name(name)
+    if include_shared:
+        for name in list(names):
+            owner_name = tier_by_name[name].share_engine
+            if owner_name:
+                _add_name(owner_name)
+        for t in run.tiers:
+            if t.share_engine and t.share_engine in names:
+                _add_name(t.name)
 
     client = httpx.Client(trust_env=False, timeout=30.0, headers=auth_headers())
-    url = f"{server_url.rstrip('/')}/workers/{tier_name}"
+    base_url = server_url.rstrip("/")
+    traffic_exists = Path(run.traffic_file).exists()
+    cached_requests: list[Request] | None = None
+    workers: dict[str, TierWorker] = {}
+    for name in names:
+        t = tier_by_name[name]
+        if traffic_exists:
+            if cached_requests is None:
+                tok_name = None if (t.engine_kind or run.engine.kind) == "mock" else (run.engine.tokenizer or run.engine.model)
+                cached_requests = load_traffic(run.traffic_file, model_name=tok_name)
+            tier_requests = cached_requests
+        else:
+            r = client.get(f"{base_url}/workers/{t.name}/requests")
+            r.raise_for_status()
+            tier_requests = [Request(**row) for row in r.json()]
+        jobs_dir = Path(run.workdir) / run.name / f"worker_{t.name}" / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        workers[t.name] = TierWorker(run, t, tier_requests, jobs_dir, local=False)
 
-    if Path(run.traffic_file).exists():
-        tok_name = None if (tier.engine_kind or run.engine.kind) == "mock" else (run.engine.tokenizer or run.engine.model)
-        requests = load_traffic(run.traffic_file, model_name=tok_name)
-    else:
-        r = client.get(f"{url}/requests")
-        r.raise_for_status()
-        requests = [Request(**row) for row in r.json()]
-
-    jobs_dir = Path(run.workdir) / run.name / f"worker_{tier_name}" / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-    worker = TierWorker(run, tier, requests, jobs_dir, local=False)
+    _wire_shared_tiers(workers, [tier_by_name[n] for n in names], enforce_same_locality=False)
+    boot_order = [workers[n] for n in names if workers[n].owner is None] + [
+        workers[n] for n in names if workers[n].owner is not None
+    ]
+    poll_tiers = [tier_by_name[n] for n in names if tier_by_name[n].share_engine] + [
+        tier_by_name[n] for n in names if not tier_by_name[n].share_engine
+    ]
 
     worker_id = uuid.uuid4().hex
-    attempt_id = None
+    active_lock = threading.Lock()
+    active_tier: str | None = None
+    attempt_id: str | None = None
     stop = threading.Event()
 
     def heartbeat() -> None:
         while not stop.is_set():
-            try:
-                client.post(f"{url}/heartbeat", timeout=5.0, json={
-                    "worker_id": worker_id, "attempt_id": attempt_id,
-                    "ready": worker.ready.is_set(), "baseline_tps": worker.baseline_tps,
-                    "crashes": worker.crashes,
-                    "boot_id": worker.boot_id, "last_canary": worker.last_canary,
-                }).raise_for_status()
-            except httpx.HTTPError as exc:
-                print(f"[kiln] {tier_name}: heartbeat failed ({exc})")
+            for t_name, w in workers.items():
+                with active_lock:
+                    cur_attempt = attempt_id if active_tier == t_name else None
+                try:
+                    client.post(f"{base_url}/workers/{t_name}/heartbeat", timeout=5.0, json={
+                        "worker_id": worker_id, "attempt_id": cur_attempt,
+                        "ready": w.ready.is_set(), "baseline_tps": w.baseline_tps,
+                        "crashes": w.crashes,
+                        "boot_id": w.boot_id, "last_canary": w.last_canary,
+                    }).raise_for_status()
+                except httpx.HTTPError as exc:
+                    print(f"[kiln] {t_name}: heartbeat failed ({exc})")
             stop.wait(REMOTE_HEARTBEAT_S)
 
-    heartbeat_thread = threading.Thread(target=heartbeat, name=f"heartbeat-{tier_name}", daemon=True)
+    heartbeat_thread = threading.Thread(target=heartbeat, name=f"heartbeat-{'-'.join(names)}", daemon=True)
     heartbeat_thread.start()
     try:
         while True:
-            worker.wait_until_ready()
-            try:
-                r = client.post(f"{url}/claim", params={"worker_id": worker_id, "wait_s": 2.0})
-                r.raise_for_status()
-                claimed = r.json().get("job")
-            except httpx.HTTPError as e:
-                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
-                    raise
-                print(f"[kiln] {tier_name}: server poll error ({e}); retrying in 5s")
-                time.sleep(5)
-                continue
-            if not claimed:
-                continue
-            attempt_id = claimed["attempt_id"]
-            jid = claimed["id"]
-            cand_dir = jobs_dir / jid
-            cand_dir.mkdir(parents=True, exist_ok=True)
-            cand_path = cand_dir / "candidate.py"
-            cand_path.write_text(claimed["source"])
-            job_extra: dict = {}
-            st_val = claimed.get("screen_threshold")
-            if isinstance(st_val, (int, float)) and math.isfinite(st_val) and st_val > 0:
-                job_extra["_screen_threshold"] = float(st_val)
-            job = Job(
-                id=jid,
-                agent=claimed["agent"],
-                tier=tier_name,
-                note=claimed.get("note", ""),
-                candidate_path=str(cand_path),
-                force_trace=bool(claimed.get("force_trace", False)),
-                extra=job_extra,
-            )
-            worker.execute_job(job)
-            payload = asdict(job)
-            payload.update(worker_id=worker_id, attempt_id=attempt_id, crashes=worker.crashes)
-            while True:
+            for w in boot_order:
+                w.wait_until_ready()
+            claimed = None
+            claimed_worker: TierWorker | None = None
+            for idx, t in enumerate(poll_tiers):
+                poll_wait = 2.0 if idx == len(poll_tiers) - 1 else 0.0
                 try:
-                    r = client.post(f"{url}/complete", json=payload)
-                    if r.status_code == 409:
-                        print(f"[kiln] {tier_name}: claim expired for {jid}; coordinator will retry it")
-                        break
+                    r = client.post(
+                        f"{base_url}/workers/{t.name}/claim",
+                        params={"worker_id": worker_id, "wait_s": poll_wait},
+                    )
                     r.raise_for_status()
-                    break
-                except httpx.HTTPError as exc:
-                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                    claimed = r.json().get("job")
+                    if claimed:
+                        claimed_worker = workers[t.name]
+                        break
+                except httpx.HTTPError as e:
+                    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
                         raise
-                    print(f"[kiln] {tier_name}: result delivery failed for {jid} ({exc}); retrying")
+                    print(f"[kiln] {t.name}: server poll error ({e}); retrying in 5s")
                     time.sleep(5)
-            attempt_id = None
+                    claimed = None
+                    break
+            if not claimed or claimed_worker is None:
+                continue
+            t_name = claimed_worker.tier.name
+            with active_lock:
+                active_tier = t_name
+                attempt_id = claimed["attempt_id"]
+            try:
+                jid = claimed["id"]
+                cand_dir = claimed_worker.jobs_dir / jid
+                cand_dir.mkdir(parents=True, exist_ok=True)
+                cand_path = cand_dir / "candidate.py"
+                cand_path.write_text(claimed["source"])
+                job_extra: dict = {}
+                st_val = claimed.get("screen_threshold")
+                if isinstance(st_val, (int, float)) and math.isfinite(st_val) and st_val > 0:
+                    job_extra["_screen_threshold"] = float(st_val)
+                job = Job(
+                    id=jid,
+                    agent=claimed["agent"],
+                    tier=t_name,
+                    note=claimed.get("note", ""),
+                    candidate_path=str(cand_path),
+                    force_trace=bool(claimed.get("force_trace", False)),
+                    extra=job_extra,
+                )
+                claimed_worker.execute_job(job)
+                payload = asdict(job)
+                payload.update(worker_id=worker_id, attempt_id=attempt_id, crashes=claimed_worker.crashes)
+                while True:
+                    try:
+                        r = client.post(f"{base_url}/workers/{t_name}/complete", json=payload)
+                        if r.status_code == 409:
+                            print(f"[kiln] {t_name}: claim expired for {jid}; coordinator will retry it")
+                            break
+                        r.raise_for_status()
+                        break
+                    except httpx.HTTPError as exc:
+                        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                            raise
+                        print(f"[kiln] {t_name}: result delivery failed for {jid} ({exc}); retrying")
+                        time.sleep(5)
+            finally:
+                with active_lock:
+                    active_tier = None
+                    attempt_id = None
     finally:
         stop.set()
         heartbeat_thread.join()
         client.close()
-        if worker.engine:
-            worker.engine.shutdown()
+        for w in workers.values():
+            if w.owner is None and w.engine:
+                w.engine.shutdown()

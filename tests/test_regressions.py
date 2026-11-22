@@ -1631,3 +1631,203 @@ def test_queue_supersede_and_max_inflight_per_agent(tmp_path, monkeypatch, capsy
         assert c2["force_trace"] is True
         r_over = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.05\n"})
         assert r_over.status_code == 429
+
+
+def test_remote_shared_mid_tier_with_lazy_slow_baseline(tmp_path, monkeypatch):
+    import json
+    import re
+    import threading
+    import httpx
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    from kiln.engine import mock as mock_mod
+    from kiln.server.app import create_app
+
+    traffic_path = tmp_path / "traffic.jsonl"
+    reqs = [Request([1, 2], 4), Request([3, 4], 4), Request([5, 6], 4)]
+    traffic_path.write_text("\n".join(json.dumps({"prompt_ids": r.prompt_ids, "output_len": r.output_len}) for r in reqs) + "\n")
+
+    # 1) Reject sharing across mismatched locality on coordinator
+    tiers = [
+        TierConfig(name="fast", max_requests=1, repeats=1, trace_kernels=False),
+        TierConfig(name="mid", share_engine="slow", max_requests=2, repeats=1, trace_kernels=False),
+        TierConfig(name="slow", lazy_baseline=True, repeats=1, trace_kernels=False),
+    ]
+    bad_run = RunConfig(name="bad_share", workdir=str(tmp_path / "bad"), traffic_file=str(traffic_path), tiers=tiers)
+    with pytest.raises(ValueError, match="cannot share engine"):
+        jobs.JobManager(bad_run, reqs, local_tiers={"fast", "mid"})
+
+    # 2) Valid remote shared topology: fast local, mid + slow remote sharing Node 1 engine
+    run = RunConfig(name="shared_remote", workdir=str(tmp_path / "run"), traffic_file=str(traffic_path), tiers=tiers)
+
+    starts: list[str] = []
+    shutdowns: list[str] = []
+    baseline_runs: list[str] = []
+    eval_order: list[tuple[str, str | None]] = []
+
+    class _SpyEngine(mock_mod.MockEngine):
+        def __init__(self, tier):
+            super().__init__(tier)
+            self._cur_candidate: str | None = None
+
+        def start(self):
+            if self.tier.name != "fast":
+                starts.append(self.tier.name)
+            super().start()
+
+        def hot_reload(self, candidate_path: str) -> None:
+            self._cur_candidate = candidate_path
+            super().hot_reload(candidate_path)
+
+        def teardown_candidate(self) -> None:
+            self._cur_candidate = None
+            super().teardown_candidate()
+
+        def shutdown(self):
+            if self.tier.name != "fast":
+                shutdowns.append(self.tier.name)
+            super().shutdown()
+
+        def measure(self, requests, repeats=1, trace=False, *, skip_prefill=False):
+            res = super().measure(requests, repeats=repeats, trace=trace, skip_prefill=skip_prefill)
+            if self.tier.name == "fast":
+                return res
+            if self._cur_candidate is None:
+                baseline_runs.append(f"{self.tier.name}:{len(requests)}")
+                return res
+            eval_order.append((f"n={len(requests)}", self._cur_candidate))
+            src = Path(self._cur_candidate).read_text()
+            m_len = re.search(r"ACCEPT_LEN\s*=\s*([0-9.]+)", src)
+            m_rate = re.search(r"ACCEPT_RATE\s*=\s*([0-9.]+)", src)
+            m_itl = re.search(r"ITL_P90\s*=\s*([0-9.]+)", src)
+            extra = dict(res.extra or {})
+            extra.update({
+                "output_tput": 1200.0,
+                "itl_p50_ms": 8.5,
+                "itl_p90_ms": float(m_itl.group(1)) if m_itl else 12.0,
+                "interactivity_p90": 83.3,
+                "spec_accept_length": float(m_len.group(1)) if m_len else 2.5,
+                "spec_accept_rate": float(m_rate.group(1)) if m_rate else 0.3,
+            })
+            return MeasureResult(
+                decode_tps=res.decode_tps,
+                prefill_tps=res.prefill_tps,
+                ttft_s=res.ttft_s,
+                runs_decode_tps=res.runs_decode_tps,
+                kernel_report=res.kernel_report,
+                trace_analysis=res.trace_analysis,
+                extra=extra,
+            )
+
+    monkeypatch.setattr(jobs, "make_engine", lambda cfg, tier: _SpyEngine(tier))
+    monkeypatch.setattr(jobs, "REMOTE_HEARTBEAT_S", 0.05)
+
+    app = create_app(run, local_tiers={"fast"})
+    mgr: jobs.JobManager = app.state.mgr
+    assert mgr.tiers["fast"].stats()["mode"] == "local"
+    assert mgr.tiers["mid"].stats()["mode"] == "remote:shared:slow"
+    assert mgr.tiers["slow"].stats()["mode"] == "remote"
+
+    class _StopWorker(Exception):
+        pass
+
+    phase = {"step": 1}
+    promoted: dict[str, str] = {}
+    claim_waits: list[tuple[str, float]] = []
+
+    class _ClientBridge:
+        def __init__(self, tc: TestClient, headers: dict | None = None):
+            self.tc = tc
+            self.headers = dict(headers or {})
+            self.empty_polls = 0
+            self.lock = threading.Lock()
+
+        def get(self, url, **kw):
+            kw.pop("timeout", None)
+            kw.setdefault("headers", self.headers)
+            with self.lock:
+                return self.tc.get(url, **kw)
+
+        def post(self, url, **kw):
+            kw.pop("timeout", None)
+            kw.setdefault("headers", self.headers)
+            if "/claim" in url and isinstance(kw.get("params"), dict) and "wait_s" in kw["params"]:
+                params = dict(kw["params"])
+                claim_waits.append((url.split("/workers/")[-1], float(params["wait_s"])))
+                params["wait_s"] = min(float(params["wait_s"]), 0.02)
+                kw["params"] = params
+            with self.lock:
+                resp = self.tc.post(url, **kw)
+            if url.endswith("/workers/slow/claim") and resp.status_code == 200 and resp.json().get("job") is None:
+                # Both mid and slow queues were checked empty
+                if phase["step"] == 1:
+                    assert mgr.tiers["slow"].baseline_tps is None
+                    assert len(baseline_runs) == 1 and baseline_runs[0] == "slow:2"
+                    # Queue slow promotion AND another mid candidate together -> mid must run first!
+                    j_slow = mgr.promote_job(j_mid1.id, target_tier="slow", note="promote winner")
+                    promoted["slow_id"] = j_slow.id
+                    j_mid2 = mgr.submit(
+                        "a1",
+                        "mid",
+                        "SPEEDUP = 1.25\nACCEPT_LEN = 3.2\nACCEPT_RATE = 0.44\nITL_P90 = 10.2\n",
+                        note="second mid",
+                    )
+                    promoted["mid2_id"] = j_mid2.id
+                    phase["step"] = 2
+                else:
+                    self.empty_polls += 1
+                    if self.empty_polls >= 2:
+                        raise _StopWorker()
+            return resp
+
+        def close(self):
+            return None
+
+    j_mid1 = mgr.submit(
+        "a1",
+        "mid",
+        "SPEEDUP = 1.15\nACCEPT_LEN = 2.8\nACCEPT_RATE = 0.36\nITL_P90 = 11.4\n",
+        note="first mid",
+    )
+
+    with TestClient(app, base_url="http://testserver") as tc:
+        assert mgr.tiers["fast"].ready.wait(timeout=5.0)
+        # Simulate worker node without local traffic.jsonl so it fetches /workers/{tier}/requests
+        worker_run = run.model_copy(update={"traffic_file": str(tmp_path / "remote_missing.jsonl")})
+        monkeypatch.setattr(httpx, "Client", lambda **kw: _ClientBridge(tc, headers=kw.get("headers")))
+        with pytest.raises(_StopWorker):
+            jobs.run_remote_worker(worker_run, "slow", "http://testserver")
+
+    # Single shared engine started and shut down cleanly once
+    assert starts == ["slow"]
+    assert shutdowns == ["slow"]
+    # mid polled with wait_s=0.0 before slow wait_s=2.0
+    assert ("mid/claim", 0.0) in claim_waits
+    assert ("slow/claim", 2.0) in claim_waits
+
+    # mid (n=2) ran BOTH mid jobs BEFORE slow (n=3) claimed its job, and slow lazy baseline ran ONCE only when slow claimed a job
+    assert len(baseline_runs) == 2
+    assert baseline_runs[0] == "slow:2"   # mid baseline on startup (max_requests=2)
+    assert baseline_runs[1] == "slow:3"   # slow lazy baseline deferred until slow job arrived (all 3 requests)
+    assert [n for n, _ in eval_order] == ["n=2", "n=2", "n=3"]
+
+    assert mgr.jobs[j_mid1.id].status == "done"
+    assert mgr.jobs[promoted["mid2_id"]].status == "done"
+    assert mgr.jobs[promoted["slow_id"]].status == "done"
+    assert mgr.tiers["slow"].baseline_tps is not None and mgr.tiers["slow"].baseline_tps > 0
+
+    lb = mgr.leaderboard(tier="mid", sort_by="spec_accept_rate")
+    assert [row["id"] for row in lb] == [promoted["mid2_id"], j_mid1.id]
+    assert lb[0]["spec_accept_rate"] == pytest.approx(0.44, rel=1e-4)
+    assert lb[0]["spec_accept_length"] == pytest.approx(3.2, rel=1e-4)
+    assert lb[0]["itl_p90_ms"] == pytest.approx(10.2, rel=1e-4)
+
+    # Verify formal 3-tier SGLang config parses cleanly
+    formal_cfg = Path(__file__).resolve().parents[1] / "configs" / "dsv41_flash_h20_sglang.yaml"
+    formal = RunConfig.load(str(formal_cfg))
+    assert [t.name for t in formal.tiers] == ["fast", "mid", "slow"]
+    fast_t, mid_t, slow_t = formal.tiers
+    assert fast_t.screen_repeats == 1 and fast_t.trace_policy == "on_improve" and fast_t.supersede_queued is True
+    assert mid_t.share_engine == "slow" and mid_t.max_requests == 16 and mid_t.supersede_queued is True
+    assert slow_t.lazy_baseline is True and slow_t.agentx is not None and slow_t.agentx["benchmark_duration_s"] == 900
+

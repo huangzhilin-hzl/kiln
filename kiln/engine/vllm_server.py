@@ -26,7 +26,14 @@ from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_p
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
-from .base import Engine, InvalidBenchmark, MeasureResult, bucket_tps_for_requests, shutdown_process_group
+from .base import (
+    Engine,
+    InvalidBenchmark,
+    MeasureResult,
+    build_server_replay_extra,
+    read_prometheus_metrics,
+    shutdown_process_group,
+)
 from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
 
@@ -139,18 +146,36 @@ class VLLMServerEngine(Engine):
         self._reset_cache()
 
     # ---------------------------------------------------------------- measure
-    def _complete_one(self, prompt_ids: list[int], max_tokens: int) -> int:
+    def _complete_one_stats(self, prompt_ids: list[int], max_tokens: int) -> tuple[int, float]:
+        t0 = time.perf_counter()
         r = self.http.post(f"{self.url}/v1/completions", json={
             "model": self.served_name, "prompt": prompt_ids, "max_tokens": max_tokens,
             "temperature": 0.0, "ignore_eos": True,
         })
+        dt = max(time.perf_counter() - t0, 1e-9)
         r.raise_for_status()
         body = r.json()
         usage = body.get("usage") or {}
         if "completion_tokens" in usage:
-            return int(usage["completion_tokens"])
+            return int(usage["completion_tokens"]), dt
         choices = body.get("choices") or [{}]
-        return len(choices[0].get("token_ids") or ()) or max_tokens
+        return (len(choices[0].get("token_ids") or ()) or max_tokens), dt
+
+    def _complete_one(self, prompt_ids: list[int], max_tokens: int) -> int:
+        return self._complete_one_stats(prompt_ids, max_tokens)[0]
+
+    def _read_spec_metrics(self) -> dict[str, float]:
+        return read_prometheus_metrics(
+            self.http,
+            self.url,
+            {
+                "spec_accept_length": (
+                    "vllm:spec_decode_mean_acceptance_length",
+                    "vllm:spec_decode_avg_acceptance_length",
+                ),
+                "spec_accept_rate": ("vllm:spec_decode_draft_acceptance_rate",),
+            },
+        )
 
     def _kernel_report(self, pool: concurrent.futures.ThreadPoolExecutor,
                        requests: list[Request]) -> tuple[str | None, dict | None]:
@@ -200,15 +225,21 @@ class VLLMServerEngine(Engine):
                 ttft_s = prefill_s / max(len(requests), 1)
 
             decode_runs = []
+            itl_samples: list[float] = []
             for _ in range(repeats):
                 t0 = time.perf_counter()
-                ntok = sum(pool.map(lambda r: self._complete_one(r.prompt_ids, r.output_len), requests))
+                batch_stats = list(pool.map(lambda r: self._complete_one_stats(r.prompt_ids, r.output_len), requests))
                 dt = max(time.perf_counter() - t0, 1e-9)
+                ntok = sum(tok for tok, _ in batch_stats)
                 decode_runs.append(ntok / dt)
+                for tok, req_dt in batch_stats:
+                    if tok > 0:
+                        itl_samples.append(1000.0 * req_dt / max(tok - 1, 1))
 
             report, trace_analysis = self._kernel_report(pool, requests) if trace else (None, None)
         decode_tps = sum(decode_runs) / len(decode_runs) if decode_runs else 0.0
-        buckets = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
+        spec_metrics = self._read_spec_metrics() if repeats > 0 else {}
+        extra = build_server_replay_extra(requests, decode_tps, prefill_tps, itl_samples, spec_metrics)
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
@@ -216,7 +247,7 @@ class VLLMServerEngine(Engine):
             runs_decode_tps=decode_runs,
             kernel_report=report,
             trace_analysis=trace_analysis,
-            extra=({"bucket_tps": buckets} if buckets else {}),
+            extra=extra,
         )
 
     def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:

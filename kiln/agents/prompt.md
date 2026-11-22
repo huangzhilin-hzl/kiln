@@ -20,15 +20,21 @@ real traffic) without changing outputs.
 - If `./refs/INDEX.md` exists, read it **first** to locate key classes and line numbers, and read only
   the needed line ranges (e.g. `sed -n 'START,ENDp' refs/...`) instead of loading entire >20KB source files.
 
-## Measuring (lock-free `micro` sandbox -> `fast` -> `slow`)
+## Measuring (lock-free `micro` sandbox -> `fast` -> `mid` -> `slow`)
 - **Pre-screen custom kernels without waiting on the engine lock**:
   `kiln micro forward.py --snapshot <tag>` runs in an isolated GPU subprocess against captured
   cold-boot layer snapshots (`kiln micro-snapshots`), checks `ptxas` register spills, optional `--ncu`
   HBM/bank-conflict counters, and padded-row `NaN` safety before entering the `fast` queue.
 - `kiln submit forward.py --tier fast --note "what you changed" --wait`
-  fast tier = few layers, quick feedback, baseline trace diff & roofline gap attribution.
-- `kiln submit forward.py --tier slow --note "..." --wait`
-  slow tier = full model, high fidelity. Only promote candidates that won on fast.
+  fast tier = quick non-DSPARK replay with two-stage screening and conditional kernel profiling
+  (`--trace` to force a profiler trace, `--supersede` to cancel older queued jobs from you).
+- `kiln submit forward.py --tier mid --note "..." --wait`
+  mid tier (if configured) = shared DSPARK server fast replay returning per-request `itl_p50_ms`,
+  `itl_p90_ms`, `interactivity_p90`, `output_tput`, `spec_accept_length`, and `spec_accept_rate`
+  without the full AgentX duration; check rankings with `kiln leaderboard --tier mid --sort spec_accept_rate`
+  or `--sort itl_p90_ms`.
+- `kiln promote <mid_job_id> --to-tier slow --note "..."` (or `kiln submit forward.py --tier slow --note "..." --wait`)
+  slow tier = full AgentX + DSPARK verification. Only promote clear `fast`/`mid` winners to `slow`.
 - `kiln status` shows each tier's queue depth and median job time. Pick the less-loaded tier when sensible.
 - `kiln hw` (or `HARDWARE.md` / `hw_profile.json` if present) shows measured HBM/GEMM/MoE/NCCL roofline ceilings for this node.
 - A job is rejected as `incorrect` if greedy outputs or logprobs diverge from baseline.

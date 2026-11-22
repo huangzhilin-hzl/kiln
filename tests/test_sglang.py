@@ -394,6 +394,114 @@ def test_sglang_offline_engine_full_lifecycle(tmp_path: Path, monkeypatch):
     assert "shutdown" in profile_events
 
 
+def test_sglang_server_replay_itl_and_spec_metrics(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    state = {"mode": "meta_info", "accept_len": 3.0, "accept_rate": 0.4}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0") or 0)
+            body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            if self.path == "/flush_cache":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+                return
+            if self.path != "/generate":
+                self.send_response(404)
+                self.end_headers()
+                return
+            sp = body.get("sampling_params") or {}
+            max_tok = int(sp.get("max_new_tokens") or 8)
+            meta = {"completion_tokens": max_tok, "prompt_tokens": len(body.get("input_ids") or [])}
+            if state["mode"] == "meta_info":
+                # 12 completion tokens with 4 verify steps => accept_length = 3.0; gamma = 5 => (12 - 4) / (4 * 5) = 0.4
+                meta["completion_tokens"] = 12
+                meta["spec_verify_ct"] = 4
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                steps = 4
+                for i in range(1, steps + 1):
+                    time.sleep(0.004)
+                    cur_toks = max(1, (meta["completion_tokens"] * i) // steps)
+                    chunk_meta = dict(meta) if i == steps else {"completion_tokens": cur_toks}
+                    payload = {"text": "x" * cur_toks, "output_ids": [1] * cur_toks, "meta_info": chunk_meta}
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            payload = {"text": "ok", "output_ids": [1] * meta["completion_tokens"], "meta_info": meta}
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if self.path == "/metrics":
+                txt = (
+                    f'sglang:spec_accept_length{{engine="0"}} {state["accept_len"]}\n'
+                    f'sglang:spec_accept_rate{{engine="0"}} {state["accept_rate"]}\n'
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(txt)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    tier = TierConfig(
+        name="mid",
+        engine_kind="sglang_server",
+        port=port,
+        repeats=1,
+        trace_kernels=False,
+        engine_overrides={
+            "speculative_algorithm": "DSPARK",
+            "speculative_dspark_block_size": 5,
+        },
+    )
+    eng = SGLangServerEngine(EngineConfig(kind="sglang_server"), tier)
+    reqs = [Request([10, 11, 12], 12), Request([20, 21, 22, 23], 12)]
+    try:
+        res1 = eng.measure_requests(reqs, repeats=1, trace=False)
+        assert res1.decode_tps > 0 and res1.prefill_tps > 0
+        assert res1.extra["output_tput"] > 0
+        assert res1.extra["itl_p50_ms"] > 0
+        assert res1.extra["itl_p90_ms"] >= res1.extra["itl_p50_ms"]
+        assert res1.extra["interactivity_p90"] > 0
+        assert res1.extra["spec_accept_length"] == pytest.approx(3.0, rel=1e-4)
+        assert res1.extra["spec_accept_rate"] == pytest.approx(0.4, rel=1e-4)
+
+        state["mode"] = "prometheus"
+        state["accept_len"] = 3.45
+        state["accept_rate"] = 0.49
+        res2 = eng.measure_requests(reqs, repeats=1, trace=False)
+        assert res2.extra["spec_accept_length"] == pytest.approx(3.45, rel=1e-4)
+        assert res2.extra["spec_accept_rate"] == pytest.approx(0.49, rel=1e-4)
+        assert res2.extra["itl_p90_ms"] > 0
+    finally:
+        eng.http.close()
+        srv.shutdown()
+        srv.server_close()
+        t.join(timeout=2)
+
+
 def test_sglang_server_engine_http_and_agentx(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     seen_rpc: list[dict] = []

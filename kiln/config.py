@@ -24,7 +24,7 @@ EngineKind = Literal[
 
 
 class TierConfig(BaseModel):
-    name: Literal["fast", "slow"]
+    name: Literal["fast", "mid", "slow"]
     # Number of decoder layers kept in this tier's engine (None = all layers).
     num_layers: int | None = None
     gpus: list[int] = Field(default_factory=list)
@@ -49,6 +49,7 @@ class TierConfig(BaseModel):
     screen_min_speedup: float = Field(default=1.0, gt=0.0)
     screen_top_k: int | None = Field(default=None, ge=1)
     trace_policy: Literal["always", "on_improve", "never"] = "always"
+    lazy_baseline: bool = False
 
     @model_validator(mode="after")
     def _validate_screening(self) -> "TierConfig":

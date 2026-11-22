@@ -1,0 +1,18 @@
+kiln/engine/pd_router.py
+  h_7339bf36ecd0bc 1-342
+kiln/engine/sglang_pd.py
+  h_7339bf36ecd0bc 254-266,274,277,279-280,282-285,447-451,454
+tests/test_sglang_pd.py
+  h_7339bf36ecd0bc 235-321
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cebc06b36452814395098ed612cf8d125451a89c",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

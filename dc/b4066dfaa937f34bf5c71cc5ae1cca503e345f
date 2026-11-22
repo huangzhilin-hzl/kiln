@@ -1,0 +1,22 @@
+README.md
+  h_7339bf36ecd0bc 63,110,112-123
+kiln/agents/prompt.md
+  h_7339bf36ecd0bc 10,13-15,54-55
+kiln/cli.py
+  h_7339bf36ecd0bc 547,565-568,573-605,848,855-858
+kiln/costmodel/model.py
+  h_7339bf36ecd0bc 346-491
+tests/test_probe.py
+  h_7339bf36ecd0bc 196-255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dcb4066dfaa937f34bf5c71cc5ae1cca503e345f",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

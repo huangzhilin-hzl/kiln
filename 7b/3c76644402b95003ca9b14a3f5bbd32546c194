@@ -1,0 +1,30 @@
+kiln/cli.py
+  h_7339bf36ecd0bc 266-280,291,293-294,296-301,353-354,701-704,721,741
+kiln/config.py
+  h_7339bf36ecd0bc 4,26-29,32-34,67-82,375-383
+kiln/engine/base.py
+  h_7339bf36ecd0bc 70,77
+kiln/engine/mock.py
+  h_7339bf36ecd0bc 8,37-46,84-85,92-93,94,101-102,103,111,129-130
+kiln/engine/sglang_offline.py
+  h_7339bf36ecd0bc 138-143,227,230-239,243-245,247-250,252-253,254,296-298,310
+kiln/engine/sglang_server.py
+  h_7339bf36ecd0bc 207-212,325-330,340,369,372-383,387-389,391-394,396-397,399
+kiln/server/app.py
+  h_7339bf36ecd0bc 35,37-43,208-214,223-231
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 37,178,180,230-245,429,639-644,647-650,668,697,717-718,1186,1324,1518-1537,1546,1558-1566
+tests/test_pd_tiers.py
+  h_7339bf36ecd0bc 1-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7b3c76644402b95003ca9b14a3f5bbd32546c194",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

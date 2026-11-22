@@ -31,8 +31,16 @@ ROLE_PROMPTS: dict[str, str] = {
         "via ablation, catching numerical drift across widths, and withdrawing/reporting invalid candidates."
     ),
     "integrator": (
-        "Focus on pulling verified winning candidates via `kiln pull <job_id>` and `kiln diff <a> <b>`, "
-        "combining orthogonal wins cleanly into one unified `forward.py`, and checking stacked end-to-end speedups."
+        "Focus on pulling verified winning candidates via `kiln checkout <job_id>` / `kiln pull <job_id>` and "
+        "`kiln diff [id_a] <id_b>`, inspecting `kiln archive --tier fast` for orthogonal stepping stones, "
+        "combining orthogonal wins cleanly via `kiln merge <id_a> <id_b> -o forward.py`, and checking stacked end-to-end speedups."
+    ),
+    "synthesizer": (
+        "Dedicated Synthesizer / Ensembler slot: continuously monitor `kiln archive --tier fast` and `kiln board` "
+        "for orthogonal stepping stones across regimes (`M<=48`, `65..256`, `M>512`) and submodule tags "
+        "(`mhc`, `gemv`, `moe_router`, `mla_rope`). Synthesize combined candidates via "
+        "`kiln merge <id_a> <id_b> -o forward.py` (or `@kiln_patch` composition), resolve any target overlaps, "
+        "verify stacked speedups on `fast`, and promote verified composite winners to `slow`."
     ),
 }
 

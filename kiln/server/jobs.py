@@ -26,6 +26,17 @@ from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
 from kiln.engine import Engine, make_engine
 from kiln.engine.base import InvalidBenchmark, MeasureResult
+from kiln.engine.vllm_profiler import (
+    TraceAnalysis,
+    compute_roofline_attribution,
+    diff_traces,
+    format_trace_report,
+)
+from kiln.patches import (
+    compose_candidates,
+    detect_candidate_conflicts,
+    inspect_candidate_source,
+)
 
 
 def _sha256_text(text: str) -> str:
@@ -56,6 +67,9 @@ class Job:
     invalidated_reason: str | None = None
     baseline_tps: float | None = None
     engine_boot_id: str | None = None
+    parent_id: str | None = None
+    parent_ids: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
     worker_id: str | None = None
     attempt_id: str | None = None
     lease_expires_at: float | None = None
@@ -151,6 +165,10 @@ class TierWorker:
         self.owner: TierWorker | None = None
         self.engine_lock = threading.RLock()
         self.baseline_tps: float | None = None
+        self.baseline_prefill_tps: float | None = None
+        self.baseline_bucket_tps: dict[str, float] = {}
+        self.baseline_trace: TraceAnalysis | None = None
+        self.hw_profile = None
         self.baseline_extra: dict = {}
         self.baseline_tokens: list[list[int]] | None = None
         self.baseline_logprobs: list[list[dict[int, float]]] | None = None
@@ -162,6 +180,18 @@ class TierWorker:
         self.boot_error: str | None = None
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._loop, name=f"tier-{tier.name}", daemon=True)
+
+    def _ensure_hw_profile(self) -> None:
+        if self.hw_profile is not None:
+            return
+        try:
+            hw_path = self.run.resolve_hw_profile()
+            if hw_path is not None:
+                from kiln.costmodel.probe import HardwareProfile
+
+                self.hw_profile = HardwareProfile.load(hw_path)
+        except Exception as exc:
+            print(f"[kiln] {self.tier.name}: failed loading hw_profile ({exc})")
 
     # ------------------------------------------------------------------ engine
     def _ensure_own_engine(self) -> None:
@@ -188,6 +218,7 @@ class TierWorker:
     def _boot(self) -> None:
         with self.engine_lock:
             self.ready.clear()
+            self._ensure_hw_profile()
             if self.owner is None:
                 self._ensure_own_engine()
                 self.boot_id = uuid.uuid4().hex[:8]
@@ -203,15 +234,34 @@ class TierWorker:
                 tokens, logprobs = self.engine.greedy_probe(probe, cc.max_new_tokens)
                 if not probe or len(tokens) != len(probe) or not all(tokens):
                     raise RuntimeError("Baseline returned incomplete correctness outputs")
-                base = self.engine.measure(self.requests, self.tier.repeats, trace=False)
+                base = self.engine.measure(self.requests, self.tier.repeats, trace=self.tier.trace_kernels)
                 if not math.isfinite(base.decode_tps) or base.decode_tps <= 0:
                     raise RuntimeError("Baseline throughput must be finite and positive")
                 self.baseline_tokens = tokens
                 self.baseline_logprobs = logprobs
                 self.baseline_tps = base.decode_tps
+                self.baseline_prefill_tps = base.prefill_tps
                 self.baseline_extra = dict(base.extra or {})
+                self.baseline_bucket_tps = {
+                    str(k): float(v)
+                    for k, v in (self.baseline_extra.get("bucket_tps") or {}).items()
+                    if isinstance(v, (int, float)) and v > 0
+                }
+                if base.trace_analysis:
+                    self.baseline_trace = TraceAnalysis.from_dict(base.trace_analysis)
                 print(f"[kiln] {self.tier.name}: baseline decode {base.decode_tps:.1f} tok/s "
                       f"(variance {base.variance_pct:.2f}%)")
+            snap_dir = self.jobs_dir.parent / "micro_snapshots"
+            if (
+                self.run.micro.enabled
+                and self.run.micro.capture_on_boot
+                and self.owner is None
+                and not (snap_dir / "manifest.json").exists()
+            ):
+                try:
+                    self.engine.capture_snapshots(str(snap_dir), list(self.run.micro.m_buckets))
+                except Exception as exc:
+                    print(f"[kiln] {self.tier.name}: cold-boot snapshot capture skipped ({exc})")
             self.boot_error = None
             self.ready.set()
 
@@ -411,8 +461,45 @@ class TierWorker:
                 paired = compare_agentx_paired(self.baseline_extra["export"], extra["export"])
                 if paired is not None:
                     extra["paired"] = paired
+
+            bucket_tps = extra.get("bucket_tps")
+            if isinstance(bucket_tps, dict):
+                bucket_speedups: dict[str, float] = {}
+                for bkey, bval in bucket_tps.items():
+                    if not isinstance(bval, (int, float)) or bval <= 0:
+                        continue
+                    base_b = self.baseline_bucket_tps.get(bkey)
+                    if base_b is None and bkey == "prefill_large":
+                        base_b = self.baseline_prefill_tps
+                    elif base_b is None and bkey in ("decode_small", "decode_mid"):
+                        base_b = self.baseline_tps
+                    if base_b and base_b > 0:
+                        bucket_speedups[str(bkey)] = round(float(bval) / float(base_b), 4)
+                if bucket_speedups:
+                    extra["bucket_speedups"] = bucket_speedups
+
+            cand_trace = TraceAnalysis.from_dict(m.trace_analysis) if m.trace_analysis else None
+            if cand_trace is not None:
+                extra["trace_diff"] = diff_traces(cand_trace, self.baseline_trace)
+            rf = compute_roofline_attribution(
+                cand_trace,
+                self.hw_profile,
+                model_name=self.run.engine.model,
+                tp_size=self.run.engine.tensor_parallel_size,
+                decode_tps=m.decode_tps,
+                prefill_tps=m.prefill_tps,
+                batch_size=len(self.requests),
+            )
+            if rf is not None:
+                extra["roofline"] = rf
+
             job.decode_tps, job.prefill_tps = m.decode_tps, m.prefill_tps
-            job.variance_pct, job.kernel_report = m.variance_pct, m.kernel_report
+            job.variance_pct = m.variance_pct
+            job.kernel_report = (
+                format_trace_report(cand_trace, self.baseline_trace, rf)
+                if cand_trace is not None
+                else m.kernel_report
+            )
             job.extra = extra
             job.speedup = m.decode_tps / self.baseline_tps
         finally:
@@ -518,10 +605,34 @@ class JobManager:
             if w.local:
                 w.thread.start()
 
-    def submit(self, agent: str, tier: str, source: str, note: str = "") -> Job:
+    def submit(
+        self,
+        agent: str,
+        tier: str,
+        source: str,
+        note: str = "",
+        parent_id: str | None = None,
+        parent_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> Job:
         if tier not in self.tiers:
             raise KeyError(f"unknown tier {tier}; have {list(self.tiers)}")
         src_sha = _sha256_text(source)
+        inspected = inspect_candidate_source(source)
+
+        merged_parents: list[str] = []
+        for pid in ([parent_id] if parent_id else []) + list(parent_ids or ()) + list(inspected.get("parents") or ()):
+            p_clean = str(pid).strip() if pid else ""
+            if p_clean and p_clean not in merged_parents:
+                merged_parents.append(p_clean)
+        resolved_parent_id = merged_parents[0] if merged_parents else None
+
+        merged_tags: list[str] = []
+        for t in list(tags or ()) + list(inspected.get("tags") or ()):
+            t_clean = str(t).strip() if t else ""
+            if t_clean and t_clean not in merged_tags:
+                merged_tags.append(t_clean)
+
         tier_cfg = self.tiers[tier].tier
         with self.lock:
             if tier_cfg.max_queued_per_agent is not None:
@@ -554,6 +665,9 @@ class JobManager:
             job = Job(
                 id=jid, agent=agent, tier=tier, note=note,
                 candidate_path=str(path), source_sha256=src_sha,
+                parent_id=resolved_parent_id,
+                parent_ids=merged_parents,
+                tags=merged_tags,
             )
             self.tiers[tier].submit(job)
             self.jobs[jid] = job
@@ -569,6 +683,9 @@ class JobManager:
                 "tier": job.tier,
                 "agent": job.agent,
                 "source_sha256": job.source_sha256,
+                "parent_id": job.parent_id,
+                "parent_ids": list(job.parent_ids),
+                "tags": list(job.tags),
                 "source": source,
             }
 
@@ -784,12 +901,16 @@ class JobManager:
             source = Path(orig.candidate_path).read_text()
             who = agent or orig.agent
             desc = note.strip() or f"Promote {orig.tier} job {orig.id}: {orig.note}".strip()
-        return self.submit(who, target_tier, source, desc)
+            tags = list(orig.tags)
+        return self.submit(who, target_tier, source, desc, parent_id=orig.id, parent_ids=[orig.id], tags=tags)
 
     _LEADERBOARD_SORTS = {
         "speedup",
         "decode_tps",
         "prefill_tps",
+        "decode_small",
+        "decode_mid",
+        "prefill_large",
         "output_tput",
         "active_decode_tps",
         "itl_p50_ms",
@@ -806,6 +927,11 @@ class JobManager:
             return j.decode_tps
         if key == "prefill_tps":
             return j.prefill_tps
+        if key in ("decode_small", "decode_mid", "prefill_large"):
+            bs = j.extra.get("bucket_speedups") if isinstance(j.extra, dict) else None
+            if isinstance(bs, dict) and isinstance(bs.get(key), (int, float)):
+                return float(bs[key])
+            return None
         if key == "paired_speedup":
             paired = j.extra.get("paired") if isinstance(j.extra, dict) else None
             return paired.get("decode_duration_speedup") if isinstance(paired, dict) else None
@@ -841,6 +967,12 @@ class JobManager:
         paired = ex.get("paired")
         if isinstance(paired, dict) and isinstance(paired.get("decode_duration_speedup"), (int, float)):
             row["paired_decode_speedup"] = round(float(paired["decode_duration_speedup"]), 4)
+        bs = ex.get("bucket_speedups")
+        if isinstance(bs, dict) and bs:
+            row["bucket_speedups"] = {str(k): round(float(v), 4) for k, v in bs.items() if isinstance(v, (int, float))}
+        rf = ex.get("roofline")
+        if isinstance(rf, dict) and rf.get("bottleneck_flags"):
+            row["roofline_flags"] = list(rf["bottleneck_flags"])
         return row
 
     @classmethod
@@ -850,6 +982,9 @@ class JobManager:
             "id": j.id,
             "agent": j.agent,
             "variance_pct": round(j.variance_pct or 0, 2),
+            "parent_id": j.parent_id,
+            "parent_ids": list(j.parent_ids),
+            "tags": list(j.tags),
             "note": j.note,
             **metrics,
         }
@@ -878,6 +1013,9 @@ class JobManager:
                     "tier": j.tier,
                     "agent": j.agent,
                     "status": j.status,
+                    "parent_id": j.parent_id,
+                    "parent_ids": list(j.parent_ids),
+                    "tags": list(j.tags),
                     **self._job_metrics(j),
                     "baseline_tps": round(j.baseline_tps, 2) if j.baseline_tps is not None else None,
                     "engine_boot_id": j.engine_boot_id,
@@ -888,16 +1026,21 @@ class JobManager:
                 })
             return out
 
+    def _valid_done_jobs_locked(self, tier: str) -> list[Job]:
+        return [
+            j for j in self.jobs.values()
+            if j.tier == tier and j.status == "done"
+            and (j.extra.get("metric") != "agentx_total_tput_per_gpu" or
+                 ((j.extra.get("submission_valid") is True or j.extra.get("unsafe_override") is True)
+                  and j.extra.get("repeats")))
+        ]
+
     def leaderboard(self, tier: str = "slow", k: int = 10, sort_by: str = "speedup") -> list[dict]:
         if sort_by not in self._LEADERBOARD_SORTS:
             raise ValueError(f"unsupported sort_by {sort_by!r}; choose from {sorted(self._LEADERBOARD_SORTS)}")
         asc = sort_by in ("itl_p50_ms", "itl_p90_ms")
         with self.lock:
-            done = [j for j in self.jobs.values()
-                    if j.tier == tier and j.status == "done"
-                    and (j.extra.get("metric") != "agentx_total_tput_per_gpu" or
-                         ((j.extra.get("submission_valid") is True or j.extra.get("unsafe_override") is True)
-                          and j.extra.get("repeats")))]
+            done = self._valid_done_jobs_locked(tier)
 
             def _sort_key(j: Job) -> tuple[int, float]:
                 val = self._leaderboard_metric(j, sort_by)
@@ -907,6 +1050,206 @@ class JobManager:
 
             done.sort(key=_sort_key)
             return [self._leaderboard_row(j) for j in done[:k]]
+
+    @staticmethod
+    def _parents_of(j: Job) -> list[str]:
+        out = list(j.parent_ids)
+        if j.parent_id and j.parent_id not in out:
+            out.insert(0, j.parent_id)
+        return out
+
+    def get_lineage(self, jid: str) -> dict:
+        """Return ancestor chain, direct children, and lineage depth for `jid`."""
+        with self.lock:
+            root = self.jobs[jid]
+            ancestors: list[dict] = []
+            visited: set[str] = {jid}
+            frontier: list[tuple[str, int]] = [(pid, 1) for pid in self._parents_of(root)]
+            max_depth = 0
+            while frontier:
+                pid, dist = frontier.pop(0)
+                if pid in visited:
+                    continue
+                visited.add(pid)
+                max_depth = max(max_depth, dist)
+                pjob = self.jobs.get(pid)
+                if pjob is None:
+                    ancestors.append({"id": pid, "missing": True, "distance": dist})
+                    continue
+                ancestors.append({
+                    **self._leaderboard_row(pjob),
+                    "tier": pjob.tier,
+                    "status": pjob.status,
+                    "distance": dist,
+                })
+                for gp in self._parents_of(pjob):
+                    if gp not in visited:
+                        frontier.append((gp, dist + 1))
+
+            children = [
+                {
+                    **self._leaderboard_row(other),
+                    "tier": other.tier,
+                    "status": other.status,
+                }
+                for other in sorted(self.jobs.values(), key=lambda x: (x.submitted_at, x.id))
+                if other.id != jid and jid in self._parents_of(other)
+            ]
+            return {
+                "job": {
+                    **self._leaderboard_row(root),
+                    "tier": root.tier,
+                    "status": root.status,
+                },
+                "depth": max_depth,
+                "ancestors": ancestors,
+                "children": children,
+            }
+
+    def archive(self, tier: str = "fast", k: int = 3) -> dict:
+        """Build ShinkaEvolve-style multi-island archive & conflict-free orthogonal merge suggestions."""
+        k = max(1, int(k))
+        regime_labels = {
+            "decode_small": "M<=48",
+            "decode_mid": "M=65..256",
+            "prefill_large": "M>512",
+        }
+        with self.lock:
+            done = self._valid_done_jobs_locked(tier)
+
+            def _top_by(pool: list[Job], metric_key: str) -> list[Job]:
+                scored: list[tuple[float, Job]] = []
+                for j in pool:
+                    val = self._leaderboard_metric(j, metric_key)
+                    if val is not None and math.isfinite(val):
+                        scored.append((float(val), j))
+                scored.sort(key=lambda item: (item[0], item[1].submitted_at), reverse=True)
+                return [j for _, j in scored[:k]]
+
+            overall_jobs = _top_by(done, "speedup")
+            overall_rows = [self._leaderboard_row(j) for j in overall_jobs]
+
+            regimes: dict[str, dict] = {}
+            island_leaders: dict[str, list[str]] = {}
+            job_by_id: dict[str, Job] = {j.id: j for j in done}
+
+            if overall_jobs:
+                island_leaders.setdefault(overall_jobs[0].id, []).append("overall")
+
+            for rkey, rlabel in regime_labels.items():
+                top_r = _top_by(done, rkey)
+                if top_r:
+                    island_leaders.setdefault(top_r[0].id, []).append(f"regime:{rkey}")
+                regimes[rkey] = {
+                    "label": rlabel,
+                    "top": [self._leaderboard_row(j) for j in top_r],
+                }
+
+            all_tags = sorted({t for j in done for t in j.tags})
+            submodules: dict[str, list[dict]] = {}
+            for tag in all_tags:
+                pool = [j for j in done if tag in j.tags]
+                top_t = _top_by(pool, "speedup")
+                if top_t:
+                    island_leaders.setdefault(top_t[0].id, []).append(f"submodule:{tag}")
+                submodules[tag] = [self._leaderboard_row(j) for j in top_t]
+
+            stepping_stones: list[dict] = []
+            stone_jobs: list[Job] = []
+            for jid, islands in island_leaders.items():
+                j = job_by_id[jid]
+                stone_jobs.append(j)
+                stepping_stones.append({
+                    **self._leaderboard_row(j),
+                    "islands": islands,
+                })
+            stepping_stones.sort(key=lambda r: (len(r["islands"]), r.get("speedup") or 0.0), reverse=True)
+
+            # Inspect stepping stones (and overall leaders) for conflict-free orthogonal merge pairs.
+            inspect_pool: list[Job] = []
+            seen_pool: set[str] = set()
+            for j in [*stone_jobs, *overall_jobs]:
+                if j.id not in seen_pool:
+                    seen_pool.add(j.id)
+                    inspect_pool.append(j)
+                if len(inspect_pool) >= 12:
+                    break
+
+            inspected_map: dict[str, dict] = {}
+            for j in inspect_pool:
+                try:
+                    src = Path(j.candidate_path).read_text()
+                    info = inspect_candidate_source(src)
+                    if info.get("syntax_ok"):
+                        inspected_map[j.id] = info
+                except OSError:
+                    continue
+
+            suggestions: list[dict] = []
+            for i in range(len(inspect_pool)):
+                ja = inspect_pool[i]
+                if ja.id not in inspected_map:
+                    continue
+                for idx_b in range(i + 1, len(inspect_pool)):
+                    jb = inspect_pool[idx_b]
+                    if jb.id not in inspected_map:
+                        continue
+                    if ja.id in self._parents_of(jb) or jb.id in self._parents_of(ja):
+                        continue
+                    if ja.source_sha256 and ja.source_sha256 == jb.source_sha256:
+                        continue
+                    conflicts = detect_candidate_conflicts([
+                        (ja.id, inspected_map[ja.id]),
+                        (jb.id, inspected_map[jb.id]),
+                    ])
+                    if conflicts:
+                        continue
+                    islands_a = set(island_leaders.get(ja.id, ()))
+                    islands_b = set(island_leaders.get(jb.id, ()))
+                    tags_a = set(ja.tags)
+                    tags_b = set(jb.tags)
+                    # Prefer pairs covering distinct submodules or distinct regimes
+                    distinct_tags = (tags_a != tags_b) and bool(tags_a or tags_b)
+                    distinct_islands = bool(islands_a - islands_b) and bool(islands_b - islands_a)
+                    if not (distinct_tags or distinct_islands):
+                        continue
+                    sp_a = float(ja.speedup or 1.0)
+                    sp_b = float(jb.speedup or 1.0)
+                    # Estimate upside using best metric across regimes if one specializes in a regime
+                    best_a = max([sp_a, *[float(v) for v in ((ja.extra or {}).get("bucket_speedups") or {}).values()]])
+                    best_b = max([sp_b, *[float(v) for v in ((jb.extra or {}).get("bucket_speedups") or {}).values()]])
+                    suggestions.append({
+                        "job_ids": [ja.id, jb.id],
+                        "tags_a": list(ja.tags),
+                        "tags_b": list(jb.tags),
+                        "islands_a": sorted(islands_a),
+                        "islands_b": sorted(islands_b),
+                        "est_combined_speedup": round(sp_a * sp_b, 4),
+                        "est_regime_upside": round(best_a * best_b, 4),
+                    })
+
+            suggestions.sort(
+                key=lambda s: (s["est_regime_upside"], s["est_combined_speedup"]),
+                reverse=True,
+            )
+            return {
+                "tier": tier,
+                "total_done": len(done),
+                "overall": overall_rows,
+                "regimes": regimes,
+                "submodules": submodules,
+                "stepping_stones": stepping_stones,
+                "merge_suggestions": suggestions[:k],
+            }
+
+    def compose_jobs(self, job_ids: list[str], allow_target_overlap: bool = False) -> dict:
+        """Synthesize a merged orthogonal candidate module from existing `job_ids`."""
+        with self.lock:
+            items: list[tuple[str, str]] = []
+            for jid in job_ids:
+                job = self.jobs[jid]
+                items.append((job.id, Path(job.candidate_path).read_text()))
+        return compose_candidates(items, allow_target_overlap=allow_target_overlap)
 
 
 def run_remote_worker(run: RunConfig, tier_name: str, server_url: str) -> None:

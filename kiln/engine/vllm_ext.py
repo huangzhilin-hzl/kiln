@@ -38,6 +38,7 @@ class HotReloadExt:
     _kiln_patched: list | None = None
     _kiln_module: types.ModuleType | None = None
     _kiln_dirty: bool = False
+    _kiln_snapshot_collector: object | None = None
 
     # ------------------------------------------------------------------ public RPCs
     def kiln_hot_reload(self, path: str) -> float:
@@ -103,6 +104,34 @@ class HotReloadExt:
             "has_speculator": r.speculator is not None,
             "num_graphs": len(getattr(r.cudagraph_manager, "graphs", {}) or {}),
         }
+
+    def kiln_enable_snapshot_capture(self, snapshot_dir: str, m_buckets=None, max_snapshot_mb: float = 64.0) -> dict:
+        import json as _json
+        from kiln.micro.snapshots import DEFAULT_M_BUCKETS, SnapshotCollector
+
+        rank = getattr(self, "rank", 0)
+        if rank not in (0, None):
+            return {"rank": rank, "skipped": True}
+        if self._kiln_snapshot_collector is not None:
+            self._kiln_snapshot_collector.close()
+        if isinstance(m_buckets, str):
+            buckets = [int(x) for x in _json.loads(m_buckets)]
+        elif m_buckets is not None:
+            buckets = [int(x) for x in m_buckets]
+        else:
+            buckets = list(DEFAULT_M_BUCKETS)
+        model = self.model_runner.get_model()
+        collector = SnapshotCollector(snapshot_dir, m_buckets=buckets, max_snapshot_mb=float(max_snapshot_mb))
+        attached = collector.attach(model)
+        self._kiln_snapshot_collector = collector
+        return {"rank": 0, "attached": attached}
+
+    def kiln_finish_snapshot_capture(self) -> dict:
+        collector = self._kiln_snapshot_collector
+        self._kiln_snapshot_collector = None
+        if collector is None:
+            return {"snapshots": []}
+        return collector.close()
 
     # ------------------------------------------------------------------ internals
     def _kiln_release_graphs(self) -> None:

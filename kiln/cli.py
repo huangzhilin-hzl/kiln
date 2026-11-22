@@ -49,22 +49,78 @@ def cmd_worker(a):
     run_remote_worker(run, tier_name=a.tier, server_url=server)
 
 
+def _read_checkout_lineage(file_path: str) -> list[str]:
+    from pathlib import Path
+
+    p = Path(file_path).resolve()
+    meta_path = p.parent / ".kiln_checkout.json"
+    if not meta_path.is_file():
+        return []
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        tgt = data.get("target")
+        if tgt and Path(tgt).resolve() != p and Path(tgt).name != p.name:
+            return []
+        pids = data.get("parent_ids")
+        if isinstance(pids, list):
+            return [str(x).strip() for x in pids if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _write_checkout_meta(out_path, parent_ids: list[str], sha256: str | None = None, tags: list[str] | None = None) -> None:
+    from pathlib import Path
+
+    out = Path(out_path)
+    meta_path = out.parent / ".kiln_checkout.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "parent_ids": list(parent_ids),
+                "target": str(out.resolve()),
+                "sha256": sha256,
+                "tags": list(tags or ()),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _wait_for_job(jid: str) -> dict:
+    while True:
+        j = http.get(f"{_url()}/jobs/{jid}").json()
+        if j["status"] not in ("queued", "running"):
+            j.pop("candidate_path", None)
+            return j
+        time.sleep(2)
+
+
 def cmd_submit(a):
     src = open(a.file).read()
-    r = http.post(f"{_url()}/jobs", json={"agent": _agent(a), "tier": a.tier,
-                                           "source": src, "note": a.note})
+    if a.tier == "micro":
+        r = http.post(f"{_url()}/micro", json={"agent": _agent(a), "source": src, "note": a.note})
+        r.raise_for_status()
+        _print(r.json())
+        return
+    parent_ids = [x.strip() for x in (a.parent or "").split(",") if x.strip()]
+    if not parent_ids:
+        parent_ids = _read_checkout_lineage(a.file)
+    tags = [x.strip() for x in (a.tags or "").split(",") if x.strip()]
+    payload: dict = {"agent": _agent(a), "tier": a.tier, "source": src, "note": a.note}
+    if parent_ids:
+        payload["parent_id"] = parent_ids[0]
+        payload["parent_ids"] = parent_ids
+    if tags:
+        payload["tags"] = tags
+    r = http.post(f"{_url()}/jobs", json=payload)
     r.raise_for_status()
     jid = r.json()["id"]
     if not a.wait:
         _print(r.json())
         return
-    while True:
-        j = http.get(f"{_url()}/jobs/{jid}").json()
-        if j["status"] not in ("queued", "running"):
-            j.pop("candidate_path", None)
-            _print(j)
-            return
-        time.sleep(2)
+    _print(_wait_for_job(jid))
 
 
 def cmd_job(a):
@@ -122,19 +178,166 @@ def cmd_pull(a):
         print(data["source"], end="" if data["source"].endswith("\n") else "\n")
 
 
+def cmd_checkout(a):
+    from pathlib import Path
+
+    r = http.get(f"{_url()}/jobs/{a.id}/source")
+    r.raise_for_status()
+    data = r.json()
+    out = Path(a.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(data["source"], encoding="utf-8")
+    _write_checkout_meta(out, [a.id], sha256=data.get("source_sha256"), tags=data.get("tags"))
+    _print({
+        "id": data["id"],
+        "tier": data["tier"],
+        "agent": data["agent"],
+        "tags": data.get("tags", []),
+        "parent_ids": [a.id],
+        "saved": str(out),
+    })
+
+
 def cmd_diff(a):
     import difflib
-    ra = http.get(f"{_url()}/jobs/{a.id_a}/source")
+
+    id_a = a.id_a
+    id_b = a.id_b
+    if id_b is None:
+        rj = http.get(f"{_url()}/jobs/{id_a}")
+        rj.raise_for_status()
+        meta = rj.json()
+        parent = meta.get("parent_id") or (meta.get("parent_ids") or [None])[0]
+        if not parent:
+            raise SystemExit(f"Job {id_a} has no parent_id; provide two job IDs (`kiln diff <id_a> <id_b>`)")
+        id_b = id_a
+        id_a = parent
+
+    ra = http.get(f"{_url()}/jobs/{id_a}/source")
     ra.raise_for_status()
-    rb = http.get(f"{_url()}/jobs/{a.id_b}/source")
+    rb = http.get(f"{_url()}/jobs/{id_b}/source")
     rb.raise_for_status()
     diff = difflib.unified_diff(
         ra.json()["source"].splitlines(keepends=True),
         rb.json()["source"].splitlines(keepends=True),
-        fromfile=a.id_a,
-        tofile=a.id_b,
+        fromfile=id_a,
+        tofile=id_b,
     )
     sys.stdout.write("".join(diff))
+
+
+def cmd_archive(a):
+    r = http.get(f"{_url()}/archive", params={"tier": a.tier, "k": a.k})
+    r.raise_for_status()
+    data = r.json()
+    if a.island:
+        if a.island.startswith("regime:"):
+            rkey = a.island.split(":", 1)[1]
+            _print(data.get("regimes", {}).get(rkey))
+        elif a.island.startswith("submodule:"):
+            skey = a.island.split(":", 1)[1]
+            _print(data.get("submodules", {}).get(skey))
+        else:
+            _print(data.get(a.island))
+        return
+    _print(data)
+
+
+def cmd_lineage(a):
+    r = http.get(f"{_url()}/jobs/{a.id}/lineage")
+    r.raise_for_status()
+    _print(r.json())
+
+
+def cmd_merge(a):
+    from pathlib import Path
+
+    r = http.post(
+        f"{_url()}/ensembles/compose",
+        json={"job_ids": a.ids, "allow_target_overlap": a.allow_overlap},
+    )
+    r.raise_for_status()
+    data = r.json()
+    out = Path(a.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(data["source"], encoding="utf-8")
+    _write_checkout_meta(out, data["parent_ids"], tags=data.get("tags"))
+    summary: dict = {
+        "saved": str(out),
+        "parent_ids": data["parent_ids"],
+        "tags": data.get("tags", []),
+        "conflicts": data.get("conflicts", []),
+    }
+    if a.submit:
+        note = a.note.strip() or f"Merge {' + '.join(data['parent_ids'])}"
+        sr = http.post(
+            f"{_url()}/jobs",
+            json={
+                "agent": _agent(a),
+                "tier": a.tier,
+                "source": data["source"],
+                "note": note,
+                "parent_id": data["parent_ids"][0],
+                "parent_ids": data["parent_ids"],
+                "tags": data.get("tags", []),
+            },
+        )
+        sr.raise_for_status()
+        sub = sr.json()
+        summary["submitted"] = _wait_for_job(sub["id"]) if a.wait else sub
+    _print(summary)
+
+
+def cmd_micro(a):
+    from pathlib import Path
+
+    src = Path(a.file).read_text(encoding="utf-8")
+    if a.local:
+        from kiln.config import RunConfig
+        from kiln.micro.sandbox import MicroRunner
+
+        run = RunConfig.load(a.config) if a.config else RunConfig()
+        runner = MicroRunner(run, Path(run.workdir) / run.name)
+        res = runner.run_candidate(
+            _agent(a),
+            src,
+            note=a.note,
+            snapshot_tag=a.snapshot,
+            enable_ncu=True if a.ncu else None,
+            enable_ptxas=False if a.no_ptxas else None,
+        )
+    else:
+        payload = {
+            "agent": _agent(a),
+            "source": src,
+            "note": a.note,
+            "snapshot_tag": a.snapshot,
+            "enable_ncu": True if a.ncu else None,
+            "enable_ptxas": False if a.no_ptxas else None,
+        }
+        r = http.post(f"{_url()}/micro", json=payload, timeout=180.0)
+        r.raise_for_status()
+        res = r.json()
+
+    if a.promote_fast and res.get("ready_for_fast"):
+        parent_ids = _read_checkout_lineage(a.file)
+        sub_payload: dict = {"agent": _agent(a), "tier": "fast", "source": src, "note": a.note or f"micro:{res['id']}"}
+        if parent_ids:
+            sub_payload["parent_id"] = parent_ids[0]
+            sub_payload["parent_ids"] = parent_ids
+        sr = http.post(f"{_url()}/jobs", json=sub_payload)
+        sr.raise_for_status()
+        sub = sr.json()
+        res["promoted_fast"] = _wait_for_job(sub["id"]) if a.wait else sub
+
+    _print(res)
+
+
+def cmd_micro_snapshots(a):
+    params = {"tag": a.tag} if a.tag else {}
+    r = http.get(f"{_url()}/micro/snapshots", params=params)
+    r.raise_for_status()
+    _print(r.json())
 
 
 def cmd_cancel(a):
@@ -427,6 +630,8 @@ def main(argv=None):
     s = sp.add_parser("submit", help="submit a candidate forward.py")
     s.add_argument("file"); s.add_argument("--tier", default="fast")
     s.add_argument("--note", default=""); s.add_argument("--agent")
+    s.add_argument("--parent", help="parent job id(s), comma-separated (auto-read from .kiln_checkout.json if omitted)")
+    s.add_argument("--tags", help="comma-separated submodule/regime tags")
     s.add_argument("--wait", action="store_true"); s.set_defaults(f=cmd_submit)
 
     s = sp.add_parser("job"); s.add_argument("id"); s.set_defaults(f=cmd_job)
@@ -445,8 +650,44 @@ def main(argv=None):
     s.add_argument("id")
     s.add_argument("-o", "--out", help="optional path to save candidate source (e.g. forward.py)")
     s.set_defaults(f=cmd_pull)
-    s = sp.add_parser("diff", help="unified diff between two jobs' candidate sources")
-    s.add_argument("id_a"); s.add_argument("id_b"); s.set_defaults(f=cmd_diff)
+    s = sp.add_parser("checkout", help="fetch a job into forward.py and record its parent lineage")
+    s.add_argument("id")
+    s.add_argument("-o", "--out", default="forward.py", help="destination file path (default: forward.py)")
+    s.set_defaults(f=cmd_checkout)
+    s = sp.add_parser("diff", help="unified diff between two jobs (or parent -> child with 1 job ID)")
+    s.add_argument("id_a"); s.add_argument("id_b", nargs="?"); s.set_defaults(f=cmd_diff)
+    s = sp.add_parser("lineage", help="show ancestor and descendant lineage for a job")
+    s.add_argument("id"); s.set_defaults(f=cmd_lineage)
+    s = sp.add_parser("archive", help="show Multi-Island Archive (regimes, submodules, stepping stones, merge suggestions)")
+    s.add_argument("--tier", default="fast")
+    s.add_argument("-k", type=int, default=3)
+    s.add_argument("--island", help="filter output (overall, regimes, submodules, stepping_stones, merge_suggestions, or regime:<k>)")
+    s.set_defaults(f=cmd_archive)
+    s = sp.add_parser("merge", help="compose multiple orthogonal candidate jobs into one forward.py")
+    s.add_argument("ids", nargs="+", help="two or more job IDs to merge")
+    s.add_argument("-o", "--out", default="forward.py", help="output merged file (default: forward.py)")
+    s.add_argument("--allow-overlap", action="store_true", help="merge even if static patch targets overlap")
+    s.add_argument("--submit", action="store_true", help="immediately submit merged candidate")
+    s.add_argument("--tier", default="fast")
+    s.add_argument("--note", default="")
+    s.add_argument("--agent")
+    s.add_argument("--wait", action="store_true")
+    s.set_defaults(f=cmd_merge)
+    s = sp.add_parser("micro", help="run lock-free isolated GPU kernel sandbox (snapshots, ptxas spills, optional ncu)")
+    s.add_argument("file")
+    s.add_argument("--snapshot", help="snapshot tag to replay (e.g. attention, moe, mhc)")
+    s.add_argument("--ncu", action="store_true", help="collect Nsight Compute HBM/bank-conflict counters")
+    s.add_argument("--no-ptxas", action="store_true", help="skip ptxas spill inspection")
+    s.add_argument("--local", action="store_true", help="run sandbox locally without kiln serve")
+    s.add_argument("-c", "--config", help="optional RunConfig YAML when running with --local")
+    s.add_argument("--promote-fast", action="store_true", help="auto-submit to fast tier if micro passes ready_for_fast")
+    s.add_argument("--wait", action="store_true", help="wait for fast-tier job when --promote-fast is set")
+    s.add_argument("--note", default="")
+    s.add_argument("--agent")
+    s.set_defaults(f=cmd_micro)
+    s = sp.add_parser("micro-snapshots", help="list cold-boot captured tensor snapshots available for `kiln micro`")
+    s.add_argument("--tag")
+    s.set_defaults(f=cmd_micro_snapshots)
     s = sp.add_parser("cancel", help="cancel a queued job before it runs")
     s.add_argument("id"); s.set_defaults(f=cmd_cancel)
     s = sp.add_parser("withdraw", help="invalidate a bogus or superseded job from leaderboards")
@@ -459,8 +700,8 @@ def main(argv=None):
     s = sp.add_parser("leaderboard"); s.add_argument("--tier", default="slow")
     s.add_argument("-k", type=int, default=10)
     s.add_argument("--sort", default="speedup",
-                   help="sort key: speedup, decode_tps, prefill_tps, output_tput, active_decode_tps, "
-                        "itl_p50_ms, itl_p90_ms, interactivity_p90, paired_speedup")
+                   help="sort key: speedup, decode_tps, prefill_tps, decode_small, decode_mid, prefill_large, "
+                        "output_tput, active_decode_tps, itl_p50_ms, itl_p90_ms, interactivity_p90, paired_speedup")
     s.set_defaults(f=cmd_leaderboard)
 
     s = sp.add_parser("promote", help="promote winning jobs to another tier or generate 900s official config")

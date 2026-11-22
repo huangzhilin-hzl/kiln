@@ -405,6 +405,7 @@ class SGLangHotReloadController:
         self._kiln_patched: list | None = None
         self._kiln_module: types.ModuleType | None = None
         self._kiln_dirty: bool = False
+        self._kiln_snapshot_collector: object | None = None
 
     def dispatch(self, method: str, args: list, kwargs: dict):
         if method == "kiln_hot_reload":
@@ -413,6 +414,10 @@ class SGLangHotReloadController:
             return self.kiln_teardown(*args, **kwargs)
         if method == "kiln_info":
             return self.kiln_info(*args, **kwargs)
+        if method == "kiln_enable_snapshot_capture":
+            return self.kiln_enable_snapshot_capture(*args, **kwargs)
+        if method == "kiln_finish_snapshot_capture":
+            return self.kiln_finish_snapshot_capture(*args, **kwargs)
         raise ValueError(f"Unknown kiln SGLang RPC method: {method!r}")
 
     def kiln_hot_reload(self, path: str) -> float:
@@ -493,6 +498,37 @@ class SGLangHotReloadController:
             "tp_rank": getattr(target_runner, "tp_rank", getattr(self.scheduler, "tp_rank", 0)),
             "dp_rank": getattr(self.scheduler, "dp_rank", 0),
         }
+
+    def kiln_enable_snapshot_capture(
+        self, snapshot_dir: str, m_buckets=None, max_snapshot_mb: float = 64.0
+    ) -> dict:
+        from kiln.micro.snapshots import DEFAULT_M_BUCKETS, SnapshotCollector
+
+        _, target_runner, _, _ = _resolve_workers(self.owner)
+        tp_rank = getattr(target_runner, "tp_rank", getattr(self.scheduler, "tp_rank", 0))
+        dp_rank = getattr(self.scheduler, "dp_rank", 0)
+        if tp_rank not in (0, None) or dp_rank not in (0, None):
+            return {"tp_rank": tp_rank, "dp_rank": dp_rank, "skipped": True}
+        if self._kiln_snapshot_collector is not None:
+            self._kiln_snapshot_collector.close()
+        if isinstance(m_buckets, str):
+            buckets = [int(x) for x in json.loads(m_buckets)]
+        elif m_buckets is not None:
+            buckets = [int(x) for x in m_buckets]
+        else:
+            buckets = list(DEFAULT_M_BUCKETS)
+        model = _get_raw_model(target_runner)
+        collector = SnapshotCollector(snapshot_dir, m_buckets=buckets, max_snapshot_mb=float(max_snapshot_mb))
+        attached = collector.attach(model)
+        self._kiln_snapshot_collector = collector
+        return {"tp_rank": 0, "attached": attached}
+
+    def kiln_finish_snapshot_capture(self) -> dict:
+        collector = self._kiln_snapshot_collector
+        self._kiln_snapshot_collector = None
+        if collector is None:
+            return {"snapshots": []}
+        return collector.close()
 
     def _rebuild(self) -> None:
         """Drop CUDA graphs, reset torch.compile & global graph pool, and recapture."""

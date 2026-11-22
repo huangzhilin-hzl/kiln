@@ -67,6 +67,7 @@ class MeasureResult:
     ttft_s: float                      # mean time-to-first-token
     runs_decode_tps: list[float] = field(default_factory=list)
     kernel_report: str | None = None
+    trace_analysis: dict | None = None
     extra: dict = field(default_factory=dict)   # e.g. AgentX P90 interactivity, export path
 
     @property
@@ -76,6 +77,22 @@ class MeasureResult:
             return 0.0
         mean = sum(r) / len(r)
         return 100.0 * (max(r) - min(r)) / mean
+
+
+def bucket_tps_for_requests(
+    requests: list[Request], decode_tps: float, prefill_tps: float
+) -> dict[str, float]:
+    """Classify offline measurement into M-regime buckets (`decode_small`, `decode_mid`, `prefill_large`)."""
+    out: dict[str, float] = {}
+    n_req = len(requests)
+    if decode_tps > 0:
+        if n_req <= 48:
+            out["decode_small"] = decode_tps
+        elif n_req <= 256:
+            out["decode_mid"] = decode_tps
+    if prefill_tps > 0:
+        out["prefill_large"] = prefill_tps
+    return out
 
 
 class Engine(abc.ABC):
@@ -108,6 +125,10 @@ class Engine(abc.ABC):
     def is_alive(self) -> bool:
         """Return whether the backing engine/worker processes are healthy and alive."""
         return True
+
+    def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
+        """Optionally capture representative submodule tensor snapshots for `kiln micro`."""
+        return None
 
     @abc.abstractmethod
     def shutdown(self) -> None: ...

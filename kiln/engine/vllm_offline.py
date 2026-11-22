@@ -13,8 +13,8 @@ import time
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
-from .base import Engine, MeasureResult
-from .vllm_profiler import configure_torch_profiler, summarize_trace
+from .base import Engine, MeasureResult, bucket_tps_for_requests
+from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
 
 # Both tiers may live in one process; CUDA_VISIBLE_DEVICES is process-global and is read when
@@ -121,27 +121,52 @@ class VLLMOfflineEngine(Engine):
             ntok = sum(len(o.outputs[0].token_ids) for o in outs)
             decode_runs.append(ntok / dt)
 
-        report = self._kernel_report(prompts) if trace else None
+        report, trace_analysis = self._kernel_report(prompts) if trace else (None, None)
+        decode_tps = sum(decode_runs) / len(decode_runs)
+        prefill_tps = isl / prefill_s
         return MeasureResult(
-            decode_tps=sum(decode_runs) / len(decode_runs),
-            prefill_tps=isl / prefill_s,
+            decode_tps=decode_tps,
+            prefill_tps=prefill_tps,
             ttft_s=prefill_s / max(len(requests), 1),
             runs_decode_tps=decode_runs,
             kernel_report=report,
+            trace_analysis=trace_analysis,
+            extra={"bucket_tps": bucket_tps_for_requests(requests, decode_tps, prefill_tps)},
         )
 
-    def _kernel_report(self, prompts) -> str | None:
+    def _kernel_report(self, prompts) -> tuple[str | None, dict | None]:
         """Top kernels by CUDA time (fast tier only)."""
         tdir = self._trace_dir
         if not tdir:
-            return None
+            return None, None
         from vllm import SamplingParams
         self.llm.start_profile()
         try:
             self.llm.generate(prompts[:4], SamplingParams(max_tokens=32, ignore_eos=True), use_tqdm=False)
         finally:
             self.llm.stop_profile()
-        return summarize_trace(tdir)
+        return build_trace_payload(tdir)
+
+    def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
+        if self.llm is None:
+            return None
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+
+        self.llm.collective_rpc(
+            "kiln_enable_snapshot_capture",
+            args=(os.path.abspath(snapshot_dir), list(m_buckets)),
+            timeout=self.tier.timeout_s,
+        )
+        try:
+            self.llm.generate(
+                [TokensPrompt(prompt_token_ids=[1, 2, 3, 4])],
+                SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True),
+                use_tqdm=False,
+            )
+        finally:
+            res = self.llm.collective_rpc("kiln_finish_snapshot_capture", timeout=self.tier.timeout_s)
+        return res[0] if res else None
 
     def greedy_probe(
         self, prompts: list[list[int]], max_new_tokens: int

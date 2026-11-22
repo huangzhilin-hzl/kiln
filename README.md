@@ -91,7 +91,24 @@ kiln agents -c configs/dsv41_flash_h20_1node.yaml
 ```
 
 - Multi-node requires a shared `KILN_TOKEN` on a private network (submissions execute Python over HTTP).
-- `agents.slots` mixes `agy`, `codex`, `claude`, and custom CLIs (or use `agents.command` + `models`); preview with `kiln agents -c <config> --dry-run`. Agents coordinate via `kiln submit / status / board / leaderboard / hw`, and run state persists under `runs/<name>/`.
+- `agents.slots` mixes `agy`, `codex`, `claude`, and custom CLIs (or use `agents.command` + `models`, with `synthesizer_slot: true` or `role: synthesizer` for dedicated ensembling); preview with `kiln agents -c <config> --dry-run`. Agents coordinate via `kiln submit / status / board / leaderboard / archive / checkout / merge / micro / hw`, and run state persists under `runs/<name>/`.
+
+## Lock-Free Micro Sandbox, Lineage & Orthogonal Ensembling
+
+```bash
+# 1. Pre-screen custom kernels without waiting on the fast/slow engine lock
+kiln micro-snapshots
+kiln micro forward.py --snapshot moe --ncu --promote-fast --wait
+
+# 2. Multi-island archive (regimes M<=48 / 65..256 / M>512 & submodule islands) + lineage
+kiln archive --tier fast
+kiln checkout <job_id> -o forward.py
+kiln diff <child_job_id>
+kiln lineage <job_id>
+
+# 3. Synthesize orthogonal winners into one composite forward.py
+kiln merge <job_a> <job_b> -o forward.py --submit --tier fast --wait
+```
 
 ## Hardware Probe & Cost Model
 
@@ -113,17 +130,19 @@ Archived winner `candidates/dsv41_flash_h20_tp8_forward.py` (DeepSeek-V4.1-Flash
 
 | Path | Role | TKCC |
 |---|---|---|
-| `kiln/engine/` | Hot-reloadable vLLM (`vllm_offline`, `vllm_server`), SGLang (`sglang_offline`, `sglang_server`), and CPU `mock` engines | §4.2, Fig. 3 |
-| `kiln/server/` | FastAPI job queues, remote workers, token auth, crash recovery, leaderboard, and shared board | §4.2, Fig. 5c |
-| `kiln/bench/` | Traffic replay, AgentX export & harness runner, greedy-token correctness check | §3, §4.1 |
+| `kiln/engine/` | Hot-reloadable vLLM (`vllm_offline`, `vllm_server`), SGLang (`sglang_offline`, `sglang_server`), CPU `mock`, baseline trace diff & roofline attribution | §4.2, Fig. 3 |
+| `kiln/server/` | FastAPI job queues, remote workers, token auth, crash recovery, multi-island archive, lineage, and shared board | §4.2, Fig. 5c |
+| `kiln/micro/` | Lock-free isolated kernel sandbox, cold-boot layer tensor snapshots, `ptxas` spill & `ncu` bank-conflict counters | — |
+| `kiln/patches.py` | `@kiln_patch` modular patch contract, static AST target/conflict analysis, and orthogonal candidate composer | — |
+| `kiln/bench/` | Traffic replay, AgentX export & harness runner, greedy-token + logprob correctness check | §3, §4.1 |
 | `kiln/costmodel/` | Hardware roofline prober (`kiln probe`) and parallelism ranker (`kiln costmodel`) | §4.3, App. D |
-| `kiln/agents/` | Parallel CLI agent supervisor (respawn, 429 backoff) and minimal prompt | §4.4 |
+| `kiln/agents/` | Parallel CLI agent supervisor (respawn, 429 backoff, synthesizer slot) and minimal prompt | §4.4 |
 | `configs/`, `profiles/` | Ready-to-run YAML configs and measured H20-3e / B300 hardware profiles | §4.3 |
 | `candidates/`, `scripts/` | Baseline contract, archived DeepSeek-V4.1-Flash winner, and vLLM/SGLang smoke tests | — |
 
 ## Limitations
 
 - **Engines:** vLLM (checked against `20d8574`) and SGLang are supported; TRT-LLM is not yet implemented.
-- **Final verification:** greedy-token matching gates search candidates; run full eval suites, perplexity, and KV-cache checks before deploying.
+- **Final verification:** greedy-token + logprob matching gates search candidates; run full eval suites, perplexity, and KV-cache checks before deploying.
 - **Cost model:** `kiln probe` calibrates Level 2 hardware curves; Level 3 end-to-end forward calibration is manual.
-- **Ensembling:** automatic merging of multiple winning candidates is not implemented yet.
+- **Ensembling:** static AST target inspection + `@kiln_patch` composition merges disjoint winners automatically (`kiln merge`), while overlapping targets still require `--allow-overlap` or manual conflict resolution.

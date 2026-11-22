@@ -15,7 +15,7 @@ from pathlib import Path
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
-from .base import Engine, MeasureResult, reap_zombies
+from .base import Engine, MeasureResult, bucket_tps_for_requests, reap_zombies
 from .sglang_ext import (
     bootstrap_env,
     encode_rpc,
@@ -25,7 +25,7 @@ from .sglang_ext import (
     merge_json_model_override_args,
     parse_rpc_message,
 )
-from .vllm_profiler import summarize_trace
+from .vllm_profiler import build_trace_payload
 
 
 # Both tiers may live in one process; CUDA_VISIBLE_DEVICES is process-global and is read when
@@ -227,19 +227,23 @@ class SGLangOfflineEngine(Engine):
             ntok = sum(_completion_tokens(o, r.output_len) for o, r in zip(outs_list, requests))
             decode_runs.append(ntok / dt)
 
-        report = self._kernel_report(prompts) if trace else None
+        report, trace_analysis = self._kernel_report(prompts) if trace else (None, None)
+        decode_tps = sum(decode_runs) / len(decode_runs)
+        prefill_tps = isl / prefill_s
         return MeasureResult(
-            decode_tps=sum(decode_runs) / len(decode_runs),
-            prefill_tps=isl / prefill_s,
+            decode_tps=decode_tps,
+            prefill_tps=prefill_tps,
             ttft_s=prefill_s / max(len(requests), 1),
             runs_decode_tps=decode_runs,
             kernel_report=report,
+            trace_analysis=trace_analysis,
+            extra={"bucket_tps": bucket_tps_for_requests(requests, decode_tps, prefill_tps)},
         )
 
-    def _kernel_report(self, prompts: list[list[int]]) -> str | None:
+    def _kernel_report(self, prompts: list[list[int]]) -> tuple[str | None, dict | None]:
         tdir = self._trace_dir
         if not tdir or not prompts:
-            return None
+            return None, None
         try:
             try:
                 self.engine.start_profile(output_dir=tdir)
@@ -252,9 +256,22 @@ class SGLangOfflineEngine(Engine):
                 )
             finally:
                 self.engine.stop_profile()
-            return summarize_trace(tdir)
+            return build_trace_payload(tdir)
         except Exception:
+            return None, None
+
+    def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
+        if self.engine is None:
             return None
+        self._rpc("kiln_enable_snapshot_capture", os.path.abspath(snapshot_dir), list(m_buckets))
+        try:
+            self.engine.generate(
+                input_ids=[[1, 2, 3, 4]],
+                sampling_params={"max_new_tokens": 2, "ignore_eos": True, "temperature": 0.0},
+            )
+        finally:
+            res = self._rpc("kiln_finish_snapshot_capture")
+        return res
 
     def greedy_probe(
         self, prompts: list[list[int]], max_new_tokens: int

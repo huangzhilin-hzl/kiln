@@ -26,8 +26,8 @@ from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_p
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
-from .base import Engine, InvalidBenchmark, MeasureResult, shutdown_process_group
-from .vllm_profiler import configure_torch_profiler, summarize_trace
+from .base import Engine, InvalidBenchmark, MeasureResult, bucket_tps_for_requests, shutdown_process_group
+from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
 
 def _cli_args(d: dict) -> list[str]:
@@ -153,18 +153,33 @@ class VLLMServerEngine(Engine):
         return len(choices[0].get("token_ids") or ()) or max_tokens
 
     def _kernel_report(self, pool: concurrent.futures.ThreadPoolExecutor,
-                       requests: list[Request]) -> str | None:
+                       requests: list[Request]) -> tuple[str | None, dict | None]:
         if not self._trace_dir or not requests:
-            return None
+            return None, None
         try:
             self.http.post(f"{self.url}/start_profile").raise_for_status()
             try:
                 list(pool.map(lambda req: self._complete_one(req.prompt_ids, 32), requests[:4]))
             finally:
                 self.http.post(f"{self.url}/stop_profile").raise_for_status()
-            return summarize_trace(self._trace_dir)
+            return build_trace_payload(self._trace_dir)
         except Exception:
+            return None, None
+
+    def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
+        if not self.is_alive():
             return None
+        import json as _json
+        self._rpc(
+            "kiln_enable_snapshot_capture",
+            os.path.abspath(snapshot_dir),
+            _json.dumps(list(m_buckets)),
+        )
+        try:
+            self._complete_one([1, 2, 3, 4], 2)
+        finally:
+            res = self._rpc("kiln_finish_snapshot_capture")
+        return res[0] if isinstance(res, list) and res else res
 
     def measure_requests(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
         """Measure offline `requests` concurrently against `vllm serve` (fast tier)."""
@@ -184,13 +199,17 @@ class VLLMServerEngine(Engine):
                 dt = max(time.perf_counter() - t0, 1e-9)
                 decode_runs.append(ntok / dt)
 
-            report = self._kernel_report(pool, requests) if trace else None
+            report, trace_analysis = self._kernel_report(pool, requests) if trace else (None, None)
+        decode_tps = sum(decode_runs) / len(decode_runs)
+        prefill_tps = isl / prefill_s
         return MeasureResult(
-            decode_tps=sum(decode_runs) / len(decode_runs),
-            prefill_tps=isl / prefill_s,
+            decode_tps=decode_tps,
+            prefill_tps=prefill_tps,
             ttft_s=prefill_s / max(len(requests), 1),
             runs_decode_tps=decode_runs,
             kernel_report=report,
+            trace_analysis=trace_analysis,
+            extra={"bucket_tps": bucket_tps_for_requests(requests, decode_tps, prefill_tps)},
         )
 
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:

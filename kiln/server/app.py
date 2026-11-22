@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, FiniteFloat
 
 from kiln.bench.traffic import load_traffic
 from kiln.config import RunConfig
+from kiln.micro.sandbox import MicroRunner
+from kiln.patches import PatchConflictError
 
 from .board import Board
 from .auth import auth_headers
@@ -22,6 +24,23 @@ class SubmitReq(BaseModel):
     tier: str = "fast"
     source: str
     note: str = ""
+    parent_id: str | None = None
+    parent_ids: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+
+
+class ComposeReq(BaseModel):
+    job_ids: list[str]
+    allow_target_overlap: bool = False
+
+
+class MicroReq(BaseModel):
+    agent: str
+    source: str
+    note: str = ""
+    snapshot_tag: str | None = None
+    enable_ncu: bool | None = None
+    enable_ptxas: bool | None = None
 
 
 class PostReq(BaseModel):
@@ -77,6 +96,7 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
     requests = load_traffic(run.traffic_file, model_name=tok_name)
     mgr = JobManager(run, requests, local_tiers=local_tiers)
     board = Board(mgr.root / "board.jsonl")
+    micro = MicroRunner(run, mgr.root)
     expected_auth = auth_headers().get("Authorization")
 
     def authenticate(authorization: Annotated[str | None, Header()] = None):
@@ -121,19 +141,40 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
     @app.post("/jobs")
     def submit(req: SubmitReq):
         try:
-            job = mgr.submit(req.agent, req.tier, req.source, req.note)
+            job = mgr.submit(
+                req.agent,
+                req.tier,
+                req.source,
+                req.note,
+                parent_id=req.parent_id,
+                parent_ids=req.parent_ids,
+                tags=req.tags,
+            )
         except KeyError as e:
             raise HTTPException(400, str(e))
         except QueueLimitError as e:
             raise HTTPException(429, str(e))
         except DuplicateJobError as e:
             raise HTTPException(409, str(e))
-        return {"id": job.id, "tier": job.tier}
+        return {
+            "id": job.id,
+            "tier": job.tier,
+            "parent_id": job.parent_id,
+            "parent_ids": job.parent_ids,
+            "tags": job.tags,
+        }
 
     @app.get("/jobs/{jid}")
     def get_job(jid: str):
         try:
             return mgr.get_job(jid)
+        except KeyError:
+            raise HTTPException(404, "no such job")
+
+    @app.get("/jobs/{jid}/lineage")
+    def get_job_lineage(jid: str):
+        try:
+            return mgr.get_lineage(jid)
         except KeyError:
             raise HTTPException(404, "no such job")
 
@@ -143,6 +184,50 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
             return mgr.get_job_source(jid)
         except (KeyError, FileNotFoundError):
             raise HTTPException(404, "no such job or source")
+
+    @app.get("/archive")
+    def archive(tier: str = "fast", k: Annotated[int, Query(ge=1, le=20)] = 3):
+        return mgr.archive(tier=tier, k=k)
+
+    @app.post("/ensembles/compose")
+    def compose_ensemble(req: ComposeReq):
+        try:
+            return mgr.compose_jobs(req.job_ids, allow_target_overlap=req.allow_target_overlap)
+        except KeyError as e:
+            raise HTTPException(404, f"no such job: {e}")
+        except PatchConflictError as e:
+            raise HTTPException(409, str(e))
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/micro/snapshots")
+    def micro_snapshots(tag: str | None = None):
+        return micro.list_snapshots(tag=tag)
+
+    @app.post("/micro")
+    def run_micro(req: MicroReq):
+        try:
+            return micro.run_candidate(
+                req.agent,
+                req.source,
+                note=req.note,
+                snapshot_tag=req.snapshot_tag,
+                enable_ncu=req.enable_ncu,
+                enable_ptxas=req.enable_ptxas,
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/micro")
+    def list_micro(limit: Annotated[int, Query(ge=1, le=200)] = 30, agent: str | None = None):
+        return micro.list_results(limit=limit, agent=agent)
+
+    @app.get("/micro/{mid}")
+    def get_micro(mid: str):
+        try:
+            return micro.get_result(mid)
+        except KeyError:
+            raise HTTPException(404, "no such micro run")
 
     @app.post("/jobs/{jid}/cancel")
     def cancel_job(jid: str):
@@ -215,5 +300,5 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
             raise HTTPException(409, "Unknown job, stale claim, or invalid completion")
         return {"ok": True}
 
-    app.state.mgr, app.state.board = mgr, board
+    app.state.mgr, app.state.board, app.state.micro = mgr, board, micro
     return app

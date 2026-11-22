@@ -73,7 +73,7 @@ class CorrectnessConfig(BaseModel):
 
 
 AgentProvider = Literal["agy", "codex", "claude", "custom"]
-AgentRole = Literal["explorer", "auditor", "integrator"]
+AgentRole = Literal["explorer", "auditor", "integrator", "synthesizer"]
 
 PROVIDER_COMMANDS: dict[str, str] = {
     "agy": (
@@ -219,9 +219,19 @@ class AgentConfig(BaseModel):
     budget_hours: float = 12.0
     respawn_on_exit: bool = True     # re-launch single-turn CLI agents (e.g. `codex exec`) until budget_hours
     isolate_credentials: bool = True # strip host cluster/cloud creds (KUBECONFIG, SSH_AUTH_SOCK, etc.)
+    synthesizer_slot: bool = False   # auto-assign the final slot as `synthesizer` when no integrator/synthesizer exists
+
+    def _has_explicit_synthesizer(self) -> bool:
+        return any(s.role in ("synthesizer", "integrator") for s in self.slots)
 
     def resolve_slot(self, slot_idx: int) -> ResolvedAgentSlot:
         """Return resolved CLI argv, provider, model, and env overrides for `slot_idx`."""
+        auto_synth = (
+            self.synthesizer_slot
+            and self.num_agents >= 2
+            and slot_idx == self.num_agents - 1
+            and not self._has_explicit_synthesizer()
+        )
         if self.slots:
             expanded = [s for s in self.slots for _ in range(s.count)]
             spec = expanded[slot_idx % len(expanded)]
@@ -241,13 +251,14 @@ class AgentConfig(BaseModel):
                 if provider == "codex" and any("model_reasoning_effort=" in a for a in spec.extra_args):
                     argv = _strip_codex_reasoning_effort(argv)
                 argv = _insert_provider_args(argv, provider, spec.extra_args)
+            role = spec.role or ("synthesizer" if auto_synth else None)
             return ResolvedAgentSlot(
                 argv=argv,
                 provider=provider,
                 model=slot_model,
                 env=dict(spec.env),
                 label=spec.name,
-                role=spec.role,
+                role=role,
                 prompt_extra=spec.prompt_extra,
             )
 
@@ -263,7 +274,13 @@ class AgentConfig(BaseModel):
             if any("{model}" in tok for tok in argv):
                 raise ValueError("'{model}' placeholder in agents.command(s) requires non-empty agents.models")
             slot_model = _extract_model(argv)
-        return ResolvedAgentSlot(argv=argv, provider=provider, model=slot_model, env={})
+        return ResolvedAgentSlot(
+            argv=argv,
+            provider=provider,
+            model=slot_model,
+            env={},
+            role="synthesizer" if auto_synth else None,
+        )
 
     def resolve_slot_command(self, slot_idx: int) -> tuple[list[str], str | None]:
         """Return (argv, model) for agent slot `slot_idx`, cycling through `commands` and `models`."""
@@ -288,6 +305,22 @@ class AgentConfig(BaseModel):
         return self
 
 
+class MicroConfig(BaseModel):
+    enabled: bool = True
+    gpus: list[int] = Field(default_factory=list)
+    max_concurrent: int = Field(default=2, ge=1)
+    timeout_s: float = 60.0
+    m_buckets: list[int] = Field(default_factory=lambda: [1, 8, 32, 64, 256, 1024])
+    capture_on_boot: bool = True
+    max_snapshot_mb: float = 64.0
+    enable_ptxas: bool = True
+    enable_ncu: bool = False
+    ncu_timeout_s: float = 45.0
+    atol: float = 1e-2
+    rtol: float = 1e-2
+    padded_nan_check: bool = True
+
+
 class RunConfig(BaseModel):
     name: str = "default"
     engine: EngineConfig = Field(default_factory=EngineConfig)
@@ -298,6 +331,7 @@ class RunConfig(BaseModel):
     traffic_file: str = "traffic/sample.jsonl"
     correctness: CorrectnessConfig = Field(default_factory=CorrectnessConfig)
     agents: AgentConfig = Field(default_factory=AgentConfig)
+    micro: MicroConfig = Field(default_factory=MicroConfig)
     hw_profile: str | None = None    # optional `kiln probe` JSON (auto-discovered in workdir if unset)
     workdir: str = "runs"
     server_url: str = "http://127.0.0.1:8765"

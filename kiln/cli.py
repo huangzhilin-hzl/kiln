@@ -56,6 +56,31 @@ def cmd_worker(a):
     )
 
 
+def cmd_pd_node(a):
+    from kiln.config import RunConfig
+    from kiln.engine.sglang_pd import build_pd_node_launch_spec
+
+    run = RunConfig.load(a.config)
+    cmd, full_env, overrides = build_pd_node_launch_spec(
+        run,
+        tier_name=a.tier,
+        role=a.role,
+        index=a.index,
+        host_override=a.host,
+        port_override=a.port,
+    )
+    if a.dry_run:
+        _print({
+            "tier": a.tier,
+            "role": a.role,
+            "index": a.index,
+            "cmd": cmd,
+            "env_overrides": overrides,
+        })
+        return
+    os.execvpe(cmd[0], cmd, full_env)
+
+
 def _read_checkout_lineage(file_path: str) -> list[str]:
     from pathlib import Path
 
@@ -659,6 +684,16 @@ def main(argv=None):
                    help="serve only --tier/--tiers without auto-including shared-engine tiers")
     s.add_argument("--server", help="central kiln server URL, e.g. http://<node0-ip>:8765")
     s.set_defaults(f=cmd_worker)
+
+    s = sp.add_parser("pd-node", help="launch one SGLang Prefill or Decode worker with kiln hot-reload hooks")
+    s.add_argument("-c", "--config", required=True)
+    s.add_argument("--role", choices=("prefill", "decode"), required=True)
+    s.add_argument("--tier", default="slow", help="PD tier name in config (default: slow)")
+    s.add_argument("--index", type=int, default=0, help="replica index within pd.prefill / pd.decode")
+    s.add_argument("--host", help="override bind host (e.g. 0.0.0.0 on multi-pod K8s)")
+    s.add_argument("--port", type=int, help="override bind port")
+    s.add_argument("--dry-run", action="store_true", help="print resolved launch command & env JSON and exit")
+    s.set_defaults(f=cmd_pd_node)
 
     s = sp.add_parser("submit", help="submit a candidate forward.py")
     s.add_argument("file"); s.add_argument("--tier", default="fast")

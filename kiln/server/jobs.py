@@ -1517,8 +1517,17 @@ class JobManager:
             )
 
             pd_pairs: list[dict] = []
-            prefill_tiers = [t for t, w in self.tiers.items() if w.tier.phase == "prefill"]
-            decode_tiers = [t for t, w in self.tiers.items() if w.tier.phase == "decode"]
+            req_worker = self.tiers.get(tier)
+            prefill_tiers = (
+                [tier]
+                if (req_worker is not None and req_worker.tier.phase == "prefill")
+                else [t for t, w in self.tiers.items() if w.tier.phase == "prefill"]
+            )
+            decode_tiers = (
+                [tier]
+                if (req_worker is not None and req_worker.tier.phase == "decode")
+                else [t for t, w in self.tiers.items() if w.tier.phase == "decode"]
+            )
             if prefill_tiers and decode_tiers:
                 p_done = [j for pt in prefill_tiers for j in self._valid_done_jobs_locked(pt)]
                 d_done = [j for dt in decode_tiers for j in self._valid_done_jobs_locked(dt)]

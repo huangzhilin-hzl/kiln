@@ -20,12 +20,85 @@ EngineKind = Literal[
     "vllm",
     "sglang_offline",
     "sglang_server",
+    "sglang_pd_server",
     "sglang",
 ]
 
 TierPhase = Literal["both", "prefill", "decode"]
 TierMetric = Literal["decode_tps", "prefill_tps", "ttft"]
+PDTransferBackend = Literal["mooncake", "mooncake_tcp", "nixl", "ascend", "mori", "fake"]
 _TIER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+class PDNodeConfig(BaseModel):
+    """One Prefill or Decode SGLang server replica in an `xPyD` disaggregated cluster."""
+
+    url: str | None = None                       # e.g. "http://10.0.0.11:30000" (if remote/pre-launched)
+    host: str = "127.0.0.1"
+    port: int | None = None
+    bootstrap_port: int | None = None            # prefill `--disaggregation-bootstrap-port` (default 8998)
+    gpus: list[int] = Field(default_factory=list)
+    num_gpus: int | None = Field(default=None, ge=1)
+    spawn: bool | None = None                    # True = spawn locally; False = connect to existing URL
+    engine_overrides: dict = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+
+    def should_spawn(self) -> bool:
+        if self.spawn is not None:
+            return bool(self.spawn)
+        return self.url is None
+
+    def resolved_url(self, default_port: int) -> str:
+        if self.url:
+            return self.url.rstrip("/")
+        port = self.port or default_port
+        bind_host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
+        return f"http://{bind_host}:{port}"
+
+    def resolved_num_gpus(self, cfg: "EngineConfig", tier_overrides: dict) -> int:
+        if self.num_gpus is not None:
+            return int(self.num_gpus)
+        if self.gpus:
+            return len(self.gpus)
+        merged = {**cfg.extra_args, **tier_overrides, **self.engine_overrides}
+        tp = int(merged.get("tp_size", cfg.tensor_parallel_size))
+        dp = int(merged.get("dp_size", 1))
+        dp_attn = bool(merged.get("enable_dp_attention", False))
+        return tp if dp_attn else tp * dp
+
+
+class PDClusterConfig(BaseModel):
+    """Topology and router settings for `sglang_pd_server` (`xPyD` disaggregation)."""
+
+    transfer_backend: PDTransferBackend = "mooncake"
+    ib_device: str | None = None
+    prefill: list[PDNodeConfig] = Field(default_factory=list)
+    decode: list[PDNodeConfig] = Field(default_factory=list)
+    router_url: str | None = None                # connect to pre-running router when set (unless spawn_router=True)
+    spawn_router: bool | None = None
+    router_host: str = "127.0.0.1"
+    router_port: int | None = None
+    router_policy: str | None = None             # e.g. "cache_aware", "round_robin", "power_of_two"
+    router_command: str | None = None            # override router CLI prefix
+    router_extra_args: list[str] = Field(default_factory=list)
+
+    def should_spawn_router(self) -> bool:
+        if self.spawn_router is not None:
+            return bool(self.spawn_router)
+        return self.router_url is None
+
+    @model_validator(mode="after")
+    def _validate_topology(self) -> "PDClusterConfig":
+        if not self.prefill:
+            raise ValueError("PDClusterConfig requires at least one prefill instance")
+        if not self.decode:
+            raise ValueError("PDClusterConfig requires at least one decode instance")
+        if self.transfer_backend == "fake":
+            raise ValueError(
+                "PDClusterConfig transfer_backend='fake' is not supported for full xPyD "
+                "(SGLang prefill servers reject 'fake'); use 'mooncake', 'mooncake_tcp', or 'nixl'"
+            )
+        return self
 
 
 class TierConfig(BaseModel):
@@ -41,10 +114,11 @@ class TierConfig(BaseModel):
     # Extra LLM(...) kwargs for this tier only, merged over engine.extra_args.
     # e.g. fast tier: {speculative_config: null} -- truncated models break MTP/DSpark layers.
     engine_overrides: dict = Field(default_factory=dict)
-    # Per-tier engine kind (defaults to engine.kind): "vllm_offline", "vllm_server", "sglang_offline", or "sglang_server".
+    # Per-tier engine kind (defaults to engine.kind): "vllm_offline", "vllm_server", "sglang_offline", "sglang_server", or "sglang_pd_server".
     engine_kind: EngineKind | None = None
     share_engine: str | None = None              # reuse another local tier's engine (single-node mode)
     port: int | None = None                      # *_server only
+    pd: PDClusterConfig | None = None            # sglang_pd_server topology
     agentx: dict | None = None                   # *_server only: AgentXConfig fields
     timeout_s: float = 600.0
     max_queued_per_agent: int | None = Field(default=None, ge=1)
@@ -62,6 +136,12 @@ class TierConfig(BaseModel):
     def _validate_screening(self) -> "TierConfig":
         if self.screen_repeats is not None and self.screen_repeats > self.repeats:
             raise ValueError("screen_repeats must be <= repeats")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_pd_tier(self) -> "TierConfig":
+        if self.engine_kind == "sglang_pd_server" and self.pd is None:
+            raise ValueError(f"Tier {self.name!r} with engine_kind='sglang_pd_server' requires a 'pd' block")
         return self
 
     @field_validator("name")
@@ -379,6 +459,9 @@ class RunConfig(BaseModel):
             if t.name in seen:
                 raise ValueError(f"Duplicate tier name {t.name!r} in tiers")
             seen.add(t.name)
+            eff_kind = t.engine_kind or self.engine.kind
+            if eff_kind == "sglang_pd_server" and t.pd is None:
+                raise ValueError(f"Tier {t.name!r} resolved to sglang_pd_server requires a 'pd' block")
         return self
 
     @property

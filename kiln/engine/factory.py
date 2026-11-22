@@ -22,4 +22,7 @@ def make_engine(cfg: EngineConfig, tier: TierConfig) -> Engine:
     if kind == "sglang_server":
         from .sglang_server import SGLangServerEngine
         return SGLangServerEngine(cfg, tier)
+    if kind == "sglang_pd_server":
+        from .sglang_pd import SGLangPDServerEngine
+        return SGLangPDServerEngine(cfg, tier)
     raise ValueError(f"unknown engine kind {kind}")

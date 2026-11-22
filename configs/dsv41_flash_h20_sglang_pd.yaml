@@ -1,0 +1,110 @@
+# DeepSeek-V4.1-Flash-1017 PD Disaggregated (`1P1D`) on H20-3e using SGLang + Mooncake + DSpark + AgentX.
+#
+# Recommended 4-Pod layout (or 3-Pod if fast_prefill & fast_decode share via `share_engine`):
+#   Pod 0 (8x H20-3e): `kiln serve -c configs/dsv41_flash_h20_sglang_pd.yaml --tiers fast_prefill --host 0.0.0.0`
+#   Pod 1 (8x H20-3e): `kiln worker -c configs/dsv41_flash_h20_sglang_pd.yaml --tier fast_decode --server http://<POD0_IP>:18765`
+#   Pod 2 (8x H20-3e, Prefill): `kiln pd-node -c configs/dsv41_flash_h20_sglang_pd.yaml --role prefill --host 0.0.0.0`
+#   Pod 3 (8x H20-3e, Decode):  `kiln pd-node -c configs/dsv41_flash_h20_sglang_pd.yaml --role decode --host 0.0.0.0`
+#   (And run `kiln worker -c configs/dsv41_flash_h20_sglang_pd.yaml --tier slow` on Pod 0 or Pod 3 to drive `sglang_router` + AgentX.)
+name: dsv41-flash-h20-sglang-pd-agentx
+engine:
+  kind: sglang_offline
+  model: /home/models/DeepSeek-V4.1-Flash-1017
+  tensor_parallel_size: 8
+  max_model_len: 1048576
+  extra_args:
+    ep_size: 8
+    moe_a2a_backend: none
+    attention_backend: dsv4
+    image_processor_backend: pil
+    chunked_prefill_size: 8192
+    max_running_requests: 64
+    mem_fraction_static: 0.84
+    moe_runner_backend: flashinfer_mxfp4
+    flashinfer_mxfp4_moe_precision: fp8
+    random_seed: 0
+tiers:
+  - name: fast_prefill
+    phase: prefill
+    metric: prefill_tps
+    engine_kind: sglang_offline
+    gpus: []
+    max_requests: 16
+    repeats: 3
+    trace_kernels: true
+    timeout_s: 900
+    max_queued_per_agent: 2
+    deduplicate_queued: true
+    engine_overrides:
+      context_length: 262144
+      disable_cuda_graph: true
+  - name: fast_decode
+    phase: decode
+    metric: decode_tps
+    engine_kind: sglang_offline
+    gpus: []
+    max_requests: 16
+    repeats: 3
+    trace_kernels: true
+    timeout_s: 900
+    max_queued_per_agent: 2
+    deduplicate_queued: true
+    engine_overrides:
+      context_length: 262144
+      cuda_graph_max_bs_decode: 32
+  - name: slow
+    phase: both
+    engine_kind: sglang_pd_server
+    port: 31480
+    repeats: 1
+    trace_kernels: false
+    timeout_s: 3600
+    engine_overrides:
+      mem_fraction_static: 0.74
+      enable_cache_report: true
+      speculative_algorithm: DSPARK
+      speculative_dspark_block_size: 5
+      tool_call_parser: deepseekv41
+      reasoning_parser: deepseek-v41
+    pd:
+      transfer_backend: mooncake
+      router_host: 127.0.0.1
+      router_port: 31480
+      router_policy: cache_aware
+      prefill:
+        - url: http://127.0.0.1:31401
+          port: 31401
+          bootstrap_port: 8998
+          num_gpus: 8
+          spawn: false
+          engine_overrides:
+            chunked_prefill_size: 16384
+            disable_cuda_graph: true
+      decode:
+        - url: http://127.0.0.1:31402
+          port: 31402
+          num_gpus: 8
+          spawn: false
+          engine_overrides:
+            cuda_graph_max_bs_decode: 64
+    agentx:
+      concurrency: 16
+      public_dataset: semianalysis_cc_traces_weka_062126
+      random_seed: 42
+      benchmark_duration_s: 900
+      unsafe_override: false
+traffic_file: traffic/agentx.jsonl
+correctness:
+  min_token_match: 0.85
+  num_prompts: 16
+  max_new_tokens: 8
+hw_profile: runs/hw_profile.json
+agents:
+  slots:
+    - {provider: agy, model: gemini-4-neon-high, count: 2, role: explorer}
+    - {provider: agy, model: gemini-4-carbon-high, role: synthesizer}
+    - {provider: codex, model: gpt-6.2-sol, count: 2, role: auditor, extra_args: ["-c", "model_reasoning_effort=high"]}
+  budget_hours: 24
+  respawn_on_exit: true
+workdir: runs
+server_url: http://0.0.0.0:18765

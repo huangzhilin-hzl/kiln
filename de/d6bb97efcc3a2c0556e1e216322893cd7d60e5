@@ -1,0 +1,22 @@
+kiln/engine/sglang_ext.py
+  h_7339bf36ecd0bc 19,25,29,401-426,436,443-444,455-464,470-471,475-476,479-480,483-487,490-491,493-503,511-528,540-541,556,558,560-562,564,571-573,587-588
+kiln/engine/sglang_offline.py
+  h_7339bf36ecd0bc 144-152
+kiln/engine/sglang_server.py
+  h_7339bf36ecd0bc 205-213
+kiln/patches.py
+  h_7339bf36ecd0bc 6,14-50,71-79,86,91-93,96,100,143,147-148,266,277-280,283-287,309,313,320,326,331,387-390,409-411,468,472,572,601,608-609,624,670-841
+tests/test_sglang.py
+  h_7339bf36ecd0bc 760-869
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ded6bb97efcc3a2c0556e1e216322893cd7d60e5",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

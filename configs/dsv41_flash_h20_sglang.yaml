@@ -26,9 +26,14 @@ tiers:
     gpus: []
     max_requests: 16
     repeats: 3
+    screen_repeats: 1
+    screen_min_speedup: 1.0
     trace_kernels: true
+    trace_policy: on_improve
     timeout_s: 900
     max_queued_per_agent: 2
+    max_inflight_per_agent: 2
+    supersede_queued: true
     deduplicate_queued: true
     engine_overrides:
       context_length: 262144

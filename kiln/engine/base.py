@@ -112,6 +112,10 @@ class Engine(abc.ABC):
     @abc.abstractmethod
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult: ...
 
+    def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+        """Run additional decode repeats and/or kernel trace on an already-warmed candidate."""
+        return self.measure(requests, repeats, trace)
+
     @abc.abstractmethod
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         """Greedy token ids, used for correctness checks."""

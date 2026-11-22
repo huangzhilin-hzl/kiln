@@ -95,20 +95,27 @@ class VLLMOfflineEngine(Engine):
         from vllm.inputs import TokensPrompt
         return [TokensPrompt(prompt_token_ids=r.prompt_ids) for r in reqs]
 
-    def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+    def measure(
+        self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
+    ) -> MeasureResult:
         """Prefill and decode measured separately (TKCC: mixing them adds ~6% noise)."""
         from vllm import SamplingParams
 
         prompts = self._prompts(requests)
-        isl = sum(len(r.prompt_ids) for r in requests)
-        warm = SamplingParams(max_tokens=1, temperature=0.0)
-        self.llm.generate(prompts, warm, use_tqdm=False)         # warm the prefix cache
+        prefill_tps = 0.0
+        ttft_s = 0.0
+        if not skip_prefill:
+            isl = sum(len(r.prompt_ids) for r in requests)
+            warm = SamplingParams(max_tokens=1, temperature=0.0)
+            self.llm.generate(prompts, warm, use_tqdm=False)         # warm the prefix cache
 
-        # Prefill: max_tokens=1 on the cached-or-not prompt set.
-        self.llm.reset_prefix_cache()
-        t0 = time.perf_counter()
-        self.llm.generate(prompts, warm, use_tqdm=False)
-        prefill_s = time.perf_counter() - t0
+            # Prefill: max_tokens=1 on the cached-or-not prompt set.
+            self.llm.reset_prefix_cache()
+            t0 = time.perf_counter()
+            self.llm.generate(prompts, warm, use_tqdm=False)
+            prefill_s = max(time.perf_counter() - t0, 1e-9)
+            prefill_tps = isl / prefill_s
+            ttft_s = prefill_s / max(len(requests), 1)
 
         decode_runs = []
         for _ in range(repeats):
@@ -122,17 +129,21 @@ class VLLMOfflineEngine(Engine):
             decode_runs.append(ntok / dt)
 
         report, trace_analysis = self._kernel_report(prompts) if trace else (None, None)
-        decode_tps = sum(decode_runs) / len(decode_runs)
-        prefill_tps = isl / prefill_s
+        decode_tps = sum(decode_runs) / len(decode_runs) if decode_runs else 0.0
+        buckets = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
-            ttft_s=prefill_s / max(len(requests), 1),
+            ttft_s=ttft_s,
             runs_decode_tps=decode_runs,
             kernel_report=report,
             trace_analysis=trace_analysis,
-            extra={"bucket_tps": bucket_tps_for_requests(requests, decode_tps, prefill_tps)},
+            extra=({"bucket_tps": buckets} if buckets else {}),
         )
+
+    def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+        """Run extra decode repeats and/or trace without repeating warmup or prefill."""
+        return self.measure(requests, repeats, trace, skip_prefill=True)
 
     def _kernel_report(self, prompts) -> tuple[str | None, dict | None]:
         """Top kernels by CUDA time (fast tier only)."""

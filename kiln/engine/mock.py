@@ -67,16 +67,25 @@ class MockEngine(Engine):
             {"cat": "kernel", "name": "mock_allreduce", "ts": 760.0 * inv, "dur": 120.0 * inv, "args": {"stream": 8}},
         ]
 
-    def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+    def measure(
+        self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
+    ) -> MeasureResult:
         noise = 0.002 if self.tier.name == "slow" else 0.005
-        runs = [BASE_DECODE_TPS * self.speedup * (1 + random.gauss(0, noise)) for _ in range(repeats)]
-        decode_tps = sum(runs) / len(runs)
-        prefill_tps = BASE_PREFILL_TPS * self.bucket_speedups.get("prefill_large", self.prefill_speedup)
-        bucket_tps = {
-            "decode_small": BASE_DECODE_TPS * self.bucket_speedups.get("decode_small", self.speedup),
-            "decode_mid": BASE_DECODE_TPS * self.bucket_speedups.get("decode_mid", self.speedup),
-            "prefill_large": prefill_tps,
-        }
+        runs = (
+            [BASE_DECODE_TPS * self.speedup * (1 + random.gauss(0, noise)) for _ in range(repeats)]
+            if repeats > 0
+            else []
+        )
+        decode_tps = sum(runs) / len(runs) if runs else 0.0
+        prefill_tps = (
+            0.0 if skip_prefill else BASE_PREFILL_TPS * self.bucket_speedups.get("prefill_large", self.prefill_speedup)
+        )
+        bucket_tps: dict[str, float] = {}
+        if decode_tps > 0:
+            bucket_tps["decode_small"] = BASE_DECODE_TPS * self.bucket_speedups.get("decode_small", self.speedup)
+            bucket_tps["decode_mid"] = BASE_DECODE_TPS * self.bucket_speedups.get("decode_mid", self.speedup)
+        if prefill_tps > 0:
+            bucket_tps["prefill_large"] = prefill_tps
         kernel_report = None
         trace_analysis = None
         if trace:
@@ -87,12 +96,15 @@ class MockEngine(Engine):
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
-            ttft_s=0.05 / max(self.prefill_speedup, 1e-6),
+            ttft_s=0.0 if skip_prefill else 0.05 / max(self.prefill_speedup, 1e-6),
             runs_decode_tps=runs,
             kernel_report=kernel_report,
             trace_analysis=trace_analysis,
-            extra={"bucket_tps": bucket_tps},
+            extra=({"bucket_tps": bucket_tps} if bucket_tps else {}),
         )
+
+    def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+        return self.measure(requests, repeats, trace, skip_prefill=True)
 
     def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
         from kiln.micro.snapshots import write_mock_snapshots

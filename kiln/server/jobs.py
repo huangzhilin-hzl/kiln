@@ -25,7 +25,7 @@ from kiln.bench.correctness import evaluate_correctness
 from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
 from kiln.engine import Engine, make_engine
-from kiln.engine.base import InvalidBenchmark, MeasureResult
+from kiln.engine.base import InvalidBenchmark, MeasureResult, bucket_tps_for_requests
 from kiln.engine.vllm_profiler import (
     TraceAnalysis,
     compute_roofline_attribution,
@@ -70,6 +70,7 @@ class Job:
     parent_id: str | None = None
     parent_ids: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    force_trace: bool = False
     worker_id: str | None = None
     attempt_id: str | None = None
     lease_expires_at: float | None = None
@@ -139,6 +140,12 @@ class SharedEngineAdapter(Engine):
             return eng.measure_requests(requests, repeats, trace)
         return eng.measure(requests, repeats, trace)
 
+    def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+        eng = self.owner.engine
+        if self.tier.agentx is None and hasattr(eng, "measure_requests"):
+            return eng.measure_requests(requests, repeats, trace, skip_prefill=True)
+        return eng.measure_more(requests, repeats, trace)
+
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         return self.owner.engine.greedy_outputs(prompts, max_new_tokens)
 
@@ -156,9 +163,11 @@ class SharedEngineAdapter(Engine):
 
 class TierWorker:
     def __init__(self, run: RunConfig, tier: TierConfig, requests: list[Request], jobs_dir: Path,
-                 local: bool = True, on_job_finished: Callable[[Job], None] | None = None):
+                 local: bool = True, on_job_finished: Callable[[Job], None] | None = None,
+                 screen_threshold_fn: Callable[[], float] | None = None):
         self.run, self.tier, self.jobs_dir, self.local = run, tier, jobs_dir, local
         self.on_job_finished = on_job_finished
+        self.screen_threshold_fn = screen_threshold_fn
         self.requests = requests[: tier.max_requests] if tier.max_requests else requests
         self.q: queue.Queue[Job] = queue.Queue()
         self.engine: Engine | None = None
@@ -234,7 +243,11 @@ class TierWorker:
                 tokens, logprobs = self.engine.greedy_probe(probe, cc.max_new_tokens)
                 if not probe or len(tokens) != len(probe) or not all(tokens):
                     raise RuntimeError("Baseline returned incomplete correctness outputs")
-                base = self.engine.measure(self.requests, self.tier.repeats, trace=self.tier.trace_kernels)
+                base = self.engine.measure(
+                    self.requests,
+                    self.tier.repeats,
+                    trace=(self.tier.trace_kernels and self.tier.trace_policy != "never"),
+                )
                 if not math.isfinite(base.decode_tps) or base.decode_tps <= 0:
                     raise RuntimeError("Baseline throughput must be finite and positive")
                 self.baseline_tokens = tokens
@@ -411,8 +424,56 @@ class TierWorker:
             )
         return rec
 
+    def _effective_screen_threshold(self, threshold_override: float | None = None) -> float:
+        if isinstance(threshold_override, (int, float)) and math.isfinite(threshold_override) and threshold_override > 0:
+            return float(threshold_override)
+        if self.screen_threshold_fn is not None:
+            val = float(self.screen_threshold_fn())
+            if math.isfinite(val) and val > 0:
+                return val
+        return float(self.tier.screen_min_speedup)
+
+    @staticmethod
+    def _merge_stage_results(
+        m1: MeasureResult, m2: MeasureResult, requests: list[Request]
+    ) -> MeasureResult:
+        runs = list(m1.runs_decode_tps) + list(m2.runs_decode_tps)
+        decode_tps = (sum(runs) / len(runs)) if runs else float(m1.decode_tps)
+        prefill_tps = float(m1.prefill_tps)
+        extra = dict(m1.extra or {})
+        for k, v in (m2.extra or {}).items():
+            if k == "bucket_tps":
+                continue
+            extra[k] = v
+        if isinstance(extra.get("bucket_tps"), dict):
+            bt = dict(extra["bucket_tps"])
+            if m1.decode_tps > 0 and decode_tps > 0:
+                ratio = decode_tps / float(m1.decode_tps)
+                for bkey in ("decode_small", "decode_mid"):
+                    if isinstance(bt.get(bkey), (int, float)):
+                        bt[bkey] = float(bt[bkey]) * ratio
+            if prefill_tps > 0:
+                bt["prefill_large"] = prefill_tps
+            extra["bucket_tps"] = bt
+        elif decode_tps > 0 or prefill_tps > 0:
+            bt = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
+            if bt:
+                extra["bucket_tps"] = bt
+        return MeasureResult(
+            decode_tps=decode_tps,
+            prefill_tps=prefill_tps,
+            ttft_s=float(m1.ttft_s),
+            runs_decode_tps=runs,
+            kernel_report=m2.kernel_report if m2.kernel_report is not None else m1.kernel_report,
+            trace_analysis=m2.trace_analysis if m2.trace_analysis is not None else m1.trace_analysis,
+            extra=extra,
+        )
+
     def _run_job(self, job: Job) -> None:
         eng, cc = self.engine, self.run.correctness
+        base_job_extra = dict(job.extra or {})
+        threshold_override = base_job_extra.pop("_screen_threshold", None)
+        job.extra = dict(base_job_extra)
         job.baseline_tps = self.baseline_tps
         job.engine_boot_id = self.boot_id
         reload_timeout = float(self.tier.timeout_s or 0)
@@ -444,19 +505,102 @@ class TierWorker:
             if not corr.ok:
                 job.status, job.error = "incorrect", corr.detail
                 return
+            screening_meta: dict | None = None
             try:
-                m = _run_with_timeout(
-                    lambda: eng.measure(self.requests, self.tier.repeats, trace=self.tier.trace_kernels),
-                    measure_timeout,
-                    f"{self.tier.name} measure",
-                )
+                if (
+                    self.tier.agentx is None
+                    and self.tier.screen_repeats is not None
+                    and self.tier.screen_repeats < self.tier.repeats
+                ):
+                    m1 = _run_with_timeout(
+                        lambda: eng.measure(self.requests, self.tier.screen_repeats, trace=False),
+                        measure_timeout,
+                        f"{self.tier.name} screen",
+                    )
+                    if not math.isfinite(m1.decode_tps) or m1.decode_tps <= 0:
+                        job.status, job.error = "invalid", "Candidate throughput must be finite and positive"
+                        return
+                    s1_speedup = m1.decode_tps / self.baseline_tps
+                    threshold = self._effective_screen_threshold(threshold_override)
+                    promoted = bool(job.force_trace or s1_speedup >= threshold)
+                    want_trace = bool(
+                        job.force_trace
+                        or (self.tier.trace_kernels and self.tier.trace_policy != "never" and promoted)
+                    )
+                    if promoted:
+                        rem = self.tier.repeats - self.tier.screen_repeats
+                        m2 = _run_with_timeout(
+                            lambda: eng.measure_more(self.requests, rem, trace=want_trace),
+                            measure_timeout,
+                            f"{self.tier.name} measure",
+                        )
+                        m = self._merge_stage_results(m1, m2, self.requests)
+                    else:
+                        m = m1
+                    screening_meta = {
+                        "stage": 2 if promoted else 1,
+                        "promoted": promoted,
+                        "stage1_speedup": round(s1_speedup, 4),
+                        "threshold": round(threshold, 4),
+                        "screen_repeats": self.tier.screen_repeats,
+                        "total_repeats": len(m.runs_decode_tps) or self.tier.screen_repeats,
+                        "traced": want_trace if promoted else False,
+                        "forced_trace": bool(job.force_trace),
+                    }
+                elif (
+                    self.tier.agentx is None
+                    and self.tier.trace_kernels
+                    and self.tier.trace_policy == "on_improve"
+                    and not job.force_trace
+                ):
+                    m1 = _run_with_timeout(
+                        lambda: eng.measure(self.requests, self.tier.repeats, trace=False),
+                        measure_timeout,
+                        f"{self.tier.name} measure",
+                    )
+                    if not math.isfinite(m1.decode_tps) or m1.decode_tps <= 0:
+                        job.status, job.error = "invalid", "Candidate throughput must be finite and positive"
+                        return
+                    s1_speedup = m1.decode_tps / self.baseline_tps
+                    threshold = self._effective_screen_threshold(threshold_override)
+                    promoted = s1_speedup >= threshold
+                    if promoted:
+                        m2 = _run_with_timeout(
+                            lambda: eng.measure_more(self.requests, 0, trace=True),
+                            measure_timeout,
+                            f"{self.tier.name} trace",
+                        )
+                        m = self._merge_stage_results(m1, m2, self.requests)
+                    else:
+                        m = m1
+                    screening_meta = {
+                        "stage": 2 if promoted else 1,
+                        "promoted": promoted,
+                        "stage1_speedup": round(s1_speedup, 4),
+                        "threshold": round(threshold, 4),
+                        "screen_repeats": self.tier.repeats,
+                        "total_repeats": len(m.runs_decode_tps) or self.tier.repeats,
+                        "traced": promoted,
+                        "forced_trace": False,
+                    }
+                else:
+                    want_trace = bool(
+                        job.force_trace or (self.tier.trace_kernels and self.tier.trace_policy != "never")
+                    )
+                    m = _run_with_timeout(
+                        lambda: eng.measure(self.requests, self.tier.repeats, trace=want_trace),
+                        measure_timeout,
+                        f"{self.tier.name} measure",
+                    )
             except InvalidBenchmark as exc:
-                job.status, job.error, job.extra = "invalid", str(exc), exc.extra
+                job.status, job.error, job.extra = "invalid", str(exc), {**base_job_extra, **(exc.extra or {})}
                 return
             if not math.isfinite(m.decode_tps) or m.decode_tps <= 0:
                 job.status, job.error = "invalid", "Candidate throughput must be finite and positive"
                 return
-            extra = dict(m.extra or {})
+            extra = {**base_job_extra, **(m.extra or {})}
+            if screening_meta is not None:
+                extra["screening"] = screening_meta
             if self.baseline_extra.get("export") and extra.get("export"):
                 paired = compare_agentx_paired(self.baseline_extra["export"], extra["export"])
                 if paired is not None:
@@ -556,6 +700,7 @@ class JobManager:
                 run, t, requests, self.jobs_dir,
                 local=(t.name in active),
                 on_job_finished=self._on_job_finished,
+                screen_threshold_fn=(lambda name=t.name: self._screen_threshold(name)),
             )
             for t in run.tiers
         }
@@ -605,6 +750,24 @@ class JobManager:
             if w.local:
                 w.thread.start()
 
+    def _screen_threshold_locked(self, tier: str) -> float:
+        cfg = self.tiers[tier].tier
+        thresh = float(cfg.screen_min_speedup)
+        if cfg.screen_top_k is not None:
+            done = [
+                j for j in self._valid_done_jobs_locked(tier)
+                if j.speedup is not None and math.isfinite(j.speedup)
+            ]
+            if len(done) >= cfg.screen_top_k:
+                done.sort(key=lambda j: float(j.speedup), reverse=True)
+                kth = float(done[cfg.screen_top_k - 1].speedup)
+                thresh = max(thresh, kth)
+        return thresh
+
+    def _screen_threshold(self, tier: str) -> float:
+        with self.lock:
+            return self._screen_threshold_locked(tier)
+
     def submit(
         self,
         agent: str,
@@ -614,6 +777,8 @@ class JobManager:
         parent_id: str | None = None,
         parent_ids: list[str] | None = None,
         tags: list[str] | None = None,
+        force_trace: bool = False,
+        supersede: bool = False,
     ) -> Job:
         if tier not in self.tiers:
             raise KeyError(f"unknown tier {tier}; have {list(self.tiers)}")
@@ -635,16 +800,6 @@ class JobManager:
 
         tier_cfg = self.tiers[tier].tier
         with self.lock:
-            if tier_cfg.max_queued_per_agent is not None:
-                queued_cnt = sum(
-                    1 for j in self.jobs.values()
-                    if j.tier == tier and j.agent == agent and j.status == "queued"
-                )
-                if queued_cnt >= tier_cfg.max_queued_per_agent:
-                    raise QueueLimitError(
-                        f"Agent {agent!r} already has {queued_cnt} queued jobs on {tier} "
-                        f"(max {tier_cfg.max_queued_per_agent})"
-                    )
             if tier_cfg.deduplicate_queued:
                 dup = next(
                     (
@@ -657,7 +812,54 @@ class JobManager:
                     raise DuplicateJobError(
                         f"Duplicate active candidate already {dup.status} as {dup.id} on {tier}"
                     )
+            agent_queued = sorted(
+                (j for j in self.jobs.values() if j.tier == tier and j.agent == agent and j.status == "queued"),
+                key=lambda j: (j.submitted_at, j.id),
+            )
+            running_cnt = sum(
+                1 for j in self.jobs.values() if j.tier == tier and j.agent == agent and j.status == "running"
+            )
             jid = time.strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
+            superseded_ids: list[str] = []
+            if supersede or tier_cfg.supersede_queued:
+                if tier_cfg.max_inflight_per_agent is not None and running_cnt >= tier_cfg.max_inflight_per_agent:
+                    raise QueueLimitError(
+                        f"Agent {agent!r} already has {running_cnt} running jobs on {tier} "
+                        f"(max_inflight {tier_cfg.max_inflight_per_agent})"
+                    )
+                if supersede or (
+                    tier_cfg.max_queued_per_agent is None and tier_cfg.max_inflight_per_agent is None
+                ):
+                    keep_queued = 0
+                else:
+                    limits: list[int] = []
+                    if tier_cfg.max_queued_per_agent is not None:
+                        limits.append(tier_cfg.max_queued_per_agent - 1)
+                    if tier_cfg.max_inflight_per_agent is not None:
+                        limits.append(tier_cfg.max_inflight_per_agent - running_cnt - 1)
+                    keep_queued = max(0, min(limits))
+                to_cancel = agent_queued[: max(0, len(agent_queued) - keep_queued)]
+                now = time.time()
+                for old in to_cancel:
+                    old.status = "cancelled"
+                    old.finished_at = now
+                    old.invalidated_reason = f"Superseded by {jid}"
+                    self.tiers[tier]._save(old)
+                    superseded_ids.append(old.id)
+            else:
+                if tier_cfg.max_queued_per_agent is not None and len(agent_queued) >= tier_cfg.max_queued_per_agent:
+                    raise QueueLimitError(
+                        f"Agent {agent!r} already has {len(agent_queued)} queued jobs on {tier} "
+                        f"(max {tier_cfg.max_queued_per_agent})"
+                    )
+                if (
+                    tier_cfg.max_inflight_per_agent is not None
+                    and running_cnt + len(agent_queued) >= tier_cfg.max_inflight_per_agent
+                ):
+                    raise QueueLimitError(
+                        f"Agent {agent!r} already has {running_cnt + len(agent_queued)} in-flight jobs on {tier} "
+                        f"(max {tier_cfg.max_inflight_per_agent})"
+                    )
             d = self.jobs_dir / jid
             d.mkdir(parents=True)
             path = d / "candidate.py"
@@ -668,6 +870,8 @@ class JobManager:
                 parent_id=resolved_parent_id,
                 parent_ids=merged_parents,
                 tags=merged_tags,
+                force_trace=force_trace,
+                extra=({"superseded": superseded_ids} if superseded_ids else {}),
             )
             self.tiers[tier].submit(job)
             self.jobs[jid] = job
@@ -859,6 +1063,8 @@ class JobManager:
             return {
                 "id": job.id, "agent": job.agent, "note": job.note,
                 "attempt_id": job.attempt_id,
+                "force_trace": job.force_trace,
+                "screen_threshold": self._screen_threshold_locked(tier),
                 "source": Path(job.candidate_path).read_text(),
             }
 
@@ -973,6 +1179,9 @@ class JobManager:
         rf = ex.get("roofline")
         if isinstance(rf, dict) and rf.get("bottleneck_flags"):
             row["roofline_flags"] = list(rf["bottleneck_flags"])
+        scr = ex.get("screening")
+        if isinstance(scr, dict) and scr.get("stage") is not None:
+            row["screen_stage"] = scr["stage"]
         return row
 
     @classmethod
@@ -1317,8 +1526,19 @@ def run_remote_worker(run: RunConfig, tier_name: str, server_url: str) -> None:
             cand_dir.mkdir(parents=True, exist_ok=True)
             cand_path = cand_dir / "candidate.py"
             cand_path.write_text(claimed["source"])
-            job = Job(id=jid, agent=claimed["agent"], tier=tier_name,
-                      note=claimed.get("note", ""), candidate_path=str(cand_path))
+            job_extra: dict = {}
+            st_val = claimed.get("screen_threshold")
+            if isinstance(st_val, (int, float)) and math.isfinite(st_val) and st_val > 0:
+                job_extra["_screen_threshold"] = float(st_val)
+            job = Job(
+                id=jid,
+                agent=claimed["agent"],
+                tier=tier_name,
+                note=claimed.get("note", ""),
+                candidate_path=str(cand_path),
+                force_trace=bool(claimed.get("force_trace", False)),
+                extra=job_extra,
+            )
             worker.execute_job(job)
             payload = asdict(job)
             payload.update(worker_id=worker_id, attempt_id=attempt_id, crashes=worker.crashes)

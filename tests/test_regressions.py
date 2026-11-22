@@ -1255,7 +1255,11 @@ def test_slot_roles_and_formal_sglang_config_governance(tmp_path, monkeypatch):
     run_sglang = RunConfig.load("configs/dsv41_flash_h20_sglang.yaml")
     fast_tier = next(t for t in run_sglang.tiers if t.name == "fast")
     assert fast_tier.max_queued_per_agent == 2
+    assert fast_tier.max_inflight_per_agent == 2
+    assert fast_tier.supersede_queued is True
     assert fast_tier.deduplicate_queued is True
+    assert fast_tier.screen_repeats == 1
+    assert fast_tier.trace_policy == "on_improve"
     roles = [s["role"] for s in describe_slots(run_sglang)]
     assert roles == ["explorer", "explorer", "integrator", "auditor", "auditor"]
 
@@ -1463,3 +1467,167 @@ def test_list_jobs_cli_summary_doctor_status_and_tunnel(tmp_path, monkeypatch, c
     assert tcmd[-4:] == ["-n", "ns1", "pod/pod-0", "19000:18765"]
     tenv = tunnel_env({"HTTP_PROXY": "http://x", "https_proxy": "http://y", "KEEP": "1"})
     assert "HTTP_PROXY" not in tenv and "https_proxy" not in tenv and tenv["KEEP"] == "1"
+
+
+def test_two_stage_fast_screening_and_conditional_trace(tmp_path):
+    from kiln.bench.traffic import Request
+    from kiln.config import MicroConfig, TierConfig
+    from kiln.server.jobs import JobManager
+
+    with pytest.raises(ValueError, match="screen_repeats must be <= repeats"):
+        TierConfig(name="fast", repeats=2, screen_repeats=3)
+
+    traffic = [Request(prompt_ids=[1, 2, 3, 4], output_len=4)]
+    run = RunConfig(
+        name="screen",
+        workdir=str(tmp_path),
+        micro=MicroConfig(enabled=False),
+        tiers=[
+            TierConfig(
+                name="fast",
+                repeats=3,
+                screen_repeats=1,
+                screen_min_speedup=1.0,
+                screen_top_k=1,
+                trace_kernels=True,
+                trace_policy="on_improve",
+            )
+        ],
+    )
+    mgr = JobManager(run, traffic, local_tiers={"fast"})
+    worker = mgr.tiers["fast"]
+    worker.wait_until_ready()
+    assert worker.baseline_trace is not None
+
+    calls: list[tuple] = []
+    orig_measure = worker.engine.measure
+    orig_more = worker.engine.measure_more
+
+    def spy_measure(reqs, repeats, trace, **kw):
+        calls.append(("measure", repeats, trace, bool(kw.get("skip_prefill", False))))
+        return orig_measure(reqs, repeats, trace, **kw)
+
+    def spy_more(reqs, repeats, trace):
+        calls.append(("measure_more", repeats, trace))
+        return orig_more(reqs, repeats, trace)
+
+    worker.engine.measure = spy_measure
+    worker.engine.measure_more = spy_more
+
+    def run_sync(src: str, **kw) -> dict:
+        job = mgr.submit("a1", "fast", src, **kw)
+        with worker.engine_lock:
+            worker.execute_job(job)
+        return mgr.get_job(job.id)
+
+    # 1. Regressed candidate stops at stage 1 (1 repeat, no trace, measure_more skipped).
+    calls.clear()
+    j_slow = run_sync("SPEEDUP = 0.96\n", note="regressed")
+    assert j_slow["status"] == "done"
+    assert calls == [("measure", 1, False, False)]
+    assert j_slow["kernel_report"] is None
+    assert "trace_diff" not in j_slow["extra"]
+    assert j_slow["extra"]["screening"]["stage"] == 1
+    assert j_slow["extra"]["screening"]["promoted"] is False
+    assert j_slow["extra"]["screening"]["total_repeats"] == 1
+
+    # 2. Improving candidate promotes to stage 2 (remaining 2 repeats + skip_prefill=True + trace=True).
+    calls.clear()
+    j_win = run_sync("SPEEDUP = 1.08\n", note="winner")
+    assert j_win["status"] == "done"
+    assert calls == [("measure", 1, False, False), ("measure_more", 2, True), ("measure", 2, True, True)]
+    assert j_win["kernel_report"] is not None and "trace_diff" in j_win["extra"]
+    assert j_win["extra"]["screening"]["stage"] == 2
+    assert j_win["extra"]["screening"]["promoted"] is True
+    assert j_win["extra"]["screening"]["traced"] is True
+    assert j_win["extra"]["screening"]["total_repeats"] == 3
+    assert j_win["extra"]["screening"]["stage1_speedup"] > 1.04
+
+    # 3. With screen_top_k=1 and 1.08 in the archive, a 1.03 candidate fails the dynamic bar at stage 1.
+    calls.clear()
+    j_mid = run_sync("SPEEDUP = 1.03\n", note="below-top1")
+    assert j_mid["status"] == "done"
+    assert calls == [("measure", 1, False, False)]
+    assert j_mid["extra"]["screening"]["stage"] == 1
+    assert j_mid["extra"]["screening"]["promoted"] is False
+    assert j_mid["extra"]["screening"]["threshold"] >= 1.05
+    assert j_mid["kernel_report"] is None
+
+    # 4. Explicit force_trace (--trace) forces full repeats + trace even on a regressed candidate.
+    calls.clear()
+    j_forced = run_sync("SPEEDUP = 0.94\n", note="forced-trace", force_trace=True)
+    assert j_forced["status"] == "done"
+    assert calls == [("measure", 1, False, False), ("measure_more", 2, True), ("measure", 2, True, True)]
+    assert j_forced["extra"]["screening"]["stage"] == 2
+    assert j_forced["extra"]["screening"]["forced_trace"] is True
+    assert j_forced["extra"]["screening"]["traced"] is True
+    assert j_forced["kernel_report"] is not None
+
+
+def test_queue_supersede_and_max_inflight_per_agent(tmp_path, monkeypatch, capsys):
+    import json
+    from fastapi.testclient import TestClient
+    from kiln.cli import main
+    from kiln.config import MicroConfig, TierConfig
+    from kiln.server.app import create_app
+
+    traffic = tmp_path / "t.jsonl"
+    traffic.write_text('{"prompt_ids":[1,2],"output_len":2}\n')
+    run = RunConfig(
+        name="supersede",
+        traffic_file=str(traffic),
+        workdir=str(tmp_path),
+        micro=MicroConfig(enabled=False),
+        tiers=[
+            TierConfig(
+                name="fast",
+                max_queued_per_agent=2,
+                max_inflight_per_agent=2,
+                supersede_queued=True,
+                deduplicate_queued=True,
+            )
+        ],
+    )
+    app = create_app(run, local_tiers=set())
+    with TestClient(app) as client:
+        j1 = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.01\n"}).json()["id"]
+        # Duplicate active source still returns 409 even when supersede_queued=True
+        assert client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.01\n"}).status_code == 409
+
+        j2 = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.02\n"}).json()["id"]
+        assert client.get("/status").json()["tiers"][0]["queue_depth"] == 2
+
+        # 3rd queued job supersedes oldest queued job (j1) cleanly
+        r3 = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.03\n"})
+        assert r3.status_code == 200
+        j3 = r3.json()["id"]
+        assert r3.json()["superseded"] == [j1]
+        j1_info = client.get(f"/jobs/{j1}").json()
+        assert j1_info["status"] == "cancelled"
+        assert j1_info["invalidated_reason"] == f"Superseded by {j3}"
+        assert client.get("/status").json()["tiers"][0]["queue_depth"] == 2
+
+        # Claim j2 (now 1 running + 1 queued j3 = 2 in-flight for a1)
+        client.post("/workers/fast/heartbeat", json={"worker_id": "w0", "ready": True, "baseline_tps": 100.0, "crashes": 0})
+        c1 = client.post("/workers/fast/claim", params={"worker_id": "w0", "wait_s": 0}).json()["job"]
+        assert c1["id"] == j2
+
+        # Submitting j4 via CLI (--trace --supersede) while j2 runs supersedes j3 so inflight stays <= 2
+        import kiln.cli as cli_mod
+        monkeypatch.setattr(cli_mod, "http", client)
+        monkeypatch.setenv("KILN_SERVER", "http://testserver")
+        cand = tmp_path / "cand.py"
+        cand.write_text("SPEEDUP = 1.04\n")
+        main(["submit", str(cand), "--tier", "fast", "--agent", "a1", "--trace", "--supersede", "--note", "latest"])
+        sub_out = json.loads(capsys.readouterr().out)
+        j4 = sub_out["id"]
+        assert sub_out["force_trace"] is True
+        assert sub_out["superseded"] == [j3]
+        assert client.get(f"/jobs/{j3}").json()["status"] == "cancelled"
+
+        # Claim j4 (now 2 running == max_inflight_per_agent=2); another submit raises 429
+        c2 = client.post("/workers/fast/claim", params={"worker_id": "w1", "wait_s": 0}).json()["job"]
+        assert c2["id"] == j4
+        assert c2["force_trace"] is True
+        r_over = client.post("/jobs", json={"agent": "a1", "tier": "fast", "source": "SPEEDUP = 1.05\n"})
+        assert r_over.status_code == 429

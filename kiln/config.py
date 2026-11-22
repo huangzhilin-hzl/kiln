@@ -41,8 +41,20 @@ class TierConfig(BaseModel):
     agentx: dict | None = None                   # *_server only: AgentXConfig fields
     timeout_s: float = 600.0
     max_queued_per_agent: int | None = Field(default=None, ge=1)
+    max_inflight_per_agent: int | None = Field(default=None, ge=1)
     deduplicate_queued: bool = False
+    supersede_queued: bool = False
     canary_every_n_jobs: int | None = Field(default=None, ge=1)
+    screen_repeats: int | None = Field(default=None, ge=1)
+    screen_min_speedup: float = Field(default=1.0, gt=0.0)
+    screen_top_k: int | None = Field(default=None, ge=1)
+    trace_policy: Literal["always", "on_improve", "never"] = "always"
+
+    @model_validator(mode="after")
+    def _validate_screening(self) -> "TierConfig":
+        if self.screen_repeats is not None and self.screen_repeats > self.repeats:
+            raise ValueError("screen_repeats must be <= repeats")
+        return self
 
     @field_validator("agentx")
     @classmethod

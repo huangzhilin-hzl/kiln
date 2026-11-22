@@ -270,16 +270,23 @@ class SGLangServerEngine(Engine):
             res = self._rpc("kiln_finish_snapshot_capture")
         return res
 
-    def measure_requests(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+    def measure_requests(
+        self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
+    ) -> MeasureResult:
         """Measure offline `requests` concurrently against `sglang.launch_server` (fast tier)."""
-        isl = sum(len(r.prompt_ids) for r in requests)
+        prefill_tps = 0.0
+        ttft_s = 0.0
         workers = min(max(len(requests), 1), 32)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-            self._reset_cache()
-            t0 = time.perf_counter()
-            list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-            prefill_s = max(time.perf_counter() - t0, 1e-9)
+            if not skip_prefill:
+                isl = sum(len(r.prompt_ids) for r in requests)
+                list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
+                self._reset_cache()
+                t0 = time.perf_counter()
+                list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
+                prefill_s = max(time.perf_counter() - t0, 1e-9)
+                prefill_tps = isl / prefill_s
+                ttft_s = prefill_s / max(len(requests), 1)
 
             decode_runs = []
             for _ in range(repeats):
@@ -289,17 +296,23 @@ class SGLangServerEngine(Engine):
                 decode_runs.append(ntok / dt)
 
             report, trace_analysis = self._kernel_report(pool, requests) if trace else (None, None)
-        decode_tps = sum(decode_runs) / len(decode_runs)
-        prefill_tps = isl / prefill_s
+        decode_tps = sum(decode_runs) / len(decode_runs) if decode_runs else 0.0
+        buckets = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
-            ttft_s=prefill_s / max(len(requests), 1),
+            ttft_s=ttft_s,
             runs_decode_tps=decode_runs,
             kernel_report=report,
             trace_analysis=trace_analysis,
-            extra={"bucket_tps": bucket_tps_for_requests(requests, decode_tps, prefill_tps)},
+            extra=({"bucket_tps": buckets} if buckets else {}),
         )
+
+    def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+        """Run extra decode repeats and/or trace on an already-warmed server."""
+        if self.agentx is None:
+            return self.measure_requests(requests, repeats, trace, skip_prefill=True)
+        return self.measure(requests, repeats, trace)
 
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
         """Use offline `/generate` replay if `agentx` is None; else run real AgentX harness."""

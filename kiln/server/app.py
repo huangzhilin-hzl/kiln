@@ -27,6 +27,8 @@ class SubmitReq(BaseModel):
     parent_id: str | None = None
     parent_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    force_trace: bool = False
+    supersede: bool = False
 
 
 class ComposeReq(BaseModel):
@@ -149,6 +151,8 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
                 parent_id=req.parent_id,
                 parent_ids=req.parent_ids,
                 tags=req.tags,
+                force_trace=req.force_trace,
+                supersede=req.supersede,
             )
         except KeyError as e:
             raise HTTPException(400, str(e))
@@ -162,6 +166,8 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
             "parent_id": job.parent_id,
             "parent_ids": job.parent_ids,
             "tags": job.tags,
+            "force_trace": job.force_trace,
+            "superseded": list((job.extra or {}).get("superseded") or []),
         }
 
     @app.get("/jobs/{jid}")

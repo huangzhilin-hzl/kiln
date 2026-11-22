@@ -114,6 +114,10 @@ def cmd_submit(a):
         payload["parent_ids"] = parent_ids
     if tags:
         payload["tags"] = tags
+    if getattr(a, "trace", False):
+        payload["force_trace"] = True
+    if getattr(a, "supersede", False):
+        payload["supersede"] = True
     r = http.post(f"{_url()}/jobs", json=payload)
     r.raise_for_status()
     jid = r.json()["id"]
@@ -632,6 +636,8 @@ def main(argv=None):
     s.add_argument("--note", default=""); s.add_argument("--agent")
     s.add_argument("--parent", help="parent job id(s), comma-separated (auto-read from .kiln_checkout.json if omitted)")
     s.add_argument("--tags", help="comma-separated submodule/regime tags")
+    s.add_argument("--trace", action="store_true", help="force full repeats + kernel trace even under fast screening")
+    s.add_argument("--supersede", action="store_true", help="cancel your older queued job(s) on this tier before queueing")
     s.add_argument("--wait", action="store_true"); s.set_defaults(f=cmd_submit)
 
     s = sp.add_parser("job"); s.add_argument("id"); s.set_defaults(f=cmd_job)

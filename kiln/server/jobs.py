@@ -34,6 +34,7 @@ from kiln.engine.vllm_profiler import (
 )
 from kiln.patches import (
     compose_candidates,
+    compose_pd_pair,
     detect_candidate_conflicts,
     inspect_candidate_source,
 )
@@ -174,7 +175,9 @@ class TierWorker:
         self.owner: TierWorker | None = None
         self.engine_lock = threading.RLock()
         self.baseline_tps: float | None = None
+        self.baseline_decode_tps: float | None = None
         self.baseline_prefill_tps: float | None = None
+        self.baseline_ttft_s: float | None = None
         self.baseline_bucket_tps: dict[str, float] = {}
         self.baseline_trace: TraceAnalysis | None = None
         self.hw_profile = None
@@ -224,6 +227,22 @@ class TierWorker:
                 pass
             self.engine = None
 
+    @property
+    def score_metric_name(self) -> str:
+        if self.tier.agentx is not None:
+            return "agentx_total_tput_per_gpu"
+        return self.tier.resolved_metric
+
+    def _primary_score(self, m: MeasureResult) -> float:
+        if self.tier.agentx is not None or (m.extra or {}).get("metric") == "agentx_total_tput_per_gpu":
+            return float(m.decode_tps)
+        metric = self.tier.resolved_metric
+        if metric == "prefill_tps":
+            return float(m.prefill_tps)
+        if metric == "ttft":
+            return (1.0 / float(m.ttft_s)) if (m.ttft_s and m.ttft_s > 0) else 0.0
+        return float(m.decode_tps)
+
     def _boot(self) -> None:
         with self.engine_lock:
             self.ready.clear()
@@ -264,12 +283,15 @@ class TierWorker:
             self.tier.repeats,
             trace=(self.tier.trace_kernels and self.tier.trace_policy != "never"),
         )
-        if not math.isfinite(base.decode_tps) or base.decode_tps <= 0:
-            raise RuntimeError("Baseline throughput must be finite and positive")
+        primary = self._primary_score(base)
+        if not math.isfinite(primary) or primary <= 0:
+            raise RuntimeError(f"Baseline {self.score_metric_name} must be finite and positive")
         self.baseline_tokens = tokens
         self.baseline_logprobs = logprobs
-        self.baseline_tps = base.decode_tps
+        self.baseline_tps = primary
+        self.baseline_decode_tps = base.decode_tps
         self.baseline_prefill_tps = base.prefill_tps
+        self.baseline_ttft_s = base.ttft_s
         self.baseline_extra = dict(base.extra or {})
         self.baseline_bucket_tps = {
             str(k): float(v)
@@ -278,8 +300,10 @@ class TierWorker:
         }
         if base.trace_analysis:
             self.baseline_trace = TraceAnalysis.from_dict(base.trace_analysis)
-        print(f"[kiln] {self.tier.name}: baseline decode {base.decode_tps:.1f} tok/s "
-              f"(variance {base.variance_pct:.2f}%)")
+        print(
+            f"[kiln] {self.tier.name} ({self.tier.phase}/{self.score_metric_name}): "
+            f"baseline {primary:.2f} (variance {base.variance_pct:.2f}%)"
+        )
 
     def _restart_engine(self) -> None:
         with self.engine_lock:
@@ -402,7 +426,7 @@ class TierWorker:
             measure_timeout,
             f"{self.tier.name} canary",
         )
-        tps = float(m.decode_tps)
+        tps = float(self._primary_score(m))
         if not math.isfinite(tps) or tps <= 0:
             raise RuntimeError("Canary throughput must be finite and positive")
         drift_pct = 100.0 * (tps - self.baseline_tps) / self.baseline_tps
@@ -441,8 +465,9 @@ class TierWorker:
         m1: MeasureResult, m2: MeasureResult, requests: list[Request]
     ) -> MeasureResult:
         runs = list(m1.runs_decode_tps) + list(m2.runs_decode_tps)
+        runs_prefill = list(m1.runs_prefill_tps) + list(m2.runs_prefill_tps)
         decode_tps = (sum(runs) / len(runs)) if runs else float(m1.decode_tps)
-        prefill_tps = float(m1.prefill_tps)
+        prefill_tps = (sum(runs_prefill) / len(runs_prefill)) if runs_prefill else float(m1.prefill_tps)
         extra = dict(m1.extra or {})
         for k, v in (m2.extra or {}).items():
             if k == "bucket_tps":
@@ -467,6 +492,7 @@ class TierWorker:
             prefill_tps=prefill_tps,
             ttft_s=float(m1.ttft_s),
             runs_decode_tps=runs,
+            runs_prefill_tps=runs_prefill,
             kernel_report=m2.kernel_report if m2.kernel_report is not None else m1.kernel_report,
             trace_analysis=m2.trace_analysis if m2.trace_analysis is not None else m1.trace_analysis,
             extra=extra,
@@ -524,10 +550,14 @@ class TierWorker:
                         measure_timeout,
                         f"{self.tier.name} screen",
                     )
-                    if not math.isfinite(m1.decode_tps) or m1.decode_tps <= 0:
-                        job.status, job.error = "invalid", "Candidate throughput must be finite and positive"
+                    s1_score = self._primary_score(m1)
+                    if not math.isfinite(s1_score) or s1_score <= 0:
+                        job.status, job.error = (
+                            "invalid",
+                            f"Candidate {self.score_metric_name} must be finite and positive",
+                        )
                         return
-                    s1_speedup = m1.decode_tps / self.baseline_tps
+                    s1_speedup = s1_score / self.baseline_tps
                     threshold = self._effective_screen_threshold(threshold_override)
                     promoted = bool(job.force_trace or s1_speedup >= threshold)
                     want_trace = bool(
@@ -550,7 +580,7 @@ class TierWorker:
                         "stage1_speedup": round(s1_speedup, 4),
                         "threshold": round(threshold, 4),
                         "screen_repeats": self.tier.screen_repeats,
-                        "total_repeats": len(m.runs_decode_tps) or self.tier.screen_repeats,
+                        "total_repeats": len(m.runs_decode_tps or m.runs_prefill_tps) or self.tier.screen_repeats,
                         "traced": want_trace if promoted else False,
                         "forced_trace": bool(job.force_trace),
                     }
@@ -565,10 +595,14 @@ class TierWorker:
                         measure_timeout,
                         f"{self.tier.name} measure",
                     )
-                    if not math.isfinite(m1.decode_tps) or m1.decode_tps <= 0:
-                        job.status, job.error = "invalid", "Candidate throughput must be finite and positive"
+                    s1_score = self._primary_score(m1)
+                    if not math.isfinite(s1_score) or s1_score <= 0:
+                        job.status, job.error = (
+                            "invalid",
+                            f"Candidate {self.score_metric_name} must be finite and positive",
+                        )
                         return
-                    s1_speedup = m1.decode_tps / self.baseline_tps
+                    s1_speedup = s1_score / self.baseline_tps
                     threshold = self._effective_screen_threshold(threshold_override)
                     promoted = s1_speedup >= threshold
                     if promoted:
@@ -586,7 +620,7 @@ class TierWorker:
                         "stage1_speedup": round(s1_speedup, 4),
                         "threshold": round(threshold, 4),
                         "screen_repeats": self.tier.repeats,
-                        "total_repeats": len(m.runs_decode_tps) or self.tier.repeats,
+                        "total_repeats": len(m.runs_decode_tps or m.runs_prefill_tps) or self.tier.repeats,
                         "traced": promoted,
                         "forced_trace": False,
                     }
@@ -602,10 +636,18 @@ class TierWorker:
             except InvalidBenchmark as exc:
                 job.status, job.error, job.extra = "invalid", str(exc), {**base_job_extra, **(exc.extra or {})}
                 return
-            if not math.isfinite(m.decode_tps) or m.decode_tps <= 0:
-                job.status, job.error = "invalid", "Candidate throughput must be finite and positive"
+            cand_score = self._primary_score(m)
+            if not math.isfinite(cand_score) or cand_score <= 0:
+                job.status, job.error = (
+                    "invalid",
+                    f"Candidate {self.score_metric_name} must be finite and positive",
+                )
                 return
             extra = {**base_job_extra, **(m.extra or {})}
+            extra.setdefault("phase", self.tier.phase)
+            extra.setdefault("score_metric", self.score_metric_name)
+            if m.ttft_s and m.ttft_s > 0:
+                extra.setdefault("ttft_s", round(float(m.ttft_s), 6))
             if screening_meta is not None:
                 extra["screening"] = screening_meta
             if self.baseline_extra.get("export") and extra.get("export"):
@@ -623,7 +665,7 @@ class TierWorker:
                     if base_b is None and bkey == "prefill_large":
                         base_b = self.baseline_prefill_tps
                     elif base_b is None and bkey in ("decode_small", "decode_mid"):
-                        base_b = self.baseline_tps
+                        base_b = self.baseline_decode_tps or self.baseline_tps
                     if base_b and base_b > 0:
                         bucket_speedups[str(bkey)] = round(float(bval) / float(base_b), 4)
                 if bucket_speedups:
@@ -652,7 +694,7 @@ class TierWorker:
                 else m.kernel_report
             )
             job.extra = extra
-            job.speedup = m.decode_tps / self.baseline_tps
+            job.speedup = cand_score / self.baseline_tps
         finally:
             _run_with_timeout(eng.teardown_candidate, teardown_timeout, f"{self.tier.name} teardown")
         job.status = "done"
@@ -672,6 +714,8 @@ class TierWorker:
         return {
             "tier": self.tier.name,
             "mode": mode,
+            "phase": self.tier.phase,
+            "metric": self.score_metric_name,
             "ready": self.ready.is_set(),
             "boot_error": self.boot_error,
             "queue_depth": q_depth,
@@ -1139,6 +1183,7 @@ class JobManager:
         "speedup",
         "decode_tps",
         "prefill_tps",
+        "ttft_s",
         "decode_small",
         "decode_mid",
         "prefill_large",
@@ -1276,7 +1321,7 @@ class JobManager:
     def leaderboard(self, tier: str = "slow", k: int = 10, sort_by: str = "speedup") -> list[dict]:
         if sort_by not in self._LEADERBOARD_SORTS:
             raise ValueError(f"unsupported sort_by {sort_by!r}; choose from {sorted(self._LEADERBOARD_SORTS)}")
-        asc = sort_by in ("itl_p50_ms", "itl_p90_ms")
+        asc = sort_by in ("itl_p50_ms", "itl_p90_ms", "ttft_s")
         with self.lock:
             done = self._valid_done_jobs_locked(tier)
 
@@ -1470,6 +1515,26 @@ class JobManager:
                 key=lambda s: (s["est_regime_upside"], s["est_combined_speedup"]),
                 reverse=True,
             )
+
+            pd_pairs: list[dict] = []
+            prefill_tiers = [t for t, w in self.tiers.items() if w.tier.phase == "prefill"]
+            decode_tiers = [t for t, w in self.tiers.items() if w.tier.phase == "decode"]
+            if prefill_tiers and decode_tiers:
+                p_done = [j for pt in prefill_tiers for j in self._valid_done_jobs_locked(pt)]
+                d_done = [j for dt in decode_tiers for j in self._valid_done_jobs_locked(dt)]
+                top_p = _top_by(p_done, "speedup")
+                top_d = _top_by(d_done, "speedup")
+                for jp in top_p[:2]:
+                    for jd in top_d[:2]:
+                        pd_pairs.append({
+                            "prefill_job_id": jp.id,
+                            "prefill_tier": jp.tier,
+                            "prefill_speedup": round(float(jp.speedup or 1.0), 4),
+                            "decode_job_id": jd.id,
+                            "decode_tier": jd.tier,
+                            "decode_speedup": round(float(jd.speedup or 1.0), 4),
+                        })
+
             return {
                 "tier": tier,
                 "total_done": len(done),
@@ -1478,6 +1543,7 @@ class JobManager:
                 "submodules": submodules,
                 "stepping_stones": stepping_stones,
                 "merge_suggestions": suggestions[:k],
+                "pd_pair_suggestions": pd_pairs[:k],
             }
 
     def compose_jobs(self, job_ids: list[str], allow_target_overlap: bool = False) -> dict:
@@ -1488,6 +1554,15 @@ class JobManager:
                 job = self.jobs[jid]
                 items.append((job.id, Path(job.candidate_path).read_text()))
         return compose_candidates(items, allow_target_overlap=allow_target_overlap)
+
+    def compose_pd_jobs(self, prefill_job_id: str, decode_job_id: str) -> dict:
+        """Synthesize a PD role-dispatched bundle from a prefill job and a decode job."""
+        with self.lock:
+            p_job = self.jobs[prefill_job_id]
+            d_job = self.jobs[decode_job_id]
+            p_item = (p_job.id, Path(p_job.candidate_path).read_text())
+            d_item = (d_job.id, Path(d_job.candidate_path).read_text())
+        return compose_pd_pair(p_item, d_item)
 
 
 def run_remote_worker(

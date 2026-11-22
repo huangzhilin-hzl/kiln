@@ -32,8 +32,15 @@ class SubmitReq(BaseModel):
 
 
 class ComposeReq(BaseModel):
-    job_ids: list[str]
+    job_ids: list[str] = Field(default_factory=list)
     allow_target_overlap: bool = False
+    prefill_job_id: str | None = None
+    decode_job_id: str | None = None
+
+
+class ComposePDReq(BaseModel):
+    prefill_job_id: str = Field(min_length=1)
+    decode_job_id: str = Field(min_length=1)
 
 
 class MicroReq(BaseModel):
@@ -198,11 +205,27 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
     @app.post("/ensembles/compose")
     def compose_ensemble(req: ComposeReq):
         try:
+            if req.prefill_job_id or req.decode_job_id:
+                if not (req.prefill_job_id and req.decode_job_id) or req.job_ids:
+                    raise HTTPException(
+                        400,
+                        "Provide both prefill_job_id and decode_job_id (without job_ids), or job_ids",
+                    )
+                return mgr.compose_pd_jobs(req.prefill_job_id, req.decode_job_id)
             return mgr.compose_jobs(req.job_ids, allow_target_overlap=req.allow_target_overlap)
         except KeyError as e:
             raise HTTPException(404, f"no such job: {e}")
         except PatchConflictError as e:
             raise HTTPException(409, str(e))
+        except (ValueError, FileNotFoundError) as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/ensembles/compose_pd")
+    def compose_pd_ensemble(req: ComposePDReq):
+        try:
+            return mgr.compose_pd_jobs(req.prefill_job_id, req.decode_job_id)
+        except KeyError as e:
+            raise HTTPException(404, f"no such job: {e}")
         except (ValueError, FileNotFoundError) as e:
             raise HTTPException(400, str(e))
 

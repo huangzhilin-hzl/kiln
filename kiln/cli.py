@@ -263,10 +263,21 @@ def cmd_lineage(a):
 def cmd_merge(a):
     from pathlib import Path
 
-    r = http.post(
-        f"{_url()}/ensembles/compose",
-        json={"job_ids": a.ids, "allow_target_overlap": a.allow_overlap},
-    )
+    pd_mode = bool(getattr(a, "prefill_id", None) or getattr(a, "decode_id", None))
+    if pd_mode:
+        if not (a.prefill_id and a.decode_id) or a.ids:
+            raise SystemExit("PD merge requires both --prefill <id> and --decode <id> (without positional job IDs)")
+        r = http.post(
+            f"{_url()}/ensembles/compose_pd",
+            json={"prefill_job_id": a.prefill_id, "decode_job_id": a.decode_id},
+        )
+    else:
+        if len(a.ids) < 2:
+            raise SystemExit("Provide two or more job IDs to merge, or pass --prefill <id> --decode <id>")
+        r = http.post(
+            f"{_url()}/ensembles/compose",
+            json={"job_ids": a.ids, "allow_target_overlap": a.allow_overlap},
+        )
     r.raise_for_status()
     data = r.json()
     out = Path(a.out)
@@ -277,10 +288,17 @@ def cmd_merge(a):
         "saved": str(out),
         "parent_ids": data["parent_ids"],
         "tags": data.get("tags", []),
-        "conflicts": data.get("conflicts", []),
+        "conflicts": data.get("conflicts", data.get("colocated_conflicts", [])),
     }
+    if pd_mode:
+        summary["pd_pair"] = {"prefill": a.prefill_id, "decode": a.decode_id}
     if a.submit:
-        note = a.note.strip() or f"Merge {' + '.join(data['parent_ids'])}"
+        default_note = (
+            f"PD pair prefill={a.prefill_id} + decode={a.decode_id}"
+            if pd_mode
+            else f"Merge {' + '.join(data['parent_ids'])}"
+        )
+        note = a.note.strip() or default_note
         sr = http.post(
             f"{_url()}/jobs",
             json={
@@ -332,7 +350,8 @@ def cmd_micro(a):
 
     if a.promote_fast and res.get("ready_for_fast"):
         parent_ids = _read_checkout_lineage(a.file)
-        sub_payload: dict = {"agent": _agent(a), "tier": "fast", "source": src, "note": a.note or f"micro:{res['id']}"}
+        target_tier = getattr(a, "promote_tier", None) or "fast"
+        sub_payload: dict = {"agent": _agent(a), "tier": target_tier, "source": src, "note": a.note or f"micro:{res['id']}"}
         if parent_ids:
             sub_payload["parent_id"] = parent_ids[0]
             sub_payload["parent_ids"] = parent_ids
@@ -679,8 +698,10 @@ def main(argv=None):
     s.add_argument("-k", type=int, default=3)
     s.add_argument("--island", help="filter output (overall, regimes, submodules, stepping_stones, merge_suggestions, or regime:<k>)")
     s.set_defaults(f=cmd_archive)
-    s = sp.add_parser("merge", help="compose multiple orthogonal candidate jobs into one forward.py")
-    s.add_argument("ids", nargs="+", help="two or more job IDs to merge")
+    s = sp.add_parser("merge", help="compose multiple orthogonal candidate jobs (or asymmetric --prefill/--decode pair) into one forward.py")
+    s.add_argument("ids", nargs="*", help="two or more job IDs to merge")
+    s.add_argument("--prefill", dest="prefill_id", help="prefill job ID for asymmetric PD pair bundle")
+    s.add_argument("--decode", dest="decode_id", help="decode job ID for asymmetric PD pair bundle")
     s.add_argument("-o", "--out", default="forward.py", help="output merged file (default: forward.py)")
     s.add_argument("--allow-overlap", action="store_true", help="merge even if static patch targets overlap")
     s.add_argument("--submit", action="store_true", help="immediately submit merged candidate")
@@ -697,6 +718,7 @@ def main(argv=None):
     s.add_argument("--local", action="store_true", help="run sandbox locally without kiln serve")
     s.add_argument("-c", "--config", help="optional RunConfig YAML when running with --local")
     s.add_argument("--promote-fast", action="store_true", help="auto-submit to fast tier if micro passes ready_for_fast")
+    s.add_argument("--promote-tier", default="fast", help="target tier for --promote-fast (e.g. fast_prefill, fast_decode)")
     s.add_argument("--wait", action="store_true", help="wait for fast-tier job when --promote-fast is set")
     s.add_argument("--note", default="")
     s.add_argument("--agent")
@@ -716,7 +738,7 @@ def main(argv=None):
     s = sp.add_parser("leaderboard"); s.add_argument("--tier", default="slow")
     s.add_argument("-k", type=int, default=10)
     s.add_argument("--sort", default="speedup",
-                   help="sort key: speedup, decode_tps, prefill_tps, decode_small, decode_mid, prefill_large, "
+                   help="sort key: speedup, decode_tps, prefill_tps, ttft_s, decode_small, decode_mid, prefill_large, "
                         "output_tput, active_decode_tps, itl_p50_ms, itl_p90_ms, interactivity_p90, "
                         "spec_accept_length, spec_accept_rate, paired_speedup")
     s.set_defaults(f=cmd_leaderboard)

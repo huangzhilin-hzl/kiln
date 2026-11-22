@@ -5,6 +5,7 @@ A candidate file may define `SPEEDUP = 1.07` (pretend speedup), `PREFILL_SPEEDUP
 """
 from __future__ import annotations
 
+import os
 import random
 import runpy
 import time
@@ -33,7 +34,16 @@ class MockEngine(Engine):
         time.sleep(0.05)
 
     def hot_reload(self, candidate_path: str) -> None:
-        ns = runpy.run_path(candidate_path)
+        had_env = "KILN_PD_ROLE" in os.environ
+        prev_env = os.environ.get("KILN_PD_ROLE")
+        os.environ["KILN_PD_ROLE"] = self.tier.phase
+        try:
+            ns = runpy.run_path(candidate_path)
+        finally:
+            if had_env and prev_env is not None:
+                os.environ["KILN_PD_ROLE"] = prev_env
+            else:
+                os.environ.pop("KILN_PD_ROLE", None)
         if ns.get("CRASH"):
             raise RuntimeError("illegal memory access (mock)")
         self.speedup = float(ns.get("SPEEDUP", 1.0))
@@ -71,15 +81,34 @@ class MockEngine(Engine):
         self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
     ) -> MeasureResult:
         noise = 0.002 if self.tier.name == "slow" else 0.005
-        runs = (
-            [BASE_DECODE_TPS * self.speedup * (1 + random.gauss(0, noise)) for _ in range(repeats)]
-            if repeats > 0
-            else []
-        )
-        decode_tps = sum(runs) / len(runs) if runs else 0.0
-        prefill_tps = (
-            0.0 if skip_prefill else BASE_PREFILL_TPS * self.bucket_speedups.get("prefill_large", self.prefill_speedup)
-        )
+        p_mult = self.bucket_speedups.get("prefill_large", self.prefill_speedup)
+        if self.tier.phase == "prefill":
+            runs_prefill = (
+                [BASE_PREFILL_TPS * p_mult * (1 + random.gauss(0, noise)) for _ in range(repeats)]
+                if repeats > 0
+                else []
+            )
+            prefill_tps = sum(runs_prefill) / len(runs_prefill) if runs_prefill else 0.0
+            decode_tps = 0.0
+            runs_decode: list[float] = []
+        elif self.tier.phase == "decode":
+            runs_decode = (
+                [BASE_DECODE_TPS * self.speedup * (1 + random.gauss(0, noise)) for _ in range(repeats)]
+                if repeats > 0
+                else []
+            )
+            decode_tps = sum(runs_decode) / len(runs_decode) if runs_decode else 0.0
+            prefill_tps = 0.0
+            runs_prefill = []
+        else:
+            runs_decode = (
+                [BASE_DECODE_TPS * self.speedup * (1 + random.gauss(0, noise)) for _ in range(repeats)]
+                if repeats > 0
+                else []
+            )
+            decode_tps = sum(runs_decode) / len(runs_decode) if runs_decode else 0.0
+            prefill_tps = 0.0 if skip_prefill else BASE_PREFILL_TPS * p_mult
+            runs_prefill = []
         bucket_tps: dict[str, float] = {}
         if decode_tps > 0:
             bucket_tps["decode_small"] = BASE_DECODE_TPS * self.bucket_speedups.get("decode_small", self.speedup)
@@ -96,8 +125,9 @@ class MockEngine(Engine):
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
-            ttft_s=0.0 if skip_prefill else 0.05 / max(self.prefill_speedup, 1e-6),
-            runs_decode_tps=runs,
+            ttft_s=(0.0 if (skip_prefill or self.tier.phase == "decode") else 0.05 / max(p_mult, 1e-6)),
+            runs_decode_tps=runs_decode,
+            runs_prefill_tps=runs_prefill,
             kernel_report=kernel_report,
             trace_analysis=trace_analysis,
             extra=({"bucket_tps": bucket_tps} if bucket_tps else {}),

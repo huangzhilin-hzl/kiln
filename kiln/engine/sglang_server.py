@@ -204,7 +204,12 @@ class SGLangServerEngine(Engine):
         raise RuntimeError("SGLang /flush_cache kept failing")
 
     def hot_reload(self, candidate_path: str) -> None:
-        secs = self._rpc("kiln_hot_reload", os.path.abspath(candidate_path))
+        args = (
+            [os.path.abspath(candidate_path)]
+            if self.tier.phase == "both"
+            else [os.path.abspath(candidate_path), self.tier.phase]
+        )
+        secs = self._rpc("kiln_hot_reload", *args)
         self._reset_cache()
         if isinstance(secs, (int, float)):
             print(f"[kiln] {self.tier.name}: hot reload {secs:.1f}s")
@@ -317,8 +322,12 @@ class SGLangServerEngine(Engine):
                     out[key] = prom[key]
         return out
 
-    def _kernel_report(self, pool: concurrent.futures.ThreadPoolExecutor,
-                       requests: list[Request]) -> tuple[str | None, dict | None]:
+    def _kernel_report(
+        self,
+        pool: concurrent.futures.ThreadPoolExecutor,
+        requests: list[Request],
+        max_new_tokens: int = 32,
+    ) -> tuple[str | None, dict | None]:
         if not self._trace_dir or not requests:
             return None, None
         try:
@@ -328,7 +337,7 @@ class SGLangServerEngine(Engine):
                 json={"output_dir": self._trace_dir},
             ).raise_for_status()
             try:
-                list(pool.map(lambda req: self._generate_one(req.prompt_ids, 32), requests[:4]))
+                list(pool.map(lambda req: self._generate_one(req.prompt_ids, max_new_tokens), requests[:4]))
             finally:
                 self.http.post(
                     f"{self.url}/stop_profile",
@@ -352,19 +361,49 @@ class SGLangServerEngine(Engine):
         self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
     ) -> MeasureResult:
         """Measure offline `requests` concurrently against `sglang.launch_server` (fast tier)."""
+        isl = sum(len(r.prompt_ids) for r in requests)
         prefill_tps = 0.0
         ttft_s = 0.0
         workers = min(max(len(requests), 1), 32)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            if self.tier.phase == "prefill":
+                if not skip_prefill:
+                    list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
+                prefill_runs: list[float] = []
+                prefill_dts: list[float] = []
+                for _ in range(repeats):
+                    self._reset_cache()
+                    t0 = time.perf_counter()
+                    list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
+                    dt = max(time.perf_counter() - t0, 1e-9)
+                    prefill_dts.append(dt)
+                    prefill_runs.append(isl / dt)
+                report, trace_analysis = (
+                    self._kernel_report(pool, requests, max_new_tokens=1) if trace else (None, None)
+                )
+                prefill_tps = (sum(prefill_runs) / len(prefill_runs)) if prefill_runs else 0.0
+                avg_dt = (sum(prefill_dts) / len(prefill_dts)) if prefill_dts else 0.0
+                buckets = bucket_tps_for_requests(requests, 0.0, prefill_tps)
+                return MeasureResult(
+                    decode_tps=0.0,
+                    prefill_tps=prefill_tps,
+                    ttft_s=(avg_dt / max(len(requests), 1)) if prefill_dts else 0.0,
+                    runs_decode_tps=[],
+                    runs_prefill_tps=prefill_runs,
+                    kernel_report=report,
+                    trace_analysis=trace_analysis,
+                    extra=({"bucket_tps": buckets} if buckets else {}),
+                )
+
             if not skip_prefill:
-                isl = sum(len(r.prompt_ids) for r in requests)
                 list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-                self._reset_cache()
-                t0 = time.perf_counter()
-                list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-                prefill_s = max(time.perf_counter() - t0, 1e-9)
-                prefill_tps = isl / prefill_s
-                ttft_s = prefill_s / max(len(requests), 1)
+                if self.tier.phase != "decode":
+                    self._reset_cache()
+                    t0 = time.perf_counter()
+                    list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
+                    prefill_s = max(time.perf_counter() - t0, 1e-9)
+                    prefill_tps = isl / prefill_s
+                    ttft_s = prefill_s / max(len(requests), 1)
 
             decode_runs = []
             itl_samples: list[float] = []

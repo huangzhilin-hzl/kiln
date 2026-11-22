@@ -135,7 +135,12 @@ class SGLangOfflineEngine(Engine):
         raise RuntimeError("SGLang flush_cache kept failing")
 
     def hot_reload(self, candidate_path: str) -> None:
-        secs = self._rpc("kiln_hot_reload", os.path.abspath(candidate_path))
+        args = (
+            [os.path.abspath(candidate_path)]
+            if self.tier.phase == "both"
+            else [os.path.abspath(candidate_path), self.tier.phase]
+        )
+        secs = self._rpc("kiln_hot_reload", *args)
         # Cached KV was written by the previous forward; never let a candidate reuse it.
         self._flush_cache()
         if isinstance(secs, (int, float)):
@@ -216,19 +221,47 @@ class SGLangOfflineEngine(Engine):
     ) -> MeasureResult:
         """Prefill and decode measured separately (TKCC: mixing them adds ~6% noise)."""
         prompts = [r.prompt_ids for r in requests]
+        isl = sum(len(r.prompt_ids) for r in requests)
+        warm = {"max_new_tokens": 1, "temperature": 0.0}
+
+        if self.tier.phase == "prefill":
+            if not skip_prefill:
+                self.engine.generate(input_ids=prompts, sampling_params=warm)
+            prefill_runs: list[float] = []
+            prefill_dts: list[float] = []
+            for _ in range(repeats):
+                self._flush_cache()
+                t0 = time.perf_counter()
+                self.engine.generate(input_ids=prompts, sampling_params=warm)
+                dt = max(time.perf_counter() - t0, 1e-9)
+                prefill_dts.append(dt)
+                prefill_runs.append(isl / dt)
+            report, trace_analysis = self._kernel_report(prompts, max_new_tokens=1) if trace else (None, None)
+            prefill_tps = (sum(prefill_runs) / len(prefill_runs)) if prefill_runs else 0.0
+            avg_dt = (sum(prefill_dts) / len(prefill_dts)) if prefill_dts else 0.0
+            buckets = bucket_tps_for_requests(requests, 0.0, prefill_tps)
+            return MeasureResult(
+                decode_tps=0.0,
+                prefill_tps=prefill_tps,
+                ttft_s=(avg_dt / max(len(requests), 1)) if prefill_dts else 0.0,
+                runs_decode_tps=[],
+                runs_prefill_tps=prefill_runs,
+                kernel_report=report,
+                trace_analysis=trace_analysis,
+                extra=({"bucket_tps": buckets} if buckets else {}),
+            )
+
         prefill_tps = 0.0
         ttft_s = 0.0
         if not skip_prefill:
-            isl = sum(len(r.prompt_ids) for r in requests)
-            warm = {"max_new_tokens": 1, "temperature": 0.0}
             self.engine.generate(input_ids=prompts, sampling_params=warm)      # warm radix cache
-
-            self._flush_cache()
-            t0 = time.perf_counter()
-            self.engine.generate(input_ids=prompts, sampling_params=warm)
-            prefill_s = max(time.perf_counter() - t0, 1e-9)
-            prefill_tps = isl / prefill_s
-            ttft_s = prefill_s / max(len(requests), 1)
+            if self.tier.phase != "decode":
+                self._flush_cache()
+                t0 = time.perf_counter()
+                self.engine.generate(input_ids=prompts, sampling_params=warm)
+                prefill_s = max(time.perf_counter() - t0, 1e-9)
+                prefill_tps = isl / prefill_s
+                ttft_s = prefill_s / max(len(requests), 1)
 
         decode_runs = []
         for _ in range(repeats):
@@ -257,10 +290,12 @@ class SGLangOfflineEngine(Engine):
         )
 
     def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
-        """Run extra decode repeats and/or trace without repeating warmup or prefill."""
+        """Run extra repeats and/or trace without repeating cold warmup."""
         return self.measure(requests, repeats, trace, skip_prefill=True)
 
-    def _kernel_report(self, prompts: list[list[int]]) -> tuple[str | None, dict | None]:
+    def _kernel_report(
+        self, prompts: list[list[int]], max_new_tokens: int = 32
+    ) -> tuple[str | None, dict | None]:
         tdir = self._trace_dir
         if not tdir or not prompts:
             return None, None
@@ -272,7 +307,7 @@ class SGLangOfflineEngine(Engine):
             try:
                 self.engine.generate(
                     input_ids=prompts[:4],
-                    sampling_params={"max_new_tokens": 32, "ignore_eos": True, "temperature": 0.0},
+                    sampling_params={"max_new_tokens": max_new_tokens, "ignore_eos": True, "temperature": 0.0},
                 )
             finally:
                 self.engine.stop_profile()

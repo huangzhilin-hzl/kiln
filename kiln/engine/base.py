@@ -67,13 +67,14 @@ class MeasureResult:
     prefill_tps: float                 # input tokens / s during pure-prefill phase
     ttft_s: float                      # mean time-to-first-token
     runs_decode_tps: list[float] = field(default_factory=list)
+    runs_prefill_tps: list[float] = field(default_factory=list)
     kernel_report: str | None = None
     trace_analysis: dict | None = None
     extra: dict = field(default_factory=dict)   # e.g. AgentX P90 interactivity, export path
 
     @property
     def variance_pct(self) -> float:
-        r = self.runs_decode_tps
+        r = self.runs_decode_tps if self.runs_decode_tps else self.runs_prefill_tps
         if len(r) < 2:
             return 0.0
         mean = sum(r) / len(r)

@@ -1,6 +1,7 @@
 """Run configuration (loaded from configs/*.yaml)."""
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,9 +23,15 @@ EngineKind = Literal[
     "sglang",
 ]
 
+TierPhase = Literal["both", "prefill", "decode"]
+TierMetric = Literal["decode_tps", "prefill_tps", "ttft"]
+_TIER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
 
 class TierConfig(BaseModel):
-    name: Literal["fast", "mid", "slow"]
+    name: str
+    phase: TierPhase = "both"
+    metric: TierMetric | None = None
     # Number of decoder layers kept in this tier's engine (None = all layers).
     num_layers: int | None = None
     gpus: list[int] = Field(default_factory=list)
@@ -56,6 +63,22 @@ class TierConfig(BaseModel):
         if self.screen_repeats is not None and self.screen_repeats > self.repeats:
             raise ValueError("screen_repeats must be <= repeats")
         return self
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        clean = value.strip()
+        if not clean or not _TIER_NAME_RE.match(clean):
+            raise ValueError(f"Invalid tier name {value!r}; use alphanumeric, '_' or '-'")
+        if clean == "micro":
+            raise ValueError("Tier name 'micro' is reserved for the lock-free micro sandbox")
+        return clean
+
+    @property
+    def resolved_metric(self) -> TierMetric:
+        if self.metric is not None:
+            return self.metric
+        return "prefill_tps" if self.phase == "prefill" else "decode_tps"
 
     @field_validator("agentx")
     @classmethod
@@ -348,6 +371,15 @@ class RunConfig(BaseModel):
     hw_profile: str | None = None    # optional `kiln probe` JSON (auto-discovered in workdir if unset)
     workdir: str = "runs"
     server_url: str = "http://127.0.0.1:8765"
+
+    @model_validator(mode="after")
+    def _validate_unique_tiers(self) -> "RunConfig":
+        seen: set[str] = set()
+        for t in self.tiers:
+            if t.name in seen:
+                raise ValueError(f"Duplicate tier name {t.name!r} in tiers")
+            seen.add(t.name)
+        return self
 
     @property
     def client_url(self) -> str:

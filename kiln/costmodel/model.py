@@ -343,6 +343,152 @@ def rank(m: ModelSpec, chip: ChipSpec, w: Workload, max_chips: int = 64, k: int 
     return rows[:k]
 
 
+# --------------------------------------------------------------------------- PD disaggregation (xPyD)
+@dataclass
+class DisaggEstimate:
+    ratio: str
+    prefill_config: str
+    decode_config: str
+    prefill_replicas: int
+    decode_replicas: int
+    prefill_gpus_per_replica: int
+    decode_gpus_per_replica: int
+    total_gpus: int
+    prefill_batch: int
+    decode_batch: int
+    ttft_s: float
+    kv_xfer_ms: float
+    decode_tps_user: float
+    tpm_per_chip: float
+    tpm_ideal_per_chip: float
+
+
+def estimate_disagg(
+    m: ModelSpec,
+    c_p: ParallelConfig,
+    c_d: ParallelConfig,
+    chip: ChipSpec,
+    w: Workload,
+    *,
+    kv_bw_per_gpu: float = 50 * GB,
+    kv_eff: float = 0.75,
+    cluster_gpus: int | None = None,
+    max_replicas_per_role: int = 8,
+) -> DisaggEstimate | None:
+    """Analytical throughput & `xPyD` sizing for asymmetric Prefill (`c_p`) + Decode (`c_d`)."""
+    ctx = w.isl + w.osl
+    c_mem_p = _max_batch_memory(m, c_p, chip, max(1, w.isl))
+    c_mem_d = _max_batch_memory(m, c_d, chip, ctx)
+    if c_mem_p < 1 or c_mem_d < 1:
+        return None
+
+    new_tokens = max(1, int(w.isl * (1 - w.cache_hit)))
+    eff_kv_bw = max(1.0, min(c_p.n, c_d.n) * kv_bw_per_gpu * kv_eff)
+
+    # Prefill: largest batch whose compute + Mooncake/RDMA KV transfer meets TTFT SLA.
+    cp, tp_, tkv_ = 0, None, 0.0
+    b = 1
+    while b <= c_mem_p:
+        t_comp = pass_time(m, c_p, chip, b, new_tokens, w.isl, prefill=True)
+        t_kv = (b * new_tokens * m.kv_bytes_per_token()) / eff_kv_bw
+        if t_comp + t_kv > w.ttft_sla_s:
+            break
+        cp, tp_, tkv_ = b, t_comp, t_kv
+        b *= 2
+
+    # Decode: largest batch meeting per-user interactivity SLA.
+    cd, td = 0, None
+    b = 1
+    while b <= c_mem_d:
+        t = pass_time(m, c_d, chip, b, 1, ctx, prefill=False)
+        if m.mtp_accept / t < w.decode_tps_sla:
+            break
+        cd, td = b, t
+        b *= 2
+
+    if not cp or not cd or tp_ is None or td is None:
+        return None
+
+    # Steady-state replica request rates (async KV DMA overlaps subsequent prefill compute).
+    p_step = max(tp_, tkv_)
+    d_total = td * (w.osl / m.mtp_accept)
+    r_p = cp / max(p_step, 1e-12)
+    r_d = cd / max(d_total, 1e-12)
+
+    tau_p = c_p.n / r_p
+    tau_d = c_d.n / r_d
+    tpm_ideal = 60.0 * (w.isl + w.osl) / (tau_p + tau_d)
+
+    best_xy: tuple[int, int] | None = None
+    best_tpm = -1.0
+    best_gpus = 10**9
+    max_x = max_replicas_per_role if cluster_gpus is None else max(1, cluster_gpus // c_p.n)
+    max_y = max_replicas_per_role if cluster_gpus is None else max(1, cluster_gpus // c_d.n)
+    for x in range(1, max_x + 1):
+        for y in range(1, max_y + 1):
+            tot_g = x * c_p.n + y * c_d.n
+            if cluster_gpus is not None and tot_g > cluster_gpus:
+                continue
+            sys_rps = min(x * r_p, y * r_d)
+            tpm_disc = 60.0 * (w.isl + w.osl) * sys_rps / tot_g
+            # Prefer higher TPM/chip; break <0.5% ties toward smaller clusters.
+            if tpm_disc > best_tpm * 1.005 or (tpm_disc >= best_tpm * 0.995 and tot_g < best_gpus):
+                best_xy = (x, y)
+                best_tpm = tpm_disc
+                best_gpus = tot_g
+
+    if best_xy is None:
+        return None
+    x, y = best_xy
+    return DisaggEstimate(
+        ratio=f"{x}P:{y}D",
+        prefill_config=c_p.label(),
+        decode_config=c_d.label(),
+        prefill_replicas=x,
+        decode_replicas=y,
+        prefill_gpus_per_replica=c_p.n,
+        decode_gpus_per_replica=c_d.n,
+        total_gpus=best_gpus,
+        prefill_batch=cp,
+        decode_batch=cd,
+        ttft_s=tp_ + tkv_,
+        kv_xfer_ms=tkv_ * 1000.0,
+        decode_tps_user=m.mtp_accept / td,
+        tpm_per_chip=best_tpm,
+        tpm_ideal_per_chip=tpm_ideal,
+    )
+
+
+def rank_disagg(
+    m: ModelSpec,
+    chip: ChipSpec,
+    w: Workload,
+    max_chips: int = 64,
+    k: int = 5,
+    *,
+    kv_bw_per_gpu: float = 50 * GB,
+    cluster_gpus: int | None = None,
+) -> list[dict]:
+    """Rank asymmetric `(c_prefill, c_decode)` disaggregated configurations by `tpm_per_chip`."""
+    admissible = [c for c in search_space(m, max_chips) if not prune(m, c, chip)]
+    rows: list[dict] = []
+    for c_p in admissible:
+        for c_d in admissible:
+            est = estimate_disagg(
+                m,
+                c_p,
+                c_d,
+                chip,
+                w,
+                kv_bw_per_gpu=kv_bw_per_gpu,
+                cluster_gpus=cluster_gpus,
+            )
+            if est is not None:
+                rows.append(asdict(est))
+    rows.sort(key=lambda r: (r["tpm_per_chip"], r["tpm_ideal_per_chip"], -r["total_gpus"]), reverse=True)
+    return rows[:k]
+
+
 # --------------------------------------------------------------------------- presets
 MODELS = {
     "llama-3.2-1b": ModelSpec("llama-3.2-1b", layers=16, hidden=2048, heads=32, kv_heads=8,

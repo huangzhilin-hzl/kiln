@@ -7,9 +7,12 @@ real traffic) without changing outputs.
   signature as `model.forward` (or return `None` if patching submodules in place). Start from the
   baseline; you may add Triton/CUDA kernels, fuse ops, change launch strategy, use CUDA-graph-friendly
   tricks (PDL, L2 prefetch), etc.
-- Modular orthogonal patches (`kiln.patches`): you can tag sub-patches using `@kiln_patch("gemv", regime="M<=48", targets=[...])`
+- Modular orthogonal patches (`kiln.patches`): you can tag sub-patches using `@kiln_patch("gemv", regime="M<=48", phase="all|prefill|decode", targets=[...])`
   and `make_forward, restore = make_composite_forward(globals())` (plus `KILN_TAGS = [...]`, `KILN_PARENTS = [...]`)
   so independent optimizations can be composed automatically across agents.
+- **Prefill-Decode (PD) Disaggregation**: when optimizing phase-specialized tiers (`fast_prefill` / `fast_decode`) or `sglang_pd_server`,
+  check `kiln.patches.current_pd_role(model)` (`"prefill"`, `"decode"`, or `"both"`). **Never alter the physical memory layout of KV Cache pages,
+  MLA packed KV buffers, or DSpark C2 state** when targeting PD, as Mooncake RDMA transfers raw KV pages directly from Prefill HBM to Decode HBM.
 - Teardown automatically restores `.forward` across `model` and all `named_modules()`. If you attach
   any extra state outside `.forward`, define `restore(model)` to clean it up. **Never mutate model
   weight or buffer tensors in place.**
@@ -48,6 +51,7 @@ real traffic) without changing outputs.
   submodule islands + conflict-free `merge_suggestions`).
 - `kiln checkout <job_id>` pulls a candidate into `forward.py` and records its parent lineage automatically for your next `kiln submit`.
 - `kiln diff <job_id>` (parent -> child) or `kiln diff <id_a> <id_b>` inspects diffs; `kiln lineage <job_id>` shows ancestry;
-  `kiln merge <id_a> <id_b> -o forward.py` composes orthogonal winners; `kiln cancel <job_id>` / `kiln withdraw <job_id> --reason "..."` cleans up bad jobs.
+  `kiln merge <id_a> <id_b> -o forward.py` composes orthogonal winners (or `kiln merge --prefill <id_p> --decode <id_d> -o forward.py`
+  for asymmetric PD pairs); `kiln cancel <job_id>` / `kiln withdraw <job_id> --reason "..."` cleans up bad jobs.
 
 Keep iterating until you are stopped. Spend your time on optimization, not bookkeeping.

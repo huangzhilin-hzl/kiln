@@ -60,6 +60,7 @@ Keep `.venv-agentx/bin` on `PATH` (or set `agentx.binary` in the slow tier confi
 | `configs/dsv41_flash_h20_1node.yaml` | 1×8 H20-3e, shared TP8 `vllm serve` (recommended single-node) |
 | `configs/dsv41_flash_h20_1node_tp4.yaml` | 1×8 H20-3e, concurrent TP4+TP4 w/ Engram CPU offload (≥400 GB free RAM) |
 | `configs/dsv41_flash_h20.yaml` | 2×8 H20-3e, parallel TP8 `fast` (Node 0) + TP8 `slow` (Node 1) |
+| `configs/dsv41_flash_h20_sglang_pd.yaml` | SGLang PD disaggregation (`fast_prefill` + `fast_decode` + `1P1D` Mooncake + `sglang_router`) |
 
 Both engines share the AgentX workload (`semianalysisai/cc-traces-weka-062126`, seed 42): `fast` replays offline requests exported with `kiln agentx-export`, while `slow` runs live `agentx profile` against `vllm_server` or `sglang_server`.
 
@@ -106,8 +107,20 @@ kiln checkout <job_id> -o forward.py
 kiln diff <child_job_id>
 kiln lineage <job_id>
 
-# 3. Synthesize orthogonal winners into one composite forward.py
+# 3. Synthesize orthogonal winners (or asymmetric Prefill + Decode winners) into one composite forward.py
 kiln merge <job_a> <job_b> -o forward.py --submit --tier fast --wait
+kiln merge --prefill <prefill_job> --decode <decode_job> -o forward.py --submit --tier slow --wait
+```
+
+## Prefill-Decode (PD) Disaggregation (SGLang + Mooncake)
+
+```bash
+# Launch hook-enabled Prefill and Decode servers on their respective GPU pods
+kiln pd-node -c configs/dsv41_flash_h20_sglang_pd.yaml --role prefill --host 0.0.0.0
+kiln pd-node -c configs/dsv41_flash_h20_sglang_pd.yaml --role decode  --host 0.0.0.0
+
+# Search asymmetric xPyD topologies & KV transfer overhead before deployment
+kiln costmodel --model deepseek-v4.1-flash -p profiles/h20_3e_hw_profile.json --disagg --cluster-gpus 16
 ```
 
 ## Hardware Probe & Cost Model

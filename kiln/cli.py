@@ -544,7 +544,7 @@ def cmd_tunnel(a):
 
 
 def cmd_costmodel(a):
-    from kiln.costmodel.model import CHIPS, MODELS, Workload, rank
+    from kiln.costmodel.model import CHIPS, GB, MODELS, Workload, rank, rank_disagg
     if a.profile:
         from kiln.costmodel.probe import HardwareProfile
         prof = HardwareProfile.load(a.profile)
@@ -562,14 +562,47 @@ def cmd_costmodel(a):
             bf16 = (prof.gemm.get("dtypes", {}).get("bf16") or {}).get("peak_tflops", 0.0)
             t_parts.append(f"BF16={bf16:,.1f}")
         hbm = prof.bandwidth.get("hbm_peak_achieved_gbps", 0.0)
-        print(f"[profile: {chip.name} ({tag}) | {' '.join(t_parts)} TFLOP/s "
-              f"| HBM={hbm:,.0f} GB/s (eff={cc.get('bw_eff', 0):.2f}) "
-              f"| link_lat={chip.link_latency * 1e6:.1f}us]")
+        if not a.json:
+            print(f"[profile: {chip.name} ({tag}) | {' '.join(t_parts)} TFLOP/s "
+                  f"| HBM={hbm:,.0f} GB/s (eff={cc.get('bw_eff', 0):.2f}) "
+                  f"| link_lat={chip.link_latency * 1e6:.1f}us]")
     else:
         chip = CHIPS[a.chip]
     w = Workload(isl=a.isl, osl=a.osl, cache_hit=a.cache_hit,
                  ttft_sla_s=a.ttft, decode_tps_sla=a.tps)
-    rows = rank(MODELS[a.model], chip, w, max_chips=a.max_chips, k=a.k)
+    model_spec = MODELS[a.model]
+    if a.disagg:
+        coloc = rank(model_spec, chip, w, max_chips=a.max_chips, k=1)
+        best_coloc = coloc[0]["tpm_per_chip"] if coloc else None
+        rows = rank_disagg(
+            model_spec,
+            chip,
+            w,
+            max_chips=a.max_chips,
+            k=a.k,
+            kv_bw_per_gpu=float(a.kv_bw_gbps) * GB,
+            cluster_gpus=a.cluster_gpus,
+        )
+        if a.json:
+            _print({"mode": "disagg", "best_colocated_tpm_per_chip": best_coloc, "rankings": rows})
+            return
+        if not rows:
+            print("no admissible disaggregated config meets the SLA")
+            return
+        for r in rows:
+            vs = f" ({r['tpm_per_chip'] / best_coloc:.2f}x vs coloc)" if best_coloc else ""
+            print(
+                f"{r['ratio']:<6} GPUs={r['total_gpus']:<3} "
+                f"P[{r['prefill_config']}] D[{r['decode_config']}] "
+                f"TPM/chip={r['tpm_per_chip']:>11,.0f}{vs} "
+                f"Cp={r['prefill_batch']:<3} Cd={r['decode_batch']:<4} "
+                f"TTFT={r['ttft_s']:.3f}s(kv={r['kv_xfer_ms']:.1f}ms) TPS/u={r['decode_tps_user']:.0f}"
+            )
+        return
+    rows = rank(model_spec, chip, w, max_chips=a.max_chips, k=a.k)
+    if a.json:
+        _print({"mode": "colocated", "rankings": rows})
+        return
     if not rows:
         print("no admissible config meets the SLA")
     for r in rows:
@@ -812,13 +845,17 @@ def main(argv=None):
     s.add_argument("--reconnect-delay", type=float, default=3.0)
     s.set_defaults(f=cmd_tunnel)
 
-    s = sp.add_parser("costmodel", help="rank parallelism configs")
+    s = sp.add_parser("costmodel", help="rank colocated or PD-disaggregated (xPyD) parallelism configs")
     s.add_argument("--model", default="qwen3-30b-a3b"); s.add_argument("--chip", default="B200")
     s.add_argument("-p", "--profile", help="calibrated hw_profile.json from `kiln probe` (overrides --chip)")
     s.add_argument("--isl", type=int, default=8192); s.add_argument("--osl", type=int, default=1024)
     s.add_argument("--cache-hit", type=float, default=0.0)
     s.add_argument("--ttft", type=float, default=1.5); s.add_argument("--tps", type=float, default=40)
     s.add_argument("--max-chips", type=int, default=64); s.add_argument("-k", type=int, default=8)
+    s.add_argument("--disagg", action="store_true", help="search asymmetric xPyD Prefill/Decode disaggregated configs")
+    s.add_argument("--kv-bw-gbps", type=float, default=50.0, help="inter-node KV transfer bandwidth per GPU in GB/s (default: 50)")
+    s.add_argument("--cluster-gpus", type=int, help="optional total GPU budget to fit integer xPyD replicas (e.g. 16, 32)")
+    s.add_argument("--json", action="store_true", help="output rankings as JSON")
     s.set_defaults(f=cmd_costmodel)
 
     s = sp.add_parser("probe", help="measure GPU/node compute, bandwidth, MoE, launch & NCCL roofline")

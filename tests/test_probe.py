@@ -193,3 +193,63 @@ def test_checked_in_b300_profile():
     assert prof.topology["interconnect"] == "NVLink/NVSwitch (NV18)"
     rows = rank(MODELS["deepseek-v4.1-flash"], prof.to_chip_spec(), Workload(), max_chips=8)
     assert rows and rows[0]["tpm_per_chip"] > 0
+
+
+def test_costmodel_disaggregated_xpyd_search_and_cli(capsys):
+    import json
+    import kiln.cli as cli_mod
+    from kiln.costmodel.model import CHIPS, GB, MODELS, Workload, rank, rank_disagg
+
+    chip = HardwareProfile.load("profiles/h20_3e_hw_profile.json").to_chip_spec()
+    w = Workload(isl=8192, osl=1024, ttft_sla_s=3.0, decode_tps_sla=30.0)
+    coloc = rank(MODELS["deepseek-v4.1-flash"], chip, w, max_chips=8, k=3)
+    disagg = rank_disagg(
+        MODELS["deepseek-v4.1-flash"],
+        chip,
+        w,
+        max_chips=8,
+        k=3,
+        kv_bw_per_gpu=50 * GB,
+        cluster_gpus=16,
+    )
+    assert coloc and disagg
+    top = disagg[0]
+    assert top["total_gpus"] <= 16
+    assert top["kv_xfer_ms"] > 0
+    assert top["ttft_s"] <= w.ttft_sla_s
+    assert top["decode_tps_user"] >= w.decode_tps_sla
+    assert "P:" in top["ratio"] and top["ratio"].endswith("D")
+
+    # Tight KV bandwidth penalizes TTFT / batch capacity as expected
+    slow_kv = rank_disagg(
+        MODELS["qwen3-30b-a3b"],
+        CHIPS["H100"],
+        Workload(isl=16384, osl=512, ttft_sla_s=1.0, decode_tps_sla=40.0),
+        max_chips=8,
+        kv_bw_per_gpu=1 * GB,
+    )
+    fast_kv = rank_disagg(
+        MODELS["qwen3-30b-a3b"],
+        CHIPS["H100"],
+        Workload(isl=16384, osl=512, ttft_sla_s=1.0, decode_tps_sla=40.0),
+        max_chips=8,
+        kv_bw_per_gpu=100 * GB,
+    )
+    assert fast_kv
+    if slow_kv:
+        assert fast_kv[0]["tpm_per_chip"] >= slow_kv[0]["tpm_per_chip"]
+
+    cli_mod.main([
+        "costmodel",
+        "--model", "deepseek-v4.1-flash",
+        "-p", "profiles/h20_3e_hw_profile.json",
+        "--ttft", "3.0",
+        "--tps", "30",
+        "--max-chips", "8",
+        "--disagg",
+        "--cluster-gpus", "16",
+        "--json",
+    ])
+    out = json.loads(capsys.readouterr().out)
+    assert out["mode"] == "disagg"
+    assert out["rankings"] and out["rankings"][0]["total_gpus"] <= 16

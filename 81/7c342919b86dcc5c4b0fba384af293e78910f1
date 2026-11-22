@@ -1,0 +1,26 @@
+configs/dsv41_flash_h20_sglang_pd.yaml
+  h_7339bf36ecd0bc 1-110
+kiln/cli.py
+  h_7339bf36ecd0bc 52-76,674-683
+kiln/config.py
+  h_7339bf36ecd0bc 23,29,33-103,117,121,128-133,449-451
+kiln/engine/factory.py
+  h_7339bf36ecd0bc 25-27
+kiln/engine/sglang_pd.py
+  h_7339bf36ecd0bc 1-729
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 1274-1284
+tests/test_sglang_pd.py
+  h_7339bf36ecd0bc 1-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "817c342919b86dcc5c4b0fba384af293e78910f1",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

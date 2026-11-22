@@ -3,11 +3,49 @@ from __future__ import annotations
 
 import ast
 import math
+import os
 import re
 import sys
 import types
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
+
+
+VALID_PATCH_PHASES = ("all", "prefill", "decode")
+
+
+def normalize_pd_role(role: str | None) -> str:
+    """Normalize PD role strings to `'prefill'`, `'decode'`, or `'both'`."""
+    val = (role or "").strip().lower()
+    if val in ("prefill", "prefill_only", "kv_producer"):
+        return "prefill"
+    if val in ("decode", "decode_only", "kv_consumer"):
+        return "decode"
+    return "both"
+
+
+def current_pd_role(model: Any = None) -> str:
+    """Return active PD execution role (`'prefill'`, `'decode'`, or `'both'`)."""
+    if model is not None:
+        attr = getattr(model, "_kiln_pd_role", None)
+        if isinstance(attr, str) and attr.strip():
+            return normalize_pd_role(attr)
+    return normalize_pd_role(os.environ.get("KILN_PD_ROLE"))
+
+
+def _resolve_patch_phase(phase: str, regime: str) -> str:
+    p = str(phase or "all").strip().lower() or "all"
+    if p == "both":
+        p = "all"
+    if p == "all":
+        reg = str(regime or "").strip().lower()
+        if reg in ("prefill", "prefill_only"):
+            p = "prefill"
+        elif reg in ("decode", "decode_only"):
+            p = "decode"
+    if p not in VALID_PATCH_PHASES:
+        raise ValueError(f"Unsupported patch phase {phase!r}; expected one of {VALID_PATCH_PHASES}")
+    return p
 
 
 class PatchConflictError(ValueError):
@@ -30,23 +68,36 @@ class PatchSpec:
     targets: tuple[str, ...] = ()
     description: str = ""
     returns_forward: bool = False
+    phase: str = "all"
+
+
+def patch_matches_pd_role(spec: PatchSpec | None, pd_role: str) -> bool:
+    """Return True if `spec` should be installed on an instance serving `pd_role`."""
+    role = normalize_pd_role(pd_role)
+    if spec is None or role == "both" or spec.phase == "all":
+        return True
+    return spec.phase == role
 
 
 def kiln_patch(
     name: str,
     *,
     regime: str = "all",
+    phase: str = "all",
     targets: Sequence[str] = (),
     description: str = "",
     returns_forward: bool = False,
 ) -> Callable[[Callable], Callable]:
-    """Mark a modular patch callable with its orthogonal name, regime, and patched targets."""
+    """Mark a modular patch callable with its orthogonal name, regime, PD phase, and patched targets."""
+    clean_regime = str(regime).strip() or "all"
+    resolved_phase = _resolve_patch_phase(phase, clean_regime)
     spec = PatchSpec(
         name=str(name).strip(),
-        regime=str(regime).strip() or "all",
+        regime=clean_regime,
         targets=tuple(str(t).strip() for t in targets if str(t).strip()),
         description=str(description).strip(),
         returns_forward=bool(returns_forward),
+        phase=resolved_phase,
     )
 
     def _decorator(fn: Callable) -> Callable:
@@ -89,9 +140,12 @@ def make_composite_forward(
     def make_forward(model: Any):
         applied_undos.clear()
         root_forward = None
+        active_role = current_pd_role(model)
         try:
             for patch_fn in patches:
                 spec = getattr(patch_fn, "__kiln_patch__", None)
+                if isinstance(spec, PatchSpec) and not patch_matches_pd_role(spec, active_role):
+                    continue
                 res = patch_fn(model)
                 undo_fn = None
                 if isinstance(spec, PatchSpec) and spec.returns_forward:
@@ -209,6 +263,7 @@ def _extract_decorator_patch(call: ast.Call) -> dict[str, Any]:
         if strs:
             name = strs[0]
     regime = "all"
+    phase = "all"
     targets: list[str] = []
     for kw in call.keywords:
         if kw.arg == "name":
@@ -219,9 +274,17 @@ def _extract_decorator_patch(call: ast.Call) -> dict[str, Any]:
             strs = _literal_str_seq(kw.value)
             if strs:
                 regime = strs[0]
+        elif kw.arg == "phase":
+            strs = _literal_str_seq(kw.value)
+            if strs:
+                phase = strs[0]
         elif kw.arg == "targets":
             targets.extend(_literal_str_seq(kw.value))
-    return {"name": name, "regime": regime, "targets": targets}
+    try:
+        resolved_phase = _resolve_patch_phase(phase, regime)
+    except ValueError:
+        resolved_phase = "all"
+    return {"name": name, "regime": regime, "phase": resolved_phase, "targets": targets}
 
 
 def _infer_tags(tokens: Sequence[str]) -> list[str]:
@@ -243,24 +306,29 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
             "tags": [],
             "parents": [],
             "regimes": [],
+            "phases": [],
             "patches": [],
             "targets": [],
             "mock_speedup": None,
+            "mock_prefill_speedup": None,
             "mock_bucket_speedups": {},
         }
 
     tags: list[str] = []
     parents: list[str] = []
     regimes: list[str] = []
+    phases: list[str] = []
     patches: list[dict[str, Any]] = []
     targets: list[str] = []
     seen_tags: set[str] = set()
     seen_parents: set[str] = set()
     seen_regimes: set[str] = set()
+    seen_phases: set[str] = set()
     seen_targets: set[str] = set()
     symbol_tokens: list[str] = []
     imported_aliases: dict[str, str] = {}
     mock_speedup: float | None = None
+    mock_prefill_speedup: float | None = None
     mock_bucket_speedups: dict[str, float] = {}
 
     def _add_tag(val: str) -> None:
@@ -316,6 +384,10 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
                     num = _literal_num(stmt.value)
                     if num is not None:
                         mock_speedup = num
+                elif tgt.id == "PREFILL_SPEEDUP":
+                    num = _literal_num(stmt.value)
+                    if num is not None:
+                        mock_prefill_speedup = num
                 elif tgt.id == "BUCKET_SPEEDUPS":
                     mock_bucket_speedups = _literal_bucket_map(stmt.value)
 
@@ -334,6 +406,9 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
                     _add_tag(pinfo["name"])
                 if pinfo["regime"] and pinfo["regime"] != "all":
                     _add_regime(pinfo["regime"])
+                if pinfo["phase"] and pinfo["phase"] != "all" and pinfo["phase"] not in seen_phases:
+                    seen_phases.add(pinfo["phase"])
+                    phases.append(pinfo["phase"])
                 for t in pinfo["targets"]:
                     _add_target(t)
         elif isinstance(node, ast.ClassDef):
@@ -390,9 +465,11 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
         "tags": tags,
         "parents": parents,
         "regimes": regimes,
+        "phases": phases,
         "patches": patches,
         "targets": targets,
         "mock_speedup": mock_speedup,
+        "mock_prefill_speedup": mock_prefill_speedup,
         "mock_bucket_speedups": mock_bucket_speedups,
     }
 
@@ -492,6 +569,7 @@ def compose_candidates(
         '"""Auto-composed orthogonal candidate synthesized by `kiln merge`."""',
         "from __future__ import annotations",
         "",
+        "import linecache",
         "import sys",
         "import types",
         "",
@@ -520,13 +598,15 @@ def compose_candidates(
         "    mod_name = f'_kiln_merged_{idx}_{safe_id}'",
         "    mod = types.ModuleType(mod_name)",
         "    mod.__file__ = f'<kiln_merged:{jid}>'",
+        "    linecache.cache[mod.__file__] = (len(src), None, src.splitlines(keepends=True), mod.__file__)",
         "    sys.modules[mod_name] = mod",
         "    exec(compile(src, mod.__file__, 'exec'), mod.__dict__)",
         "    return mod",
         "",
         "",
         "def _cleanup_loaded() -> None:",
-        "    for mod_name, _ in reversed(_LOADED_PARENTS):",
+        "    for mod_name, mod in reversed(_LOADED_PARENTS):",
+        "        linecache.cache.pop(getattr(mod, '__file__', None), None)",
         "        sys.modules.pop(mod_name, None)",
         "    _LOADED_PARENTS.clear()",
         "",
@@ -541,6 +621,7 @@ def compose_candidates(
         "            except BaseException as exc:",
         "                if first_err is None:",
         "                    first_err = exc",
+        "        linecache.cache.pop(getattr(mod, '__file__', None), None)",
         "        sys.modules.pop(mod_name, None)",
         "    if first_err is not None:",
         "        raise first_err",
@@ -585,4 +666,176 @@ def compose_candidates(
         "parent_ids": parent_ids,
         "tags": merged_tags,
         "conflicts": conflicts,
+    }
+
+
+def compose_pd_pair(
+    prefill_item: tuple[str, str],
+    decode_item: tuple[str, str],
+) -> dict[str, Any]:
+    """Bundle asymmetric `(prefill_id, prefill_src)` + `(decode_id, decode_src)` into one PD-aware candidate.
+
+    At hot-reload time, `make_forward(model)` inspects `current_pd_role(model)`:
+    - `'prefill'` instances execute ONLY `prefill_src`.
+    - `'decode'` instances execute ONLY `decode_src`.
+    - `'both'` (colocated fallback) executes both if their targets are disjoint, else `decode_src`.
+    Because P and D workers run in isolated processes under PD disaggregation, overlapping targets
+    between `prefill_src` and `decode_src` are safe and never raise `PatchConflictError`.
+    """
+    p_id, p_src = prefill_item
+    d_id, d_src = decode_item
+    info_p = inspect_candidate_source(p_src)
+    if not info_p["syntax_ok"]:
+        raise ValueError(f"Prefill candidate {p_id} has invalid Python syntax")
+    info_d = inspect_candidate_source(d_src)
+    if not info_d["syntax_ok"]:
+        raise ValueError(f"Decode candidate {d_id} has invalid Python syntax")
+
+    parent_ids: list[str] = []
+    for jid in (p_id, d_id):
+        if jid and jid not in parent_ids:
+            parent_ids.append(jid)
+
+    merged_tags: list[str] = []
+    for tag in [*info_p["tags"], *info_d["tags"], "pd_pair"]:
+        if tag and tag not in merged_tags:
+            merged_tags.append(tag)
+
+    colocated_conflicts = (
+        [] if p_id == d_id else detect_candidate_conflicts([(p_id, info_p), (d_id, info_d)])
+    )
+    has_colocated_overlap = bool(colocated_conflicts)
+
+    mock_decode_sp = info_d["mock_speedup"]
+    mock_prefill_sp = (
+        info_p["mock_prefill_speedup"]
+        or info_p["mock_bucket_speedups"].get("prefill_large")
+        or info_p["mock_speedup"]
+    )
+    combined_buckets: dict[str, float] = {}
+    for k in ("decode_small", "decode_mid"):
+        if k in info_d["mock_bucket_speedups"]:
+            combined_buckets[k] = round(float(info_d["mock_bucket_speedups"][k]), 6)
+        elif mock_decode_sp is not None:
+            combined_buckets[k] = round(float(mock_decode_sp), 6)
+    if "prefill_large" in info_p["mock_bucket_speedups"]:
+        combined_buckets["prefill_large"] = round(float(info_p["mock_bucket_speedups"]["prefill_large"]), 6)
+    elif mock_prefill_sp is not None:
+        combined_buckets["prefill_large"] = round(float(mock_prefill_sp), 6)
+
+    lines: list[str] = [
+        '"""Asymmetric Prefill/Decode candidate pair synthesized by `kiln merge --prefill --decode`."""',
+        "from __future__ import annotations",
+        "",
+        "import linecache",
+        "import os",
+        "import sys",
+        "import types",
+        "",
+        f"KILN_PARENTS = {parent_ids!r}",
+        f"KILN_TAGS = {merged_tags!r}",
+        f"KILN_PD_PAIR = {{'prefill': {p_id!r}, 'decode': {d_id!r}}}",
+    ]
+    if mock_decode_sp is not None:
+        lines.append(f"SPEEDUP = {round(float(mock_decode_sp), 6)!r}")
+    if mock_prefill_sp is not None:
+        lines.append(f"PREFILL_SPEEDUP = {round(float(mock_prefill_sp), 6)!r}")
+    if combined_buckets:
+        lines.append(f"BUCKET_SPEEDUPS = {combined_buckets!r}")
+
+    lines.extend([
+        "",
+        f"_PREFILL_SPEC: tuple[str, str] = ({p_id!r}, {p_src!r})",
+        f"_DECODE_SPEC: tuple[str, str] = ({d_id!r}, {d_src!r})",
+        f"_HAS_COLOCATED_OVERLAP: bool = {has_colocated_overlap!r}",
+        "_LOADED: list[tuple[str, types.ModuleType]] = []",
+        "",
+        "",
+        "def _active_role(model) -> str:",
+        "    attr = getattr(model, '_kiln_pd_role', None) if model is not None else None",
+        "    raw = (attr if isinstance(attr, str) and attr.strip() else os.environ.get('KILN_PD_ROLE', '')).strip().lower()",
+        "    if raw in ('prefill', 'prefill_only', 'kv_producer'):",
+        "        return 'prefill'",
+        "    if raw in ('decode', 'decode_only', 'kv_consumer'):",
+        "        return 'decode'",
+        "    return 'both'",
+        "",
+        "",
+        "def _load_role_module(role_tag: str, jid: str, src: str) -> types.ModuleType:",
+        "    safe_id = ''.join(ch if ch.isalnum() or ch == '_' else '_' for ch in jid)",
+        "    mod_name = f'_kiln_pd_{role_tag}_{safe_id}'",
+        "    mod = types.ModuleType(mod_name)",
+        "    mod.__file__ = f'<kiln_pd:{role_tag}:{jid}>'",
+        "    linecache.cache[mod.__file__] = (len(src), None, src.splitlines(keepends=True), mod.__file__)",
+        "    sys.modules[mod_name] = mod",
+        "    exec(compile(src, mod.__file__, 'exec'), mod.__dict__)",
+        "    return mod",
+        "",
+        "",
+        "def _restore_applied(applied: list[tuple[str, types.ModuleType]], model) -> None:",
+        "    first_err = None",
+        "    for mod_name, mod in reversed(applied):",
+        "        restore_fn = getattr(mod, 'restore', None)",
+        "        if callable(restore_fn):",
+        "            try:",
+        "                restore_fn(model)",
+        "            except BaseException as exc:",
+        "                if first_err is None:",
+        "                    first_err = exc",
+        "        linecache.cache.pop(getattr(mod, '__file__', None), None)",
+        "        sys.modules.pop(mod_name, None)",
+        "    if first_err is not None:",
+        "        raise first_err",
+        "",
+        "",
+        "def make_forward(model):",
+        "    restore(model)",
+        "    role = _active_role(model)",
+        "    if role == 'prefill':",
+        "        specs = [('prefill', *_PREFILL_SPEC)]",
+        "    elif role == 'decode':",
+        "        specs = [('decode', *_DECODE_SPEC)]",
+        "    elif _PREFILL_SPEC[0] == _DECODE_SPEC[0] or _HAS_COLOCATED_OVERLAP:",
+        "        specs = [('decode', *_DECODE_SPEC)]",
+        "    else:",
+        "        specs = [('prefill', *_PREFILL_SPEC), ('decode', *_DECODE_SPEC)]",
+        "    root_forward = None",
+        "    applied: list[tuple[str, types.ModuleType]] = []",
+        "    try:",
+        "        for role_tag, jid, src in specs:",
+        "            mod = _load_role_module(role_tag, jid, src)",
+        "            applied.append((mod.__name__, mod))",
+        "            _LOADED.append((mod.__name__, mod))",
+        "            mk = getattr(mod, 'make_forward', None)",
+        "            if not callable(mk):",
+        "                from kiln.patches import make_composite_forward",
+        "                mk, auto_restore = make_composite_forward(vars(mod))",
+        "                if not hasattr(mod, 'restore'):",
+        "                    mod.restore = auto_restore",
+        "            new_fwd = mk(model)",
+        "            if new_fwd is not None:",
+        "                model.forward = new_fwd",
+        "                root_forward = new_fwd",
+        "    except BaseException:",
+        "        _LOADED.clear()",
+        "        _restore_applied(applied, model)",
+        "        raise",
+        "    return root_forward",
+        "",
+        "",
+        "def restore(model) -> None:",
+        "    applied = list(_LOADED)",
+        "    _LOADED.clear()",
+        "    if applied:",
+        "        _restore_applied(applied, model)",
+        "",
+    ])
+
+    return {
+        "source": "\n".join(lines),
+        "parent_ids": parent_ids,
+        "prefill_id": p_id,
+        "decode_id": d_id,
+        "tags": merged_tags,
+        "colocated_conflicts": colocated_conflicts,
     }

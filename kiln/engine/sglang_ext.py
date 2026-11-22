@@ -16,14 +16,17 @@ Candidate contract (identical to vLLM, see `candidates/baseline_forward.py`):
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib
 import importlib.abc
 import importlib.util
 import inspect
 import json
+import linecache
 import math
 import os
 import sys
+import tempfile
 import time
 import types
 from pathlib import Path
@@ -395,6 +398,32 @@ def _resolve_workers(owner):
     return target_worker, target_runner, spec_worker, draft_runners
 
 
+def resolve_sglang_pd_role(server_args: object = None, explicit_role: str | None = None) -> str:
+    """Determine PD execution role (`'prefill'`, `'decode'`, or `'both'`) for an SGLang worker."""
+    if isinstance(explicit_role, str) and explicit_role.strip():
+        norm = explicit_role.strip().lower()
+        if norm in ("prefill", "prefill_only", "kv_producer"):
+            return "prefill"
+        if norm in ("decode", "decode_only", "kv_consumer"):
+            return "decode"
+        if norm in ("both", "all", "null", "none"):
+            return "both"
+    mode = getattr(server_args, "disaggregation_mode", None)
+    if mode is None:
+        disagg_ns = getattr(server_args, "disagg", None)
+        mode = getattr(disagg_ns, "disaggregation_mode", None)
+    if isinstance(mode, str):
+        m_low = mode.strip().lower()
+        if m_low == "prefill":
+            return "prefill"
+        if m_low == "decode":
+            return "decode"
+    env_role = os.environ.get("KILN_PD_ROLE", "").strip().lower()
+    if env_role in ("prefill", "decode"):
+        return env_role
+    return "both"
+
+
 # --------------------------------------------------------------------------- HotReload controller
 class SGLangHotReloadController:
     """Attached lazily to each SGLang `Scheduler` rank to manage candidate hot reload."""
@@ -404,12 +433,15 @@ class SGLangHotReloadController:
         self.scheduler = getattr(owner, "scheduler", None) or owner
         self._kiln_patched: list | None = None
         self._kiln_module: types.ModuleType | None = None
+        self._kiln_temp_path: Path | None = None
         self._kiln_dirty: bool = False
         self._kiln_snapshot_collector: object | None = None
 
     def dispatch(self, method: str, args: list, kwargs: dict):
         if method == "kiln_hot_reload":
             return self.kiln_hot_reload(*args, **kwargs)
+        if method == "kiln_hot_reload_source":
+            return self.kiln_hot_reload_source(*args, **kwargs)
         if method == "kiln_teardown":
             return self.kiln_teardown(*args, **kwargs)
         if method == "kiln_info":
@@ -420,33 +452,79 @@ class SGLangHotReloadController:
             return self.kiln_finish_snapshot_capture(*args, **kwargs)
         raise ValueError(f"Unknown kiln SGLang RPC method: {method!r}")
 
-    def kiln_hot_reload(self, path: str) -> float:
-        """Install candidate `path`, reset compile/graphs, and recapture. Returns seconds taken."""
+    def _clear_pd_context(self, model) -> None:
+        if model is not None and hasattr(model, "_kiln_pd_role"):
+            try:
+                delattr(model, "_kiln_pd_role")
+            except Exception:
+                pass
+
+    def _install_from_path(
+        self, path: str, *, pd_role: str | None = None, temp_path: Path | None = None
+    ) -> float:
         t0 = time.perf_counter()
         _, target_runner, _, _ = _resolve_workers(self.owner)
         model = _get_raw_model(target_runner)
         self.kiln_teardown()
 
+        linecache.checkcache(path)
+        importlib.invalidate_caches()
         name = f"kiln_candidate_{abs(hash((path, t0)))}"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
             raise ImportError(f"Cannot load candidate module from {path}")
         mod = importlib.util.module_from_spec(spec)
+        server_args = getattr(target_runner, "server_args", None) or getattr(self.scheduler, "server_args", None)
+        role = resolve_sglang_pd_role(server_args, explicit_role=pd_role)
         self._kiln_patched = snapshot_forwards(model)
         self._kiln_module = mod
+        self._kiln_temp_path = temp_path
+        try:
+            model._kiln_pd_role = role
+        except Exception:
+            pass
         sys.modules[name] = mod
         rebuild_started = False
+        had_env = "KILN_PD_ROLE" in os.environ
+        prev_env = os.environ.get("KILN_PD_ROLE")
         try:
-            spec.loader.exec_module(mod)
-            new_fwd = mod.make_forward(model)
-            if new_fwd is not None:
-                model.forward = new_fwd
+            os.environ["KILN_PD_ROLE"] = role
+            try:
+                spec.loader.exec_module(mod)
+                new_fwd = mod.make_forward(model)
+                if new_fwd is not None:
+                    model.forward = new_fwd
+            finally:
+                if had_env and prev_env is not None:
+                    os.environ["KILN_PD_ROLE"] = prev_env
+                else:
+                    os.environ.pop("KILN_PD_ROLE", None)
             rebuild_started = True
             self._rebuild()
         except Exception:
             self._restore_baseline(rebuild=rebuild_started)
             raise
         return time.perf_counter() - t0
+
+    def kiln_hot_reload(self, path: str, pd_role: str | None = None) -> float:
+        """Install candidate `path`, reset compile/graphs, and recapture. Returns seconds taken."""
+        return self._install_from_path(path, pd_role=pd_role)
+
+    def kiln_hot_reload_source(
+        self, source: str, label: str = "candidate.py", pd_role: str | None = None
+    ) -> float:
+        """Materialize `source` on local temp storage (for `@triton.jit` source inspection) and hot-reload."""
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("Candidate source must be a non-empty string")
+        # Ensure teardown runs before writing a new temp file if a previous candidate was installed.
+        self.kiln_teardown()
+        sha = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+        safe_stem = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in Path(label).stem) or "cand"
+        tmp_path = Path(tempfile.gettempdir()) / f"kiln_sgl_{os.getpid()}_{safe_stem}_{sha}.py"
+        tmp_path.write_text(source, encoding="utf-8")
+        return self._install_from_path(str(tmp_path), pd_role=pd_role, temp_path=tmp_path)
 
     def kiln_teardown(self) -> float:
         """Restore baseline `.forward` across `model` and all submodules, then recapture."""
@@ -459,6 +537,8 @@ class SGLangHotReloadController:
 
     def _restore_baseline(self, rebuild: bool) -> None:
         mod = self._kiln_module
+        temp_path = self._kiln_temp_path
+        model = None
         try:
             _, target_runner, _, _ = _resolve_workers(self.owner)
             model = _get_raw_model(target_runner)
@@ -473,15 +553,24 @@ class SGLangHotReloadController:
             self._kiln_dirty = True
             raise RuntimeError("Kiln candidate rollback failed; restart the engine") from exc
         finally:
+            self._clear_pd_context(model)
             if mod is not None:
+                linecache.cache.pop(getattr(mod, "__file__", None), None)
                 sys.modules.pop(mod.__name__, None)
+            if temp_path is not None:
+                linecache.cache.pop(str(temp_path), None)
+                temp_path.unlink(missing_ok=True)
             self._kiln_module = None
+            self._kiln_temp_path = None
             self._kiln_patched = None
 
     def kiln_info(self) -> dict:
         _, target_runner, spec_worker, draft_runners = _resolve_workers(self.owner)
         model = _get_raw_model(target_runner)
         server_args = getattr(target_runner, "server_args", None) or getattr(self.scheduler, "server_args", None)
+        disagg_mode = getattr(server_args, "disaggregation_mode", None)
+        if disagg_mode is None:
+            disagg_mode = getattr(getattr(server_args, "disagg", None), "disaggregation_mode", "null")
         num_graphs = (
             _count_graphs(target_runner, _MODEL_RUNNER_GRAPH_ATTRS)
             + _count_graphs(spec_worker, _SPEC_WORKER_GRAPH_ATTRS)
@@ -495,6 +584,8 @@ class SGLangHotReloadController:
             "enable_piecewise_cuda_graph": bool(getattr(server_args, "enable_piecewise_cuda_graph", False)),
             "has_speculator": spec_worker is not None,
             "num_graphs": num_graphs,
+            "disaggregation_mode": str(disagg_mode or "null"),
+            "pd_role": resolve_sglang_pd_role(server_args),
             "tp_rank": getattr(target_runner, "tp_rank", getattr(self.scheduler, "tp_rank", 0)),
             "dp_rank": getattr(self.scheduler, "dp_rank", 0),
         }

@@ -757,3 +757,113 @@ def test_sglang_engines_is_alive_and_zombie_reap():
     assert srv.is_alive() is True
     srv.proc = DeadProc()
     assert srv.is_alive() is False
+
+
+def test_sglang_inline_source_rpc_and_pd_role_patches(monkeypatch):
+    from kiln.patches import compose_pd_pair, inspect_candidate_source, kiln_patch, make_composite_forward
+
+    class Layer:
+        def forward(self, x):
+            return x + 1
+
+    class Model:
+        def __init__(self):
+            self.layer = Layer()
+
+        def named_modules(self):
+            yield "", self
+            yield "layer", self.layer
+
+        def forward(self, x):
+            return self.layer.forward(x)
+
+    prefill_model = Model()
+    decode_model = Model()
+    p_sched = SimpleNamespace(
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=prefill_model,
+                server_args=SimpleNamespace(disable_cuda_graph=True, disaggregation_mode="prefill"),
+            )
+        )
+    )
+    d_sched = SimpleNamespace(
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=decode_model,
+                server_args=SimpleNamespace(disable_cuda_graph=True, disaggregation_mode="decode"),
+            )
+        )
+    )
+    p_ctrl = SGLangHotReloadController(p_sched)
+    d_ctrl = SGLangHotReloadController(d_sched)
+    assert p_ctrl.kiln_info()["disaggregation_mode"] == "prefill"
+    assert p_ctrl.kiln_info()["pd_role"] == "prefill"
+    assert d_ctrl.kiln_info()["disaggregation_mode"] == "decode"
+    assert d_ctrl.kiln_info()["pd_role"] == "decode"
+
+    monkeypatch.setenv("KILN_PD_ROLE", "sentinel_prev")
+    # 1. Single role-aware candidate using @kiln_patch(phase=...) + inspect.getsourcelines check
+    role_src = (
+        "import inspect, types\n"
+        "from kiln.patches import kiln_patch, make_composite_forward\n"
+        "def _triton_like_kernel(x):\n"
+        "    return x * 100\n"
+        "@kiln_patch('p_opt', phase='prefill', targets=['Layer'])\n"
+        "def apply_prefill(model):\n"
+        "    lines, _ = inspect.getsourcelines(_triton_like_kernel)\n"
+        "    assert any('x * 100' in ln for ln in lines)\n"
+        "    model.layer.forward = types.MethodType(lambda self, x: _triton_like_kernel(x), model.layer)\n"
+        "@kiln_patch('d_opt', phase='decode', targets=['Layer'])\n"
+        "def apply_decode(model):\n"
+        "    model.layer.forward = types.MethodType(lambda self, x: x + 42, model.layer)\n"
+        "make_forward, restore = make_composite_forward(globals())\n"
+    )
+    info = inspect_candidate_source(role_src)
+    assert set(info["phases"]) == {"prefill", "decode"}
+
+    p_ctrl.dispatch("kiln_hot_reload_source", [role_src, "role_cand.py"], {})
+    p_tmp = p_ctrl._kiln_temp_path
+    assert p_tmp is not None and p_tmp.exists()
+    assert prefill_model.forward(3) == 300
+
+    d_ctrl.dispatch("kiln_hot_reload_source", [role_src, "role_cand.py"], {})
+    assert decode_model.forward(3) == 45
+
+    p_ctrl.kiln_teardown()
+    d_ctrl.kiln_teardown()
+    assert not p_tmp.exists()
+    assert prefill_model.forward(3) == 4
+    assert decode_model.forward(3) == 4
+    assert os.environ.get("KILN_PD_ROLE") == "sentinel_prev"
+
+    # 2. Asymmetric P+D pair composition where P and D patch the SAME target incompatibly
+    p_only = (
+        "import inspect, types\n"
+        "PREFILL_SPEEDUP = 1.35\n"
+        "def _p_kern(v): return v * 10\n"
+        "def make_forward(model):\n"
+        "    assert inspect.getsourcelines(_p_kern)[0]\n"
+        "    model.layer.forward = types.MethodType(lambda self, x: _p_kern(x), model.layer)\n"
+        "    return None\n"
+    )
+    d_only = (
+        "import types\n"
+        "SPEEDUP = 1.25\n"
+        "def make_forward(model):\n"
+        "    model.layer.forward = types.MethodType(lambda self, x: x + 77, model.layer)\n"
+        "    return None\n"
+    )
+    pair = compose_pd_pair(("job-p1", p_only), ("job-d1", d_only))
+    assert pair["parent_ids"] == ["job-p1", "job-d1"]
+    assert "pd_pair" in pair["tags"]
+    assert pair["colocated_conflicts"]  # overlapping target `model.layer.forward` detected for colocated fallback
+
+    p_ctrl.kiln_hot_reload_source(pair["source"], "pd_pair.py")
+    d_ctrl.kiln_hot_reload_source(pair["source"], "pd_pair.py")
+    assert prefill_model.forward(5) == 50
+    assert decode_model.forward(5) == 82
+    p_ctrl.kiln_teardown()
+    d_ctrl.kiln_teardown()
+    assert prefill_model.forward(5) == 6
+    assert decode_model.forward(5) == 6

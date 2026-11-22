@@ -141,6 +141,15 @@ class SGLangOfflineEngine(Engine):
         if isinstance(secs, (int, float)):
             print(f"[kiln] {self.tier.name}: hot reload {secs:.1f}s")
 
+    def hot_reload_source(
+        self, source: str, label: str = "candidate.py", pd_role: str | None = None
+    ) -> None:
+        args = [source, label] if pd_role is None else [source, label, pd_role]
+        secs = self._rpc("kiln_hot_reload_source", *args)
+        self._flush_cache()
+        if isinstance(secs, (int, float)):
+            print(f"[kiln] {self.tier.name}: hot reload (inline) {secs:.1f}s")
+
     def teardown_candidate(self) -> None:
         self._rpc("kiln_teardown")
         self._flush_cache()

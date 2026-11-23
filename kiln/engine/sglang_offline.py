@@ -304,6 +304,9 @@ class SGLangOfflineEngine(Engine):
         if not tdir or not prompts:
             return None, None
         try:
+            if max_new_tokens == 1:
+                # Reproduce the cold prefill used for throughput and TTFT.
+                self._flush_cache()
             try:
                 self.engine.start_profile(output_dir=tdir)
             except TypeError:

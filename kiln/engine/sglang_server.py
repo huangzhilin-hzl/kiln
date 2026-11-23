@@ -333,6 +333,9 @@ class SGLangServerEngine(Engine):
         if not self._trace_dir or not requests:
             return None, None
         try:
+            if max_new_tokens == 1:
+                # Reproduce the cold prefill used for throughput and TTFT.
+                self._reset_cache()
             self.http.post(
                 f"{self.url}/start_profile",
                 headers=self._admin_headers,

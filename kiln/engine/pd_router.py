@@ -132,6 +132,63 @@ class PDRouterState:
         return modified
 
 
+class _DecodeStreamResponse(StreamingResponse):
+    def __init__(self, upstream: httpx.Response):
+        self.upstream = upstream
+        super().__init__(
+            upstream.aiter_bytes(),
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+        )
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.upstream.aclose()
+
+
+async def _stream_pair(client: httpx.AsyncClient, prefill_url: str, decode_url: str, body: dict):
+    async def start_backend(url: str, payload: dict, stream: bool) -> httpx.Response:
+        request = client.build_request("POST", url, json=payload)
+        response = await client.send(request, stream=stream)
+        if response.is_success:
+            return response
+        try:
+            await response.aread()
+            response.raise_for_status()
+        finally:
+            await response.aclose()
+
+    # Ask prefill for a completed HTTP response so generation failures are visible
+    # before committing the decode stream. Both halves still start concurrently.
+    prefill_body = {**body, "stream": False}
+    prefill_body.pop("stream_options", None)
+    prefill_task = asyncio.create_task(start_backend(prefill_url, prefill_body, False))
+    decode_task = asyncio.create_task(start_backend(decode_url, body, True))
+    streaming = False
+    try:
+        _, decode = await asyncio.gather(prefill_task, decode_task)
+        response = _DecodeStreamResponse(decode)
+        streaming = True
+        return response
+    except httpx.HTTPStatusError as exc:
+        upstream = exc.response
+        headers = {key: upstream.headers[key] for key in ("content-type", "retry-after") if key in upstream.headers}
+        return Response(upstream.content, status_code=upstream.status_code, headers=headers)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="PD backend timed out") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="PD backend request failed") from exc
+    finally:
+        if not streaming:
+            prefill_task.cancel()
+            decode_task.cancel()
+            _, decode = await asyncio.gather(prefill_task, decode_task, return_exceptions=True)
+            if isinstance(decode, httpx.Response):
+                await decode.aclose()
+
+
 def create_pd_router_app(
     prefill_nodes: list[tuple[str, int | None]],
     decode_urls: list[str],
@@ -180,23 +237,7 @@ def create_pd_router_app(
         client = _client()
 
         if modified.get("stream", False):
-            async def _run_prefill() -> httpx.Response:
-                return await client.post(f"{p_url}/{endpoint}", json=modified)
-
-            async def _stream_gen():
-                prefill_task = asyncio.create_task(_run_prefill())
-                try:
-                    async with client.stream("POST", f"{d_url}/{endpoint}", json=modified) as d_resp:
-                        async for chunk in d_resp.aiter_bytes():
-                            if chunk:
-                                yield chunk
-                finally:
-                    try:
-                        await prefill_task
-                    except Exception:
-                        pass
-
-            return StreamingResponse(_stream_gen(), media_type="text/event-stream")
+            return await _stream_pair(client, f"{p_url}/{endpoint}", f"{d_url}/{endpoint}", modified)
 
         p_resp, d_resp = await asyncio.gather(
             client.post(f"{p_url}/{endpoint}", json=modified),

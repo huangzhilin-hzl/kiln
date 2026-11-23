@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -323,3 +324,63 @@ def test_pd_router_fallback_and_2p1d_bootstrap_pairing(monkeypatch):
         }
         assert stats["decode_counts"] == {"http://127.0.0.1:31504": 4}
 
+
+@pytest.mark.parametrize("failed_role,status", [("prefill", 429), ("decode", 503)])
+def test_pd_stream_propagates_upstream_errors_without_waiting_for_peer(failed_role, status):
+    from fastapi.testclient import TestClient
+    from kiln.engine.pd_router import create_pd_router_app
+
+    cancelled = []
+    async def backend(request):
+        role = request.url.host
+        if role != failed_role:
+            try:
+                await asyncio.sleep(10)
+            finally:
+                cancelled.append(role)
+        return httpx.Response(status, json={"error": role}, headers={"Retry-After": "7"})
+
+    app = create_pd_router_app([("http://prefill", 8998)], ["http://decode"], transport=httpx.MockTransport(backend))
+    with TestClient(app) as tc:
+        r = tc.post("/v1/chat/completions", json={"stream": True})
+    assert r.status_code == status and r.json() == {"error": failed_role}
+    assert r.headers["retry-after"] == "7"
+    assert cancelled == ["decode" if failed_role == "prefill" else "prefill"]
+
+
+@pytest.mark.parametrize("prefill_fails", [False, True])
+def test_pd_stream_closes_decode_after_prefill_result(prefill_fails):
+    from fastapi.testclient import TestClient
+    from kiln.engine.pd_router import create_pd_router_app
+
+    closed = []
+    seen = {}
+
+    class DecodeBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"data: hello\n\n"
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self):
+            closed.append(True)
+
+    async def backend(request):
+        role = request.url.host
+        seen[role] = json.loads(request.content)
+        if role == "decode":
+            return httpx.Response(200, stream=DecodeBody(), headers={"content-type": "text/event-stream"})
+        await asyncio.sleep(0)
+        if prefill_fails:
+            raise httpx.ConnectError("unavailable", request=request)
+        return httpx.Response(200, json={})
+
+    app = create_pd_router_app([("http://prefill", 8998)], ["http://decode"], transport=httpx.MockTransport(backend))
+    with TestClient(app) as tc:
+        r = tc.post("/v1/chat/completions", json={"stream": True, "stream_options": {"include_usage": True}})
+    assert r.status_code == (502 if prefill_fails else 200)
+    if not prefill_fails:
+        assert r.text == "data: hello\n\ndata: [DONE]\n\n"
+    assert seen["prefill"]["stream"] is False and "stream_options" not in seen["prefill"]
+    assert seen["decode"]["stream"] and seen["decode"]["stream_options"] == {"include_usage": True}
+    assert seen["decode"]["bootstrap_room"] == seen["prefill"]["bootstrap_room"]
+    assert closed == [True]

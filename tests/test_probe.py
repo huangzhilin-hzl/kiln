@@ -275,3 +275,19 @@ def test_dsv41_dspark_rankings_satisfy_pd_launch_constraints():
     # Other presets still support asymmetric P/D layouts and DP attention.
     assert estimate_disagg(MODELS["qwen3-30b-a3b"], ParallelConfig(1, 2, 2, 1),
                            ParallelConfig(1, 1, 1, 1), CHIPS["H100"], Workload(isl=512))
+
+
+def test_disagg_cli_compares_against_colocated_within_cluster_budget(capsys):
+    from kiln.costmodel.model import CHIPS
+
+    model = MODELS["qwen3-30b-a3b"]
+    chip = CHIPS["H100"]
+    workload = Workload(isl=512)
+    unrestricted = rank(model, chip, workload, max_chips=8, k=1)[0]
+    affordable = rank(model, chip, workload, max_chips=2, k=1)[0]
+    assert unrestricted["n"] > 2
+    cli.main(["costmodel", "--model", model.name, "--chip", chip.name,
+              "--isl", "512", "--max-chips", "8", "--cluster-gpus", "2", "--disagg", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["rankings"] and all(r["total_gpus"] <= 2 for r in result["rankings"])
+    assert result["best_colocated_tpm_per_chip"] == affordable["tpm_per_chip"]

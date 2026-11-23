@@ -572,13 +572,14 @@ def cmd_costmodel(a):
                  ttft_sla_s=a.ttft, decode_tps_sla=a.tps)
     model_spec = MODELS[a.model]
     if a.disagg:
-        coloc = rank(model_spec, chip, w, max_chips=a.max_chips, k=1)
+        max_chips = a.max_chips if a.cluster_gpus is None else min(a.max_chips, a.cluster_gpus)
+        coloc = rank(model_spec, chip, w, max_chips=max_chips, k=1)
         best_coloc = coloc[0]["tpm_per_chip"] if coloc else None
         rows = rank_disagg(
             model_spec,
             chip,
             w,
-            max_chips=a.max_chips,
+            max_chips=max_chips,
             k=a.k,
             kv_bw_per_gpu=float(a.kv_bw_gbps) * GB,
             cluster_gpus=a.cluster_gpus,

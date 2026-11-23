@@ -34,7 +34,7 @@ from .base import (
     read_prometheus_metrics,
     shutdown_process_group,
 )
-from .replay import time_http_prefill
+from .replay import read_completion, time_http_prefill
 from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
 
@@ -147,23 +147,20 @@ class VLLMServerEngine(Engine):
         self._reset_cache()
 
     # ---------------------------------------------------------------- measure
-    def _complete_one_stats(self, prompt_ids: list[int], max_tokens: int) -> tuple[int, float]:
-        t0 = time.perf_counter()
-        r = self.http.post(f"{self.url}/v1/completions", json={
+    def _complete_one_stats(
+        self, prompt_ids: list[int], max_tokens: int, *, stream: bool = True
+    ) -> tuple[int, float | None]:
+        payload = {
             "model": self.served_name, "prompt": prompt_ids, "max_tokens": max_tokens,
-            "temperature": 0.0, "ignore_eos": True,
-        })
-        dt = max(time.perf_counter() - t0, 1e-9)
-        r.raise_for_status()
-        body = r.json()
-        usage = body.get("usage") or {}
-        if "completion_tokens" in usage:
-            return int(usage["completion_tokens"]), dt
-        choices = body.get("choices") or [{}]
-        return (len(choices[0].get("token_ids") or ()) or max_tokens), dt
+            "temperature": 0.0, "ignore_eos": True, "stream": stream,
+        }
+        if stream:
+            payload.update(return_token_ids=True, stream_options={"include_usage": True})
+        _, tokens, itl_ms = read_completion(self.http, f"{self.url}/v1/completions", payload, sglang=False)
+        return tokens, itl_ms
 
     def _complete_one(self, prompt_ids: list[int], max_tokens: int) -> int:
-        return self._complete_one_stats(prompt_ids, max_tokens)[0]
+        return self._complete_one_stats(prompt_ids, max_tokens, stream=False)[0]
 
     def _read_spec_metrics(self) -> dict[str, float]:
         return read_prometheus_metrics(
@@ -230,9 +227,7 @@ class VLLMServerEngine(Engine):
                 dt = max(time.perf_counter() - t0, 1e-9)
                 ntok = sum(tok for tok, _ in batch_stats)
                 decode_runs.append(ntok / dt)
-                for tok, req_dt in batch_stats:
-                    if tok > 0:
-                        itl_samples.append(1000.0 * req_dt / max(tok - 1, 1))
+                itl_samples.extend(itl for _, itl in batch_stats if itl is not None)
 
             report, trace_analysis = self._kernel_report(pool, requests) if trace else (None, None)
         decode_tps = sum(decode_runs) / len(decode_runs) if decode_runs else 0.0
@@ -242,6 +237,7 @@ class VLLMServerEngine(Engine):
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
             ttft_s=ttft_s,
+            itl_samples_ms=itl_samples,
             runs_decode_tps=decode_runs,
             kernel_report=report,
             trace_analysis=trace_analysis,

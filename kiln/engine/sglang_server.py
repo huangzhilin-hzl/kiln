@@ -43,7 +43,7 @@ from .sglang_ext import (
     merge_json_model_override_args,
     parse_rpc_message,
 )
-from .replay import mean_ttft, time_http_prefill
+from .replay import mean_ttft, read_completion, time_http_prefill
 from .vllm_profiler import build_trace_payload
 
 
@@ -230,30 +230,14 @@ class SGLangServerEngine(Engine):
         self._reset_cache()
 
     # ---------------------------------------------------------------- measure
-    def _generate_one_stats(self, prompt_ids: list[int], max_tokens: int) -> dict:
-        t0 = time.perf_counter()
-        r = self.http.post(
-            f"{self.url}/generate",
-            json={
-                "input_ids": prompt_ids,
-                "sampling_params": {
-                    "max_new_tokens": max_tokens,
-                    "temperature": 0.0,
-                    "ignore_eos": True,
-                },
-                "stream": False,
-            },
-        )
-        dt = max(time.perf_counter() - t0, 1e-9)
-        r.raise_for_status()
-        body = r.json()
+    def _generate_one_stats(self, prompt_ids: list[int], max_tokens: int, *, stream: bool = True) -> dict:
+        body, ntok, itl_ms = read_completion(self.http, f"{self.url}/generate", {
+            "input_ids": prompt_ids,
+            "sampling_params": {"max_new_tokens": max_tokens, "temperature": 0.0, "ignore_eos": True},
+            "stream": stream,
+        }, sglang=True)
         meta = body.get("meta_info") or {}
-        if meta.get("completion_tokens") is not None:
-            ntok = int(meta["completion_tokens"])
-        else:
-            ids = extract_output_ids(body)
-            ntok = len(ids) if ids is not None else max_tokens
-        out: dict = {"tokens": ntok, "dt": dt}
+        out: dict = {"tokens": ntok, "itl_ms": itl_ms}
         for key in (
             "spec_verify_ct",
             "spec_accept_length",
@@ -267,7 +251,7 @@ class SGLangServerEngine(Engine):
         return out
 
     def _generate_one(self, prompt_ids: list[int], max_tokens: int) -> int:
-        return int(self._generate_one_stats(prompt_ids, max_tokens)["tokens"])
+        return int(self._generate_one_stats(prompt_ids, max_tokens, stream=False)["tokens"])
 
     def _spec_draft_gamma(self) -> int | None:
         merged = {**self.cfg.extra_args, **self.tier.engine_overrides}
@@ -414,10 +398,7 @@ class SGLangServerEngine(Engine):
                 ntok = sum(int(s["tokens"]) for s in batch_stats)
                 decode_runs.append(ntok / dt)
                 decode_stats.extend(batch_stats)
-                for s in batch_stats:
-                    tok = int(s["tokens"])
-                    if tok > 0:
-                        itl_samples.append(1000.0 * float(s["dt"]) / max(tok - 1, 1))
+                itl_samples.extend(s["itl_ms"] for s in batch_stats if s["itl_ms"] is not None)
 
             report, trace_analysis = self._kernel_report(pool, requests) if trace else (None, None)
         decode_tps = sum(decode_runs) / len(decode_runs) if decode_runs else 0.0
@@ -427,6 +408,7 @@ class SGLangServerEngine(Engine):
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
             ttft_s=ttft_s,
+            itl_samples_ms=itl_samples,
             runs_decode_tps=decode_runs,
             kernel_report=report,
             trace_analysis=trace_analysis,

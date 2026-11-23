@@ -75,6 +75,8 @@ class MeasureResult:
     trace_analysis: dict | None = None
     extra: dict = field(default_factory=dict)   # e.g. AgentX P90 interactivity, export path
 
+    itl_samples_ms: list[float] = field(default_factory=list)
+
     @property
     def variance_pct(self) -> float:
         r = self.runs_decode_tps if self.runs_decode_tps else self.runs_prefill_tps
@@ -160,6 +162,19 @@ def read_prometheus_metrics(
     return out
 
 
+def replay_itl_metrics(itl_samples_ms: list[float]) -> dict:
+    extra = {}
+    p50 = percentile(itl_samples_ms, 0.50)
+    p90 = percentile(itl_samples_ms, 0.90)
+    if p50 is not None:
+        extra["itl_p50_ms"] = p50
+    if p90 is not None:
+        extra["itl_p90_ms"] = p90
+        if p90 > 0:
+            extra["interactivity_p90"] = 1000.0 / p90
+    return extra
+
+
 def build_server_replay_extra(
     requests: list[Request],
     decode_tps: float,
@@ -174,14 +189,7 @@ def build_server_replay_extra(
         extra["bucket_tps"] = buckets
     if decode_tps > 0 and math.isfinite(decode_tps):
         extra["output_tput"] = decode_tps
-    p50 = percentile(itl_samples_ms, 0.50)
-    p90 = percentile(itl_samples_ms, 0.90)
-    if p50 is not None:
-        extra["itl_p50_ms"] = p50
-    if p90 is not None:
-        extra["itl_p90_ms"] = p90
-        if p90 > 0:
-            extra["interactivity_p90"] = 1000.0 / p90
+    extra.update(replay_itl_metrics(itl_samples_ms))
     if spec_metrics:
         for k in ("spec_accept_length", "spec_accept_rate"):
             v = spec_metrics.get(k)

@@ -66,3 +66,43 @@ def test_ttft_screening_weights_all_prefill_repeats():
     more = MeasureResult(0, 10, 0.9, runs_prefill_tps=[10, 10])
     merged = TierWorker._merge_stage_results(first, more, [])
     assert merged.ttft_s == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("sglang", [True, False])
+@pytest.mark.parametrize("n_tokens", [1, 3])
+def test_itl_excludes_first_token_wait_and_final_metadata(monkeypatch, sglang, n_tokens):
+    import json
+    import httpx
+
+    # First token at 10 s, two more at 10.04 s, trailing usage/stats at 12 s.
+    clock = iter((10.0, 10.04, 12.0))
+    monkeypatch.setattr(replay, "time", SimpleNamespace(perf_counter=lambda: next(clock)))
+    if sglang:
+        counts = [1, 3, 3] if n_tokens == 3 else [1, 1]
+        events = [{"meta_info": {"completion_tokens": count}} for count in counts]
+    else:
+        events = [{"choices": [{"token_ids": [1]}]}]
+        if n_tokens == 3:
+            events.append({"choices": [{"token_ids": [2, 3]}]})
+        events.append({"choices": [], "usage": {"completion_tokens": n_tokens}})
+    chunks = [f"data: {json.dumps(event)}\n\n" for event in events]
+    response = httpx.Response(200, text="".join(chunks) + "data: [DONE]\n\n",
+                              headers={"content-type": "text/event-stream"})
+    with httpx.Client(transport=httpx.MockTransport(lambda req: response)) as client:
+        _, tokens, itl = replay.read_completion(client, "http://engine", {}, sglang=sglang)
+    assert tokens == n_tokens
+    if n_tokens == 1:
+        assert itl is None
+    else:
+        assert itl == pytest.approx(20.0)
+
+
+def test_merge_itl_percentiles_over_both_screening_stages():
+    from kiln.engine.base import MeasureResult
+    from kiln.server.jobs import TierWorker
+
+    first = MeasureResult(100, 0, 0, itl_samples_ms=[10, 20])
+    more = MeasureResult(100, 0, 0, itl_samples_ms=[30, 40])
+    merged = TierWorker._merge_stage_results(first, more, [])
+    assert merged.extra["itl_p50_ms"] == pytest.approx(25)
+    assert merged.extra["itl_p90_ms"] == pytest.approx(37)

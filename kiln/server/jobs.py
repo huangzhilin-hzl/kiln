@@ -25,7 +25,7 @@ from kiln.bench.correctness import evaluate_correctness
 from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
 from kiln.engine import Engine, make_engine
-from kiln.engine.base import InvalidBenchmark, MeasureResult, bucket_tps_for_requests, evaluating_phase
+from kiln.engine.base import InvalidBenchmark, MeasureResult, bucket_tps_for_requests, evaluating_phase, replay_itl_metrics
 from kiln.engine.vllm_profiler import (
     TraceAnalysis,
     compute_roofline_attribution,
@@ -498,6 +498,9 @@ class TierWorker:
             bt = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
             if bt:
                 extra["bucket_tps"] = bt
+        itl_samples = m1.itl_samples_ms + m2.itl_samples_ms
+        if itl_samples:
+            extra.update(replay_itl_metrics(itl_samples))
         ttft_s = m1.ttft_s
         if m2.runs_prefill_tps:
             n1, n2 = len(m1.runs_prefill_tps), len(m2.runs_prefill_tps)
@@ -507,6 +510,7 @@ class TierWorker:
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
             ttft_s=ttft_s,
+            itl_samples_ms=itl_samples,
             runs_decode_tps=runs,
             runs_prefill_tps=runs_prefill,
             kernel_report=m2.kernel_report if m2.kernel_report is not None else m1.kernel_report,

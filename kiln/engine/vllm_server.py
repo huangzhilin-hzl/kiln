@@ -34,6 +34,7 @@ from .base import (
     read_prometheus_metrics,
     shutdown_process_group,
 )
+from .replay import time_http_prefill
 from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
 
@@ -218,11 +219,8 @@ class VLLMServerEngine(Engine):
                 isl = sum(len(r.prompt_ids) for r in requests)
                 list(pool.map(lambda r: self._complete_one(r.prompt_ids, 1), requests))
                 self._reset_cache()
-                t0 = time.perf_counter()
-                list(pool.map(lambda r: self._complete_one(r.prompt_ids, 1), requests))
-                prefill_s = max(time.perf_counter() - t0, 1e-9)
+                prefill_s, ttft_s = time_http_prefill(pool, requests, self._complete_one)
                 prefill_tps = isl / prefill_s
-                ttft_s = prefill_s / max(len(requests), 1)
 
             decode_runs = []
             itl_samples: list[float] = []

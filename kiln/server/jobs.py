@@ -487,10 +487,15 @@ class TierWorker:
             bt = bucket_tps_for_requests(requests, decode_tps, prefill_tps)
             if bt:
                 extra["bucket_tps"] = bt
+        ttft_s = m1.ttft_s
+        if m2.runs_prefill_tps:
+            n1, n2 = len(m1.runs_prefill_tps), len(m2.runs_prefill_tps)
+            ttft_s = ((m1.ttft_s * n1 + m2.ttft_s * n2) / (n1 + n2)
+                      if (n1 == 0 or m1.ttft_s > 0) and m2.ttft_s > 0 else 0.0)
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
-            ttft_s=float(m1.ttft_s),
+            ttft_s=ttft_s,
             runs_decode_tps=runs,
             runs_prefill_tps=runs_prefill,
             kernel_report=m2.kernel_report if m2.kernel_report is not None else m1.kernel_report,

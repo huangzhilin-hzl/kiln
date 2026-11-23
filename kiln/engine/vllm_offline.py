@@ -14,6 +14,7 @@ from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
 from .base import Engine, MeasureResult, bucket_tps_for_requests
+from .replay import mean_ttft
 from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
 
@@ -45,6 +46,7 @@ class VLLMOfflineEngine(Engine):
             model=self.cfg.model,
             tensor_parallel_size=self.cfg.tensor_parallel_size,
             max_model_len=self.cfg.max_model_len,
+            disable_log_stats=False,             # expose per-request first_token_latency
             enable_prefix_caching=True,          # TKCC: reuse a fixed request set -> cached prompts
             worker_extension_cls="kiln.engine.vllm_ext.HotReloadExt",
         )
@@ -112,10 +114,11 @@ class VLLMOfflineEngine(Engine):
             # Prefill: max_tokens=1 on the cached-or-not prompt set.
             self.llm.reset_prefix_cache()
             t0 = time.perf_counter()
-            self.llm.generate(prompts, warm, use_tqdm=False)
+            outputs = self.llm.generate(prompts, warm, use_tqdm=False)
             prefill_s = max(time.perf_counter() - t0, 1e-9)
             prefill_tps = isl / prefill_s
-            ttft_s = prefill_s / max(len(requests), 1)
+            ttft_s = mean_ttft(getattr(getattr(out, "metrics", None), "first_token_latency", None)
+                               for out in outputs)
 
         decode_runs = []
         for _ in range(repeats):

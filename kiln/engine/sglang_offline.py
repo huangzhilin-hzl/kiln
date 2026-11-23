@@ -16,6 +16,7 @@ from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
 from .base import Engine, MeasureResult, bucket_tps_for_requests, reap_zombies
+from .replay import mean_ttft
 from .sglang_ext import (
     bootstrap_env,
     encode_rpc,
@@ -216,6 +217,15 @@ class SGLangOfflineEngine(Engine):
                 pass
 
     # ---------------------------------------------------------------- measuring
+    def _time_prefill(self, prompts, sampling_params) -> tuple[float, float]:
+        start = time.perf_counter()
+        outputs = self.engine.generate(input_ids=prompts, sampling_params=sampling_params)
+        elapsed = max(time.perf_counter() - start, 1e-9)
+        batch = [outputs] if isinstance(outputs, dict) else outputs
+        # With max_new_tokens=1, completion of each request is its first token.
+        metadata = [out.get("meta_info") or {} for out in batch]
+        return elapsed, mean_ttft(meta.get("ttft_latency", meta.get("e2e_latency")) for meta in metadata)
+
     def measure(
         self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
     ) -> MeasureResult:
@@ -228,22 +238,19 @@ class SGLangOfflineEngine(Engine):
             if not skip_prefill:
                 self.engine.generate(input_ids=prompts, sampling_params=warm)
             prefill_runs: list[float] = []
-            prefill_dts: list[float] = []
+            ttft_runs: list[float] = []
             for _ in range(repeats):
                 self._flush_cache()
-                t0 = time.perf_counter()
-                self.engine.generate(input_ids=prompts, sampling_params=warm)
-                dt = max(time.perf_counter() - t0, 1e-9)
-                prefill_dts.append(dt)
+                dt, ttft = self._time_prefill(prompts, warm)
+                ttft_runs.append(ttft)
                 prefill_runs.append(isl / dt)
             report, trace_analysis = self._kernel_report(prompts, max_new_tokens=1) if trace else (None, None)
             prefill_tps = (sum(prefill_runs) / len(prefill_runs)) if prefill_runs else 0.0
-            avg_dt = (sum(prefill_dts) / len(prefill_dts)) if prefill_dts else 0.0
             buckets = bucket_tps_for_requests(requests, 0.0, prefill_tps)
             return MeasureResult(
                 decode_tps=0.0,
                 prefill_tps=prefill_tps,
-                ttft_s=(avg_dt / max(len(requests), 1)) if prefill_dts else 0.0,
+                ttft_s=mean_ttft(ttft_runs),
                 runs_decode_tps=[],
                 runs_prefill_tps=prefill_runs,
                 kernel_report=report,
@@ -257,11 +264,8 @@ class SGLangOfflineEngine(Engine):
             self.engine.generate(input_ids=prompts, sampling_params=warm)      # warm radix cache
             if self.tier.phase != "decode":
                 self._flush_cache()
-                t0 = time.perf_counter()
-                self.engine.generate(input_ids=prompts, sampling_params=warm)
-                prefill_s = max(time.perf_counter() - t0, 1e-9)
+                prefill_s, ttft_s = self._time_prefill(prompts, warm)
                 prefill_tps = isl / prefill_s
-                ttft_s = prefill_s / max(len(requests), 1)
 
         decode_runs = []
         for _ in range(repeats):

@@ -125,7 +125,7 @@ class MockEngine(Engine):
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
-            ttft_s=(0.0 if (skip_prefill or self.tier.phase == "decode") else 0.05 / max(p_mult, 1e-6)),
+            ttft_s=0.05 / max(p_mult, 1e-6) if prefill_tps > 0 else 0.0,
             runs_decode_tps=runs_decode,
             runs_prefill_tps=runs_prefill,
             kernel_report=kernel_report,

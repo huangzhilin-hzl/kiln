@@ -43,6 +43,7 @@ from .sglang_ext import (
     merge_json_model_override_args,
     parse_rpc_message,
 )
+from .replay import mean_ttft, time_http_prefill
 from .vllm_profiler import build_trace_payload
 
 
@@ -371,24 +372,21 @@ class SGLangServerEngine(Engine):
                 if not skip_prefill:
                     list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
                 prefill_runs: list[float] = []
-                prefill_dts: list[float] = []
+                ttft_runs: list[float] = []
                 for _ in range(repeats):
                     self._reset_cache()
-                    t0 = time.perf_counter()
-                    list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-                    dt = max(time.perf_counter() - t0, 1e-9)
-                    prefill_dts.append(dt)
+                    dt, ttft = time_http_prefill(pool, requests, self._generate_one)
+                    ttft_runs.append(ttft)
                     prefill_runs.append(isl / dt)
                 report, trace_analysis = (
                     self._kernel_report(pool, requests, max_new_tokens=1) if trace else (None, None)
                 )
                 prefill_tps = (sum(prefill_runs) / len(prefill_runs)) if prefill_runs else 0.0
-                avg_dt = (sum(prefill_dts) / len(prefill_dts)) if prefill_dts else 0.0
                 buckets = bucket_tps_for_requests(requests, 0.0, prefill_tps)
                 return MeasureResult(
                     decode_tps=0.0,
                     prefill_tps=prefill_tps,
-                    ttft_s=(avg_dt / max(len(requests), 1)) if prefill_dts else 0.0,
+                    ttft_s=mean_ttft(ttft_runs),
                     runs_decode_tps=[],
                     runs_prefill_tps=prefill_runs,
                     kernel_report=report,
@@ -400,11 +398,8 @@ class SGLangServerEngine(Engine):
                 list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
                 if self.tier.phase != "decode":
                     self._reset_cache()
-                    t0 = time.perf_counter()
-                    list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-                    prefill_s = max(time.perf_counter() - t0, 1e-9)
+                    prefill_s, ttft_s = time_http_prefill(pool, requests, self._generate_one)
                     prefill_tps = isl / prefill_s
-                    ttft_s = prefill_s / max(len(requests), 1)
 
             decode_runs = []
             itl_samples: list[float] = []

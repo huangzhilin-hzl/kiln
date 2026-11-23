@@ -42,6 +42,7 @@ from .sglang_ext import (
     parse_rpc_message,
 )
 from .sglang_server import _sglang_cli_args
+from .replay import time_http_prefill
 from .vllm_profiler import build_trace_payload
 
 
@@ -635,9 +636,7 @@ class SGLangPDServerEngine(Engine):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
             self._reset_all_caches()
-            t0 = time.perf_counter()
-            list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-            prefill_s = max(time.perf_counter() - t0, 1e-9)
+            prefill_s, ttft_s = time_http_prefill(pool, requests, self._generate_one)
 
             decode_runs = []
             for _ in range(repeats):
@@ -652,7 +651,7 @@ class SGLangPDServerEngine(Engine):
         return MeasureResult(
             decode_tps=decode_tps,
             prefill_tps=prefill_tps,
-            ttft_s=prefill_s / max(len(requests), 1),
+            ttft_s=ttft_s,
             runs_decode_tps=decode_runs,
             kernel_report=report,
             trace_analysis=trace_analysis,

@@ -1,0 +1,22 @@
+tests/test_evolution_and_micro.py
+  s_56a07b14c3664a::t_c079807604ee2f 442-471
+kiln/micro/sandbox.py
+  s_56a07b14c3664a::t_86a8e133af6944 88-113,117-141,144,149,159,204,207,214
+  s_56a07b14c3664a::t_4ea471fc7d1704 114-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dcb4ae7fe0f6b284407a2316e4bab31cf0160ab4",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

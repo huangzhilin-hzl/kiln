@@ -1,0 +1,21 @@
+tests/test_probe.py
+  s_56a07b14c3664a::t_59a47c1230274a 278-293
+kiln/cli.py
+  s_56a07b14c3664a::t_d79bb630ff346e 575-576,582
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "933fff42e08e9540c34362b998cc3f9c8674d68a",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

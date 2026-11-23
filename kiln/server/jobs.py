@@ -173,7 +173,8 @@ class TierWorker:
         self.on_job_finished = on_job_finished
         self.screen_threshold_fn = screen_threshold_fn
         self.requests = requests[: tier.max_requests] if tier.max_requests else requests
-        self.q: queue.Queue[Job] = queue.Queue()
+        self.q: queue.Queue[Job | None] = queue.Queue()
+        self.stop_requested = threading.Event()
         self.engine: Engine | None = None
         self.owner: TierWorker | None = None
         self.engine_lock = threading.RLock()
@@ -248,6 +249,8 @@ class TierWorker:
 
     def _boot(self) -> None:
         with self.engine_lock:
+            if self.stop_requested.is_set():
+                return
             self.ready.clear()
             self._ensure_hw_profile()
             if self.owner is None:
@@ -354,9 +357,13 @@ class TierWorker:
     # ------------------------------------------------------------------ loop
     def _loop(self) -> None:
         self.wait_until_ready()
-        while True:
+        while not self.stop_requested.is_set():
             job = self.q.get()
+            if job is None:
+                return
             with self.engine_lock:
+                if self.stop_requested.is_set():
+                    return
                 if job.status != "queued":
                     continue
                 if self.engine is not None and not self.engine.is_alive():
@@ -367,17 +374,18 @@ class TierWorker:
                     except Exception as exc:
                         self.boot_error = str(exc)
                 self.wait_until_ready()
-                self.execute_job(job)
+                if not self.stop_requested.is_set():
+                    self.execute_job(job)
 
     def wait_until_ready(self) -> None:
-        while not self.ready.is_set():
+        while not self.ready.is_set() and not self.stop_requested.is_set():
             try:
                 self._boot()
             except Exception as exc:
                 if self.boot_error != str(exc):
                     print(f"[kiln] {self.tier.name}: boot failed ({exc}); retrying")
                 self.boot_error = str(exc)
-                time.sleep(5)
+                self.stop_requested.wait(5)
 
     def execute_job(self, job: Job) -> None:
         with self.engine_lock:
@@ -718,7 +726,7 @@ class TierWorker:
         else:
             mode = "local" if self.local else "remote"
         with self.q.mutex:
-            q_depth = sum(1 for j in self.q.queue if j.status == "queued")
+            q_depth = sum(1 for j in self.q.queue if j is not None and j.status == "queued")
         return {
             "tier": self.tier.name,
             "mode": mode,
@@ -824,6 +832,22 @@ class JobManager:
         for w in self.tiers.values():
             if w.local:
                 w.thread.start()
+
+    def shutdown(self) -> None:
+        """Finish active jobs, leave queued work on disk, and release each local engine once."""
+        local_workers = [w for w in self.tiers.values() if w.local]
+        for worker in local_workers:
+            worker.stop_requested.set()
+            worker.q.put(None)
+        for worker in local_workers:
+            if worker.thread.is_alive():
+                worker.thread.join()
+        for worker in local_workers:
+            worker.ready.clear()
+            if worker.owner is None:
+                worker._shutdown_own_engine()
+            else:
+                worker.engine = None
 
     def _screen_threshold_locked(self, tier: str) -> float:
         cfg = self.tiers[tier].tier

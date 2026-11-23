@@ -115,8 +115,11 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        mgr.start()
-        yield
+        try:
+            mgr.start()
+            yield
+        finally:
+            mgr.shutdown()
 
     app = FastAPI(title="kiln", lifespan=lifespan, dependencies=[Depends(authenticate)])
 

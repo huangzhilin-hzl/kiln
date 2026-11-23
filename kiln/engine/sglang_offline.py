@@ -138,8 +138,8 @@ class SGLangOfflineEngine(Engine):
     def hot_reload(self, candidate_path: str) -> None:
         args = (
             [os.path.abspath(candidate_path)]
-            if self.tier.phase == "both"
-            else [os.path.abspath(candidate_path), self.tier.phase]
+            if self.assessment_phase == "both"
+            else [os.path.abspath(candidate_path), self.assessment_phase]
         )
         secs = self._rpc("kiln_hot_reload", *args)
         # Cached KV was written by the previous forward; never let a candidate reuse it.
@@ -234,7 +234,7 @@ class SGLangOfflineEngine(Engine):
         isl = sum(len(r.prompt_ids) for r in requests)
         warm = {"max_new_tokens": 1, "temperature": 0.0}
 
-        if self.tier.phase == "prefill":
+        if self.assessment_phase == "prefill":
             if not skip_prefill:
                 self.engine.generate(input_ids=prompts, sampling_params=warm)
             prefill_runs: list[float] = []
@@ -262,7 +262,7 @@ class SGLangOfflineEngine(Engine):
         ttft_s = 0.0
         if not skip_prefill:
             self.engine.generate(input_ids=prompts, sampling_params=warm)      # warm radix cache
-            if self.tier.phase != "decode":
+            if self.assessment_phase != "decode":
                 self._flush_cache()
                 prefill_s, ttft_s = self._time_prefill(prompts, warm)
                 prefill_tps = isl / prefill_s

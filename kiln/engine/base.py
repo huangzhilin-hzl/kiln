@@ -11,9 +11,12 @@ import math
 import os
 import signal
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from kiln.bench.traffic import Request
+from kiln.config import TierPhase
 
 
 def reap_zombies() -> int:
@@ -187,8 +190,25 @@ def build_server_replay_extra(
     return extra
 
 
+_borrower_phase: ContextVar[TierPhase | None] = ContextVar("kiln_borrower_phase", default=None)
+
+
+@contextmanager
+def evaluating_phase(phase: TierPhase):
+    """Select a borrower's phase for one engine call, including calls on watchdog threads."""
+    token = _borrower_phase.set(phase)
+    try:
+        yield
+    finally:
+        _borrower_phase.reset(token)
+
+
 class Engine(abc.ABC):
     """One persistent engine == one measurement tier."""
+
+    @property
+    def assessment_phase(self) -> TierPhase:
+        return _borrower_phase.get() or self.tier.phase
 
     @abc.abstractmethod
     def start(self) -> None: ...

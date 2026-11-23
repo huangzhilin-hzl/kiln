@@ -36,7 +36,7 @@ class MockEngine(Engine):
     def hot_reload(self, candidate_path: str) -> None:
         had_env = "KILN_PD_ROLE" in os.environ
         prev_env = os.environ.get("KILN_PD_ROLE")
-        os.environ["KILN_PD_ROLE"] = self.tier.phase
+        os.environ["KILN_PD_ROLE"] = self.assessment_phase
         try:
             ns = runpy.run_path(candidate_path)
         finally:
@@ -82,7 +82,7 @@ class MockEngine(Engine):
     ) -> MeasureResult:
         noise = 0.002 if self.tier.name == "slow" else 0.005
         p_mult = self.bucket_speedups.get("prefill_large", self.prefill_speedup)
-        if self.tier.phase == "prefill":
+        if self.assessment_phase == "prefill":
             runs_prefill = (
                 [BASE_PREFILL_TPS * p_mult * (1 + random.gauss(0, noise)) for _ in range(repeats)]
                 if repeats > 0
@@ -91,7 +91,7 @@ class MockEngine(Engine):
             prefill_tps = sum(runs_prefill) / len(runs_prefill) if runs_prefill else 0.0
             decode_tps = 0.0
             runs_decode: list[float] = []
-        elif self.tier.phase == "decode":
+        elif self.assessment_phase == "decode":
             runs_decode = (
                 [BASE_DECODE_TPS * self.speedup * (1 + random.gauss(0, noise)) for _ in range(repeats)]
                 if repeats > 0

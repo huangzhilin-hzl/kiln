@@ -208,8 +208,8 @@ class SGLangServerEngine(Engine):
     def hot_reload(self, candidate_path: str) -> None:
         args = (
             [os.path.abspath(candidate_path)]
-            if self.tier.phase == "both"
-            else [os.path.abspath(candidate_path), self.tier.phase]
+            if self.assessment_phase == "both"
+            else [os.path.abspath(candidate_path), self.assessment_phase]
         )
         secs = self._rpc("kiln_hot_reload", *args)
         self._reset_cache()
@@ -368,7 +368,7 @@ class SGLangServerEngine(Engine):
         ttft_s = 0.0
         workers = min(max(len(requests), 1), 32)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            if self.tier.phase == "prefill":
+            if self.assessment_phase == "prefill":
                 if not skip_prefill:
                     list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
                 prefill_runs: list[float] = []
@@ -396,7 +396,7 @@ class SGLangServerEngine(Engine):
 
             if not skip_prefill:
                 list(pool.map(lambda r: self._generate_one(r.prompt_ids, 1), requests))
-                if self.tier.phase != "decode":
+                if self.assessment_phase != "decode":
                     self._reset_cache()
                     prefill_s, ttft_s = time_http_prefill(pool, requests, self._generate_one)
                     prefill_tps = isl / prefill_s

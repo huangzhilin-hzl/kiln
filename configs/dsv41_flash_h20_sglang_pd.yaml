@@ -3,12 +3,15 @@
 # Use these DNS names in the pods' namespace, or replace them with routable pod addresses.
 # kiln-control serves 18765, kiln-prefill serves 31401 and bootstrap port 8998, and kiln-decode serves 31402.
 # Each PD name must resolve to its single replica. Set the same KILN_TOKEN on the server and both workers.
-# Recommended 4-Pod layout (or 3-Pod if fast_prefill & fast_decode share via `share_engine`):
+# Recommended 4-Pod layout:
 #   Pod 0 (8x H20-3e): `kiln serve -c configs/dsv41_flash_h20_sglang_pd.yaml --tiers fast_prefill --host 0.0.0.0`
 #   Pod 1 (8x H20-3e): `kiln worker -c configs/dsv41_flash_h20_sglang_pd.yaml --tier fast_decode --server http://kiln-control:18765`
 #   Pod 2 (8x H20-3e, Prefill): `kiln pd-node -c configs/dsv41_flash_h20_sglang_pd.yaml --role prefill --host 0.0.0.0`
 #   Pod 3 (8x H20-3e, Decode):  `kiln pd-node -c configs/dsv41_flash_h20_sglang_pd.yaml --role decode --host 0.0.0.0`
 #   (And run `kiln worker -c configs/dsv41_flash_h20_sglang_pd.yaml --tier slow --server http://kiln-control:18765` on Pod 0 or Pod 3 to drive `sglang_router` + AgentX.)
+# For 3 Pods, set fast_decode.share_engine: fast_prefill, use --tiers fast_prefill,fast_decode
+# on Pod 0, and omit the fast_decode worker on Pod 1. Both fast tiers share Pod 0's
+# engine launch options and use their own phase for candidate loading and measurement.
 name: dsv41-flash-h20-sglang-pd-agentx
 engine:
   kind: sglang_offline

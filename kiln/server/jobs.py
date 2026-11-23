@@ -25,7 +25,7 @@ from kiln.bench.correctness import evaluate_correctness
 from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
 from kiln.engine import Engine, make_engine
-from kiln.engine.base import InvalidBenchmark, MeasureResult, bucket_tps_for_requests
+from kiln.engine.base import InvalidBenchmark, MeasureResult, bucket_tps_for_requests, evaluating_phase
 from kiln.engine.vllm_profiler import (
     TraceAnalysis,
     compute_roofline_attribution,
@@ -130,22 +130,25 @@ class SharedEngineAdapter(Engine):
             self.owner._ensure_own_engine()
 
     def hot_reload(self, candidate_path: str) -> None:
-        self.owner.engine.hot_reload(candidate_path)
+        with evaluating_phase(self.tier.phase):
+            self.owner.engine.hot_reload(candidate_path)
 
     def teardown_candidate(self) -> None:
         self.owner.engine.teardown_candidate()
 
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
-        eng = self.owner.engine
-        if self.tier.agentx is None and hasattr(eng, "measure_requests"):
-            return eng.measure_requests(requests, repeats, trace)
-        return eng.measure(requests, repeats, trace)
+        with evaluating_phase(self.tier.phase):
+            eng = self.owner.engine
+            if self.tier.agentx is None and hasattr(eng, "measure_requests"):
+                return eng.measure_requests(requests, repeats, trace)
+            return eng.measure(requests, repeats, trace)
 
     def measure_more(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
-        eng = self.owner.engine
-        if self.tier.agentx is None and hasattr(eng, "measure_requests"):
-            return eng.measure_requests(requests, repeats, trace, skip_prefill=True)
-        return eng.measure_more(requests, repeats, trace)
+        with evaluating_phase(self.tier.phase):
+            eng = self.owner.engine
+            if self.tier.agentx is None and hasattr(eng, "measure_requests"):
+                return eng.measure_requests(requests, repeats, trace, skip_prefill=True)
+            return eng.measure_more(requests, repeats, trace)
 
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         return self.owner.engine.greedy_outputs(prompts, max_new_tokens)

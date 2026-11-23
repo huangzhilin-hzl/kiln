@@ -23,13 +23,14 @@ import importlib.util
 import inspect
 import json
 import linecache
-import math
 import os
 import sys
 import tempfile
 import time
 import types
 from pathlib import Path
+
+from kiln.bench.correctness import logprob_value
 
 from .patching import restore_forwards, snapshot_forwards
 
@@ -166,30 +167,29 @@ def extract_output_logprobs(out: dict) -> list[dict[int, float]] | None:
     """Extract per-step `{token_id: logprob}` dicts from an SGLang response when present."""
     meta = out.get("meta_info") or {}
     entries = meta.get("output_token_logprobs")
-    if not isinstance(entries, list) or not entries:
+    if entries is None:
         return None
+    if not isinstance(entries, list):
+        return []
     top_entries = meta.get("output_top_logprobs")
     steps: list[dict[int, float]] = []
     for idx, entry in enumerate(entries):
         step: dict[int, float] = {}
-        if isinstance(entry, (list, tuple)) and len(entry) >= 2 and entry[0] is not None and entry[1] is not None:
-            try:
-                lp = float(entry[0])
-                if math.isfinite(lp):
-                    step[int(entry[1])] = lp
-            except (TypeError, ValueError):
-                pass
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2 or entry[1] is None:
+            steps.append(step)
+            continue
+        try:
+            step[int(entry[1])] = logprob_value(entry[0])
+        except (TypeError, ValueError, OverflowError):
+            steps.append(step)
+            continue
         if isinstance(top_entries, list) and idx < len(top_entries) and isinstance(top_entries[idx], list):
             for item in top_entries[idx]:
-                if isinstance(item, (list, tuple)) and len(item) >= 2 and item[0] is not None and item[1] is not None:
+                if isinstance(item, (list, tuple)) and len(item) >= 2 and item[1] is not None:
                     try:
-                        lp = float(item[0])
-                        if math.isfinite(lp):
-                            step.setdefault(int(item[1]), lp)
-                    except (TypeError, ValueError):
-                        pass
-        if not step:
-            return None
+                        step.setdefault(int(item[1]), logprob_value(item[0]))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
         steps.append(step)
     return steps
 

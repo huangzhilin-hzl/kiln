@@ -10,6 +10,7 @@ import os
 import threading
 import time
 
+from kiln.bench.correctness import collect_probe_logprobs, logprob_value
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
@@ -187,7 +188,6 @@ class VLLMOfflineEngine(Engine):
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
         if "greedy_outputs" in self.__dict__:
             return self.greedy_outputs(prompts, max_new_tokens), None
-        import math
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
 
@@ -197,36 +197,28 @@ class VLLMOfflineEngine(Engine):
             sp = SamplingParams(max_tokens=max_new_tokens, temperature=0.0, ignore_eos=True)
         self.llm.reset_prefix_cache()
         out_ids: list[list[int]] = []
-        out_lps: list[list[dict[int, float]]] = []
-        all_have_lps = bool(prompts)
+        out_lps: list[list[dict[int, float]] | None] = []
         for p in prompts:
             o = self.llm.generate([TokensPrompt(prompt_token_ids=p)], sp, use_tqdm=False)[0]
             comp = o.outputs[0]
             out_ids.append(list(comp.token_ids))
             raw_lps = getattr(comp, "logprobs", None)
-            if isinstance(raw_lps, list) and raw_lps:
-                seq_lps: list[dict[int, float]] = []
-                valid = True
-                for step_lp in raw_lps:
-                    if not isinstance(step_lp, dict) or not step_lp:
-                        valid = False
-                        break
-                    step_dict: dict[int, float] = {}
-                    for tid, val in step_lp.items():
-                        lp = float(getattr(val, "logprob", val))
-                        if math.isfinite(lp):
-                            step_dict[int(tid)] = lp
-                    if not step_dict:
-                        valid = False
-                        break
-                    seq_lps.append(step_dict)
-                if valid:
-                    out_lps.append(seq_lps)
-                else:
-                    all_have_lps = False
-            else:
-                all_have_lps = False
-        return out_ids, (out_lps if all_have_lps else None)
+            if raw_lps is None:
+                out_lps.append(None)
+                continue
+            steps = []
+            if isinstance(raw_lps, list):
+                for entry in raw_lps:
+                    step = {}
+                    if isinstance(entry, dict):
+                        for tid, val in entry.items():
+                            try:
+                                step[int(tid)] = logprob_value(getattr(val, "logprob", val))
+                            except (TypeError, ValueError, OverflowError):
+                                continue
+                    steps.append(step)
+            out_lps.append(steps)
+        return out_ids, collect_probe_logprobs(out_lps)
 
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         return self.greedy_probe(prompts, max_new_tokens)[0]

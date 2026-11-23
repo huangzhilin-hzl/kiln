@@ -21,7 +21,7 @@ from tempfile import NamedTemporaryFile
 from typing import Callable
 
 from kiln.bench.agentx import compare_agentx_paired
-from kiln.bench.correctness import evaluate_correctness
+from kiln.bench.correctness import evaluate_correctness, validate_probe_logprobs
 from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
 from kiln.engine import Engine, make_engine
@@ -284,6 +284,9 @@ class TierWorker:
         tokens, logprobs = self.engine.greedy_probe(probe, cc.max_new_tokens)
         if not probe or len(tokens) != len(probe) or not all(tokens):
             raise RuntimeError("Baseline returned incomplete correctness outputs")
+        error = validate_probe_logprobs(tokens, logprobs)
+        if error:
+            raise RuntimeError(f"Invalid baseline logprobs: {error}")
         base = self.engine.measure(
             self.requests,
             self.tier.repeats,

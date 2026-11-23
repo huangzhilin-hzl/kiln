@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+from kiln.bench.correctness import collect_probe_logprobs
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
@@ -343,8 +344,7 @@ class SGLangOfflineEngine(Engine):
         sp = {"max_new_tokens": max_new_tokens, "temperature": 0.0, "ignore_eos": True}
         self._flush_cache()
         out_ids: list[list[int]] = []
-        out_lps: list[list[dict[int, float]]] = []
-        all_have_lps = bool(prompts)
+        out_lps: list[list[dict[int, float]] | None] = []
         for p in prompts:
             try:
                 res = self.engine.generate(input_ids=p, sampling_params=sp, return_logprob=True)
@@ -358,11 +358,8 @@ class SGLangOfflineEngine(Engine):
                 raise RuntimeError("SGLang did not return output_ids for the correctness probe")
             out_ids.append(ids)
             lps = extract_output_logprobs(res)
-            if lps is None:
-                all_have_lps = False
-            else:
-                out_lps.append(lps)
-        return out_ids, (out_lps if all_have_lps else None)
+            out_lps.append(lps)
+        return out_ids, collect_probe_logprobs(out_lps)
 
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         return self.greedy_probe(prompts, max_new_tokens)[0]

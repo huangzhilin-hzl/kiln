@@ -29,6 +29,7 @@ from typing import Literal
 import httpx
 
 from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_profile
+from kiln.bench.correctness import collect_probe_logprobs
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, PDClusterConfig, PDNodeConfig, RunConfig, TierConfig
 
@@ -722,8 +723,7 @@ class SGLangPDServerEngine(Engine):
             return self.greedy_outputs(prompts, max_new_tokens), None
         self._reset_all_caches()
         out_ids: list[list[int]] = []
-        out_lps: list[list[dict[int, float]]] = []
-        all_have_lps = bool(prompts)
+        out_lps: list[list[dict[int, float]] | None] = []
         for p in prompts:
             payload = {
                 "input_ids": p,
@@ -743,11 +743,8 @@ class SGLangPDServerEngine(Engine):
                 raise RuntimeError("SGLang PD router did not return output_ids for correctness probe")
             out_ids.append(ids)
             lps = extract_output_logprobs(data)
-            if lps is None:
-                all_have_lps = False
-            else:
-                out_lps.append(lps)
-        return out_ids, (out_lps if all_have_lps else None)
+            out_lps.append(lps)
+        return out_ids, collect_probe_logprobs(out_lps)
 
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         return self.greedy_probe(prompts, max_new_tokens)[0]

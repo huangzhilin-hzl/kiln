@@ -23,6 +23,7 @@ from pathlib import Path
 import httpx
 
 from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_profile
+from kiln.bench.correctness import collect_probe_logprobs, logprob_value
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
@@ -292,8 +293,7 @@ class VLLMServerEngine(Engine):
         if "greedy_outputs" in self.__dict__:
             return self.greedy_outputs(prompts, max_new_tokens), None
         out_ids: list[list[int]] = []
-        out_lps: list[list[dict[int, float]]] = []
-        all_have_lps = bool(prompts)
+        out_lps: list[list[dict[int, float]] | None] = []
         for p in prompts:
             r = self.http.post(f"{self.url}/v1/completions", json={
                 "model": self.served_name, "prompt": p, "max_tokens": max_new_tokens,
@@ -308,25 +308,13 @@ class VLLMServerEngine(Engine):
             out_ids.append(toks)
             lp_obj = ch.get("logprobs") or {}
             tok_lps = lp_obj.get("token_logprobs")
-            if isinstance(tok_lps, list) and len(tok_lps) == len(toks) and tok_lps:
-                seq_lps: list[dict[int, float]] = []
-                valid = True
-                for tid, val in zip(toks, tok_lps):
-                    if val is None:
-                        valid = False
-                        break
-                    fval = float(val)
-                    if not math.isfinite(fval):
-                        valid = False
-                        break
-                    seq_lps.append({int(tid): fval})
-                if valid:
-                    out_lps.append(seq_lps)
-                else:
-                    all_have_lps = False
+            if tok_lps is None:
+                out_lps.append(None)
+            elif isinstance(tok_lps, list) and len(tok_lps) == len(toks):
+                out_lps.append([{int(tid): logprob_value(lp)} for tid, lp in zip(toks, tok_lps)])
             else:
-                all_have_lps = False
-        return out_ids, (out_lps if all_have_lps else None)
+                out_lps.append([])
+        return out_ids, collect_probe_logprobs(out_lps)
 
     def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
         return self.greedy_probe(prompts, max_new_tokens)[0]

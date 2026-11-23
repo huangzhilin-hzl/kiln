@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import math
@@ -84,24 +85,80 @@ def _sync_if_cuda(device: str) -> None:
         _torch.cuda.synchronize()
 
 
-def _time_callable(fn: Callable[[], Any], device: str, warmup: int = 2, iters: int = 5) -> float:
+def _copy_inputs(inputs: Any) -> Any:
+    """Copy a trial's nested inputs while retaining tensor and array view layouts."""
+    memo: dict[int, Any] = {}
+    seen: set[int] = set()
+    arrays: list[np.ndarray] = []
+    pending = [inputs]
+    while pending:
+        obj = pending.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, (list, tuple)):
+            pending.extend(obj)
+        elif isinstance(obj, dict):
+            pending.extend(obj.values())
+        elif type(obj) is np.ndarray and not obj.dtype.hasobject:
+            arrays.append(obj)
+        elif _torch is not None and isinstance(obj, _torch.Tensor):
+            with _torch.inference_mode(obj.is_inference()):
+                if obj.is_leaf:
+                    memo[id(obj)] = copy.deepcopy(obj, memo)
+                else:
+                    # Torch only deep-copies leaves. Share the copied storage among
+                    # views and retain a differentiable clone for non-leaf inputs.
+                    with _torch.enable_grad():
+                        tensor = obj.clone()
+                    if obj.layout == _torch.strided:
+                        with _torch.no_grad():
+                            tensor.set_(copy.deepcopy(obj.detach(), memo))
+                    memo[id(obj)] = tensor
+
+    if arrays:
+        # NumPy deepcopy packs sliced arrays. Rebuild overlapping views over
+        # one shared buffer, including negative, zero and non-unit strides.
+        byte_bounds = np.lib.array_utils.byte_bounds if hasattr(np.lib, "array_utils") else np.byte_bounds
+        bounds = sorted((byte_bounds(a), i) for i, a in enumerate(arrays))
+        start = 0
+        while start < len(bounds):
+            (low, high), _ = bounds[start]
+            end = start + 1
+            while end < len(bounds) and bounds[end][0][0] < high:
+                high = max(high, bounds[end][0][1])
+                end += 1
+            storage = np.empty(high - low, dtype=np.uint8)
+            for _, i in bounds[start:end]:
+                arr = arrays[i]
+                view = np.ndarray(arr.shape, arr.dtype, storage, arr.ctypes.data - low, arr.strides)
+                np.copyto(view, arr)
+                view.flags.writeable = arr.flags.writeable
+                memo[id(arr)] = view
+            start = end
+    return copy.deepcopy(inputs, memo)
+
+
+def _time_callable(fn: Callable, inputs: Any, device: str, warmup: int = 2, iters: int = 5) -> float:
     for _ in range(warmup):
-        fn()
+        _call_with_inputs(fn, _copy_inputs(inputs))
     _sync_if_cuda(device)
     samples_ms: list[float] = []
     if device == "cuda" and _torch is not None and _torch.cuda.is_available():
         for _ in range(iters):
+            sample = _copy_inputs(inputs)
             s_ev = _torch.cuda.Event(enable_timing=True)
             e_ev = _torch.cuda.Event(enable_timing=True)
             s_ev.record()
-            fn()
+            _call_with_inputs(fn, sample)
             e_ev.record()
             _torch.cuda.synchronize()
             samples_ms.append(float(s_ev.elapsed_time(e_ev)))
     else:
         for _ in range(iters):
+            sample = _copy_inputs(inputs)
             t0 = time.perf_counter()
-            fn()
+            _call_with_inputs(fn, sample)
             samples_ms.append((time.perf_counter() - t0) * 1000.0)
     return float(statistics.median(samples_ms))
 
@@ -144,19 +201,21 @@ def _evaluate_case(case: dict[str, Any], device: str, atol: float, rtol: float) 
     flops = case.get("flops")
 
     if callable(ref_fn) and callable(cand_fn) and inputs is not None:
-        ref_out = _call_with_inputs(ref_fn, inputs)
-        cand_out = _call_with_inputs(cand_fn, inputs)
+        ref_out = _call_with_inputs(ref_fn, _copy_inputs(inputs))
+        # A kernel may return a view of a shared output workspace.
+        expected = [arr.copy() for arr in _flatten_arrays(ref_out)]
+        cand_out = _call_with_inputs(cand_fn, _copy_inputs(inputs))
         _sync_if_cuda(device)
-        ok, max_diff, detail = _check_close(ref_out, cand_out, atol, rtol)
-        ref_ms = _time_callable(lambda: _call_with_inputs(ref_fn, inputs), device)
-        cand_ms = _time_callable(lambda: _call_with_inputs(cand_fn, inputs), device)
+        ok, max_diff, detail = _check_close(expected, cand_out, atol, rtol)
+        ref_ms = _time_callable(ref_fn, inputs, device)
+        cand_ms = _time_callable(cand_fn, inputs, device)
         speedup = (ref_ms / cand_ms) if cand_ms > 0 and ref_ms > 0 else None
     elif callable(cand_fn) and inputs is not None and "ref_output" in case:
-        cand_out = _call_with_inputs(cand_fn, inputs)
+        cand_out = _call_with_inputs(cand_fn, _copy_inputs(inputs))
         _sync_if_cuda(device)
         ok, max_diff, detail = _check_close(case["ref_output"], cand_out, atol, rtol)
         ref_ms = float(case["ref_ms"]) if case.get("ref_ms") else None
-        cand_ms = _time_callable(lambda: _call_with_inputs(cand_fn, inputs), device)
+        cand_ms = _time_callable(cand_fn, inputs, device)
         speedup = (ref_ms / cand_ms) if (ref_ms and cand_ms > 0) else None
     else:
         ok = bool(case.get("correct", True))

@@ -405,6 +405,70 @@ def test_trace_diff_stream_bubbles_and_roofline_attribution(tmp_path: Path):
         assert "[Roofline Gap]" in done["kernel_report"]
 
 
+@pytest.mark.parametrize("use_reference_kernel", [False, True])
+@pytest.mark.parametrize("candidate_increment", [1, 2])
+def test_micro_in_place_kernels_start_each_trial_from_the_same_input(use_reference_kernel, candidate_increment):
+    from kiln.micro.sandbox import _evaluate_case
+
+    original = np.zeros(1, dtype=np.float32)
+    reference_inputs = []
+    candidate_inputs = []
+
+    def reference(x):
+        reference_inputs.append(x.item())
+        x += 1
+        return x
+
+    def candidate(x):
+        candidate_inputs.append(x.item())
+        x += candidate_increment
+        return x
+
+    case = {"inputs": {"x": original}, "cand_fn": candidate}
+    if use_reference_kernel:
+        case["ref_fn"] = reference
+    else:
+        case["ref_output"] = np.ones_like(original)
+    row = _evaluate_case(case, "cpu", atol=0, rtol=0)
+    assert row["correct"] == (candidate_increment == 1)
+    assert row["max_abs_diff"] == candidate_increment - 1
+    assert original.item() == 0
+    assert len(candidate_inputs) > 1
+    assert set(candidate_inputs) == {0}
+    if use_reference_kernel:
+        assert reference_inputs == candidate_inputs
+
+
+def test_micro_preserves_overlapping_strided_array_inputs():
+    from kiln.micro.sandbox import _copy_inputs
+
+    base = np.arange(16)
+    a, b = base[14:1:-2], base[6:12:2]
+    broadcast = np.broadcast_to(base[6:7], (4,))
+    x, y, z = _copy_inputs((a, b, broadcast))
+    assert [v.strides for v in (x, y, z)] == [v.strides for v in (a, b, broadcast)]
+    assert np.array_equal(x, a) and np.array_equal(y, b)
+    x[4] = 99
+    assert y[0] == 99 and np.all(z == 99)
+    assert not z.flags.writeable and base[6] == 6
+
+
+def test_micro_preserves_nonleaf_tensor_views_and_inference_mode():
+    torch = pytest.importorskip("torch")
+    from kiln.micro.sandbox import _copy_inputs
+
+    base = torch.arange(10.0, requires_grad=True) * 3
+    sliced = base[1::2]
+    x, y = _copy_inputs((base, sliced))
+    assert not x.is_leaf and x.requires_grad and y.stride() == sliced.stride()
+    x[1] += 2
+    assert y[0].item() == 5 and base[1].item() == 3
+    with torch.inference_mode():
+        inference = torch.ones(3)
+        assert _copy_inputs(inference).is_inference()
+    assert _copy_inputs(inference).is_inference()
+
+
 def test_micro_snapshots_lock_free_sandbox_padded_nan_ptxas_ncu(tmp_path: Path):
     # 1. Cold-boot SnapshotCollector on duck-typed multi-layer model + replay
     class DummyAttn:

@@ -1,0 +1,25 @@
+kiln/micro/sandbox.py
+  s_56a07b14c3664a::t_8fb8740bcb9d76 5,142,153,161,205-206,209-211,218
+tests/test_evolution_and_micro.py
+  s_56a07b14c3664a::t_4e2278f56fe721 408-441
+tests/test_probe.py
+  s_56a07b14c3664a::t_581b1e99f29cf7 256-277
+kiln/costmodel/model.py
+  s_56a07b14c3664a::t_72110fc8774972 82,380-381,509
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "698b7bfd666a79b017c003908379e0be5f675542",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

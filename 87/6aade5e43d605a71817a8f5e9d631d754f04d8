@@ -1,0 +1,33 @@
+kiln/engine/replay.py
+  s_56a07b14c3664a::t_42adf017b7f5c7 15,51-52,56-57,100
+  s_56a07b14c3664a::t_7aef41ed381ac8 4,11-12,39-50,53-55,58-99,101-102
+  s_56a07b14c3664a::t_3fff1dd4e46244 16
+kiln/engine/sglang_server.py
+  s_56a07b14c3664a::t_7aef41ed381ac8 46,233-238,240,254,401
+  s_56a07b14c3664a::t_b3c2f962bb7a41 411
+kiln/engine/vllm_server.py
+  s_56a07b14c3664a::t_7aef41ed381ac8 37,150-153,155-160,163,230
+  s_56a07b14c3664a::t_80da5123af3c65 240
+kiln/engine/base.py
+  s_56a07b14c3664a::t_a75f5344288078 78-79,165-177,192
+kiln/server/jobs.py
+  s_56a07b14c3664a::t_df29d3d2256d6c 28,501-503,513
+tests/test_replay_latency.py
+  s_56a07b14c3664a::t_92cbeae335c590 69-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "876aade5e43d605a71817a8f5e9d631d754f04d8",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

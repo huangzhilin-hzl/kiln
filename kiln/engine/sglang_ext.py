@@ -277,10 +277,19 @@ def _clear_containers(target) -> None:
             container.clear()
 
 
-def _release_graph_attr(obj, attr: str) -> bool:
+def _active_graph_attrs(obj, attrs: tuple[str, ...]) -> set[str]:
+    active = set()
+    for attr in attrs:
+        graph = getattr(obj, attr, None)
+        if graph is not None and not _is_eager_runner(obj, graph):
+            active.add(attr)
+    return active
+
+
+def _release_graph_attr(obj, attr: str) -> None:
     gr = getattr(obj, attr, None)
     if gr is None or _is_eager_runner(obj, gr):
-        return False
+        return
     backend = getattr(gr, "backend", None)
     if backend is not None:
         cleanup = getattr(backend, "cleanup", None)
@@ -299,7 +308,6 @@ def _release_graph_attr(obj, attr: str) -> bool:
             pass
     fallback = getattr(obj, "eager_runner", None) if attr == "prefill_cuda_graph_runner" else None
     setattr(obj, attr, fallback)
-    return True
 
 
 def _count_graphs(obj, attrs: tuple[str, ...]) -> int:
@@ -435,6 +443,8 @@ class SGLangHotReloadController:
         self._kiln_module: types.ModuleType | None = None
         self._kiln_temp_path: Path | None = None
         self._kiln_dirty: bool = False
+        self._target_graph_attrs: set[str] = set()
+        self._capture_draft_graphs = False
         self._kiln_snapshot_collector: object | None = None
 
     def dispatch(self, method: str, args: list, kwargs: dict):
@@ -463,9 +473,9 @@ class SGLangHotReloadController:
         self, path: str, *, pd_role: str | None = None, temp_path: Path | None = None
     ) -> float:
         t0 = time.perf_counter()
-        _, target_runner, _, _ = _resolve_workers(self.owner)
-        model = _get_raw_model(target_runner)
         self.kiln_teardown()
+        _, target_runner, spec_worker, draft_runners = _resolve_workers(self.owner)
+        model = _get_raw_model(target_runner)
 
         linecache.checkcache(path)
         importlib.invalidate_caches()
@@ -478,6 +488,12 @@ class SGLangHotReloadController:
         mod = importlib.util.module_from_spec(spec)
         server_args = getattr(target_runner, "server_args", None) or getattr(self.scheduler, "server_args", None)
         role = resolve_sglang_pd_role(server_args, explicit_role=pd_role)
+        # Capture topology before releasing a graph. Failed capture can leave the
+        # runner unset, and teardown must still rebuild that graph for the baseline.
+        self._target_graph_attrs = _active_graph_attrs(target_runner, _MODEL_RUNNER_GRAPH_ATTRS)
+        self._capture_draft_graphs = bool(_active_graph_attrs(spec_worker, _SPEC_WORKER_GRAPH_ATTRS)) or any(
+            _active_graph_attrs(runner, _MODEL_RUNNER_GRAPH_ATTRS) for runner in draft_runners
+        )
         self._kiln_patched = snapshot_forwards(model)
         self._kiln_module = mod
         self._kiln_temp_path = temp_path
@@ -635,21 +651,13 @@ class SGLangHotReloadController:
             except Exception:
                 pass
 
-        had_piecewise = getattr(target_runner, "piecewise_cuda_graph_runner", None) is not None
-        released_attrs = {a: _release_graph_attr(target_runner, a) for a in _MODEL_RUNNER_GRAPH_ATTRS}
-        had_prefill_cg = released_attrs.get("prefill_cuda_graph_runner", False)
-        had_decode_cg = released_attrs.get("decode_cuda_graph_runner", False)
-        had_legacy_cg = any(
-            v for k, v in released_attrs.items()
-            if k not in ("prefill_cuda_graph_runner", "decode_cuda_graph_runner")
-        )
-        had_spec_graphs = (
-            spec_worker is not None
-            and any([_release_graph_attr(spec_worker, a) for a in _SPEC_WORKER_GRAPH_ATTRS])
-        )
-        had_draft_runner_graphs = any(
-            [any([_release_graph_attr(dr, a) for a in _MODEL_RUNNER_GRAPH_ATTRS]) for dr in draft_runners]
-        )
+        for attr in _MODEL_RUNNER_GRAPH_ATTRS:
+            _release_graph_attr(target_runner, attr)
+        for attr in _SPEC_WORKER_GRAPH_ATTRS:
+            _release_graph_attr(spec_worker, attr)
+        for runner in draft_runners:
+            for attr in _MODEL_RUNNER_GRAPH_ATTRS:
+                _release_graph_attr(runner, attr)
         if spec_worker is not None:
             for dr in draft_runners:
                 hooks = getattr(dr, "capture_tail_hooks", None)
@@ -666,6 +674,8 @@ class SGLangHotReloadController:
         _empty_cache()
 
         # Recapture target graphs first (matches SGLang startup order for shared memory pool).
+        had_prefill_cg = "prefill_cuda_graph_runner" in self._target_graph_attrs
+        had_decode_cg = "decode_cuda_graph_runner" in self._target_graph_attrs
         if had_prefill_cg or had_decode_cg:
             if had_prefill_cg and hasattr(target_runner, "init_prefill_cuda_graph"):
                 target_runner.init_prefill_cuda_graph()
@@ -674,20 +684,20 @@ class SGLangHotReloadController:
             if not hasattr(target_runner, "init_prefill_cuda_graph") and not hasattr(target_runner, "init_decode_cuda_graph"):
                 if hasattr(target_runner, "init_cuda_graphs"):
                     target_runner.init_cuda_graphs()
-        elif had_legacy_cg:
+        elif self._target_graph_attrs:
             if hasattr(target_runner, "init_device_graphs"):
                 target_runner.init_device_graphs()
             elif hasattr(target_runner, "init_cuda_graphs"):
                 target_runner.init_cuda_graphs()
             if (
-                had_piecewise
+                "piecewise_cuda_graph_runner" in self._target_graph_attrs
                 and getattr(target_runner, "piecewise_cuda_graph_runner", None) is None
                 and hasattr(target_runner, "init_piecewise_cuda_graphs")
             ):
                 target_runner.init_piecewise_cuda_graphs()
 
         # Recapture speculative / draft graphs second.
-        if had_spec_graphs or had_draft_runner_graphs:
+        if self._capture_draft_graphs:
             if spec_worker is not None and hasattr(spec_worker, "init_cuda_graphs"):
                 spec_worker.init_cuda_graphs()
             elif spec_worker is not None and hasattr(spec_worker, "_capture_cuda_graphs"):

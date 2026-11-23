@@ -172,6 +172,44 @@ def test_sglang_hot_reload_controller_standard_and_speculative(tmp_path: Path, m
     assert "forward" not in model.mlp.__dict__
 
 
+@pytest.mark.parametrize("baseline_capture_fails", [False, True])
+def test_failed_decode_graph_capture_recovers_baseline(tmp_path, baseline_capture_fails):
+    class Model:
+        def forward(self):
+            return "baseline"
+
+    class Runner:
+        def __init__(self):
+            self.model = Model()
+            self.decode_cuda_graph_runner = object()
+            self.captures = []
+
+        def init_decode_cuda_graph(self):
+            self.decode_cuda_graph_runner = None
+            name = self.model.forward()
+            self.captures.append(name)
+            if name == "candidate" or baseline_capture_fails:
+                raise ValueError(f"{name} capture failed")
+            self.decode_cuda_graph_runner = object()
+
+    runner = Runner()
+    ctrl = SGLangHotReloadController(SimpleNamespace(tp_worker=SimpleNamespace(model_runner=runner)))
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text('def make_forward(model):\n    return lambda: "candidate"\n')
+    if baseline_capture_fails:
+        with pytest.raises(RuntimeError, match="rollback failed"):
+            ctrl.kiln_hot_reload(str(candidate))
+        with pytest.raises(RuntimeError, match="restart the engine"):
+            ctrl.kiln_teardown()
+    else:
+        with pytest.raises(ValueError, match="candidate capture failed"):
+            ctrl.kiln_hot_reload(str(candidate))
+        ctrl.kiln_teardown()
+        assert runner.decode_cuda_graph_runner is not None
+    assert runner.captures == ["candidate", "baseline"]
+    assert runner.model.forward() == "baseline"
+
+
 @pytest.mark.parametrize("restore_fails", [False, True])
 def test_sglang_hot_reload_rollback_and_dirty_state(tmp_path: Path, restore_fails: bool):
     class Model:

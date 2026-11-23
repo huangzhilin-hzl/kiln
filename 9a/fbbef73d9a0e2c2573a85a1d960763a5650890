@@ -1,0 +1,25 @@
+kiln/server/jobs.py
+  s_56a07b14c3664a::t_300561bc487a20 176-177,252-253,360,362-363,365-366,377-378,381,388,724,831-845
+  s_56a07b14c3664a::t_caa1cca6a12bfe 846
+kiln/server/app.py
+  s_56a07b14c3664a::t_300561bc487a20 118-122
+tests/test_local_shutdown.py
+  s_56a07b14c3664a::t_300561bc487a20 1-45
+  s_56a07b14c3664a::t_582b0f0116cf3f 46-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9afbbef73d9a0e2c2573a85a1d960763a5650890",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

@@ -79,6 +79,7 @@ class ModelSpec:
     total_weight_bytes: float | None = None
     prefill_layer_frac: float = 1.0
     kv_bytes_per_tok: float | None = None
+    dsv41_dspark: bool = False  # SGLang PD uses matching TP across roles and forbids DP attention.
 
     @property
     def is_moe(self) -> bool:
@@ -376,6 +377,8 @@ def estimate_disagg(
     max_replicas_per_role: int = 8,
 ) -> DisaggEstimate | None:
     """Analytical throughput & `xPyD` sizing for asymmetric Prefill (`c_p`) + Decode (`c_d`)."""
+    if m.dsv41_dspark and (c_p.attn_dp != 1 or c_d.attn_dp != 1 or c_p.attn_tp != c_d.attn_tp):
+        return None
     ctx = w.isl + w.osl
     c_mem_p = _max_batch_memory(m, c_p, chip, max(1, w.isl))
     c_mem_d = _max_batch_memory(m, c_d, chip, ctx)
@@ -503,7 +506,7 @@ MODELS = {
         "deepseek-v4.1-flash", layers=40, hidden=5120, heads=64, kv_heads=1, head_dim=128,
         vocab=129280, experts=256, top_k=8, expert_inter=2304, shared_experts=1,
         bytes_per_param=0.7, kv_bytes=0.5, mtp_accept=3.2,
-        total_weight_bytes=510 * GB, prefill_layer_frac=0.5, kv_bytes_per_tok=890.0,
+        total_weight_bytes=510 * GB, prefill_layer_frac=0.5, kv_bytes_per_tok=890.0, dsv41_dspark=True,
     ),
 }
 MODELS["deepseek4.1-flash"] = MODELS["deepseek-v4.1-flash"]

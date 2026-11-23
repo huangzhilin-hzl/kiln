@@ -253,3 +253,25 @@ def test_costmodel_disaggregated_xpyd_search_and_cli(capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["mode"] == "disagg"
     assert out["rankings"] and out["rankings"][0]["total_gpus"] <= 16
+
+
+def test_dsv41_dspark_rankings_satisfy_pd_launch_constraints():
+    from kiln.costmodel.model import CHIPS, estimate_disagg, rank_disagg, search_space
+    from kiln.engine.sglang_pd import validate_sglang_pd_args
+
+    m = MODELS["deepseek-v4.1-flash"]
+    chip = HardwareProfile.load("profiles/h20_3e_hw_profile.json").to_chip_spec()
+    configs = {c.label(): c for c in search_space(m, max_chips=16)}
+    rows = rank_disagg(m, chip, Workload(), max_chips=16, cluster_gpus=16, k=1000)
+    assert rows
+    for row in rows:
+        args = []
+        for role in ("prefill", "decode"):
+            config = configs[row[f"{role}_config"]]
+            args.append({"speculative_algorithm": "DSPARK", "dp_size": config.attn_dp,
+                         "tp_size": config.n, "enable_dp_attention": config.attn_dp > 1})
+        validate_sglang_pd_args(m.name, "mooncake", [args[0]], [args[1]])
+
+    # Other presets still support asymmetric P/D layouts and DP attention.
+    assert estimate_disagg(MODELS["qwen3-30b-a3b"], ParallelConfig(1, 2, 2, 1),
+                           ParallelConfig(1, 1, 1, 1), CHIPS["H100"], Workload(isl=512))

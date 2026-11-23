@@ -1,0 +1,23 @@
+README.md
+  s_56a07b14c3664a::t_13a847c92eb1c3 117-118
+configs/dsv41_flash_h20_sglang_pd.yaml
+  s_56a07b14c3664a::t_a95b3dfd6511e4 3-5,8,11,78,87
+tests/test_sglang_pd.py
+  s_56a07b14c3664a::t_83f6b66d07f6aa 35-36,44-45,53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "aca55defe6b9b9da1eeed8246faa249ad91994ca",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

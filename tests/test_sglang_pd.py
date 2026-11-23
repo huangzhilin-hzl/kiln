@@ -32,6 +32,8 @@ def test_pd_config_yaml_and_pd_node_cli_dry_run(capsys):
     eng = make_engine(run.engine, slow)
     assert isinstance(eng, SGLangPDServerEngine)
     assert eng.total_gpus == 16  # 1P (8 GPUs) + 1D (8 GPUs)
+    assert eng.prefill_urls == ["http://kiln-prefill:31401"]
+    assert eng.decode_urls == ["http://kiln-decode:31402"]
 
     cli_mod.main(["pd-node", "-c", cfg_path, "--role", "prefill", "--host", "0.0.0.0", "--dry-run"])
     p_spec = json.loads(capsys.readouterr().out)
@@ -39,7 +41,8 @@ def test_pd_config_yaml_and_pd_node_cli_dry_run(capsys):
     assert "--disaggregation-mode" in p_spec["cmd"]
     idx = p_spec["cmd"].index("--disaggregation-mode")
     assert p_spec["cmd"][idx + 1] == "prefill"
-    assert "--disaggregation-bootstrap-port" in p_spec["cmd"]
+    assert p_spec["cmd"][p_spec["cmd"].index("--port") + 1] == "31401"
+    assert p_spec["cmd"][p_spec["cmd"].index("--disaggregation-bootstrap-port") + 1] == "8998"
     assert p_spec["env_overrides"]["KILN_SGLANG_HOOK"] == "1"
     assert p_spec["env_overrides"]["KILN_PD_ROLE"] == "prefill"
 
@@ -47,6 +50,7 @@ def test_pd_config_yaml_and_pd_node_cli_dry_run(capsys):
     d_spec = json.loads(capsys.readouterr().out)
     idx_d = d_spec["cmd"].index("--disaggregation-mode")
     assert d_spec["cmd"][idx_d + 1] == "decode"
+    assert d_spec["cmd"][d_spec["cmd"].index("--port") + 1] == "31402"
     assert d_spec["env_overrides"]["KILN_PD_ROLE"] == "decode"
 
 

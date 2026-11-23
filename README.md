@@ -114,6 +114,8 @@ kiln merge --prefill <prefill_job> --decode <decode_job> -o forward.py --submit 
 
 ## Prefill-Decode (PD) Disaggregation (SGLang + Mooncake)
 
+The four-pod example uses three DNS names. Point `kiln-control` at the Kiln server on port 18765, `kiln-prefill` at the prefill pod on ports 31401 and 8998, and `kiln-decode` at the decode pod on port 31402. Use a separate name per replica when scaling. The launch commands in the config can also use your own pod addresses.
+
 ```bash
 # Launch hook-enabled Prefill and Decode servers on their respective GPU pods
 kiln pd-node -c configs/dsv41_flash_h20_sglang_pd.yaml --role prefill --host 0.0.0.0

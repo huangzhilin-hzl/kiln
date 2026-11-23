@@ -283,6 +283,9 @@ def build_router_cmd(
         # `sglang_router` is absent or only ships Python `MiniLB` (which mismatches
         # multi-prefill bootstrap ports and crashes on `return_logprob=True` without
         # input logprobs); use kiln's built-in async HTTP PD router.
+        from .pd_router import validate_fallback_policy
+
+        validate_fallback_policy(pd.router_policy or "round_robin")
         cmd = [sys.executable, "-m", "kiln.engine.pd_router"]
 
     cmd += ["--pd-disaggregation", "--host", host, "--port", str(port)]

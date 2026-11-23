@@ -29,6 +29,7 @@ def test_pd_config_yaml_and_pd_node_cli_dry_run(capsys):
     slow = run.tiers[2]
     assert slow.engine_kind == "sglang_pd_server"
     assert slow.pd is not None and slow.pd.transfer_backend == "mooncake"
+    assert slow.pd.router_policy == "round_robin"
 
     eng = make_engine(run.engine, slow)
     assert isinstance(eng, SGLangPDServerEngine)
@@ -318,6 +319,7 @@ def test_pd_router_fallback_and_2p1d_bootstrap_pairing(monkeypatch):
             assert r.status_code == 200
             assert r.json()["output_ids"] == [101, 102]
         stats = tc.get("/router_stats").json()
+        assert stats["policy"] == "round_robin"
         assert stats["prefill_counts"] == {
             "http://127.0.0.1:31500": 2,
             "http://127.0.0.1:31502": 2,
@@ -384,3 +386,38 @@ def test_pd_stream_closes_decode_after_prefill_result(prefill_fails):
     assert seen["decode"]["stream"] and seen["decode"]["stream_options"] == {"include_usage": True}
     assert seen["decode"]["bootstrap_room"] == seen["prefill"]["bootstrap_room"]
     assert closed == [True]
+
+
+def test_fallback_policy_validation_is_specific_to_fallback(monkeypatch):
+    from kiln.engine.pd_router import create_pd_router_app, parse_pd_router_cli
+
+    pd = PDClusterConfig(
+        router_policy="cache_aware",
+        prefill=[PDNodeConfig(url="http://p")],
+        decode=[PDNodeConfig(url="http://d")],
+    )
+    router_args = (pd, ["http://p"], ["http://d"], "127.0.0.1", 31480)
+    monkeypatch.setattr("kiln.engine.sglang_pd._has_rust_sglang_router", lambda: True)
+    assert build_router_cmd(*router_args)[-2:] == ["--policy", "cache_aware"]
+    monkeypatch.setattr("kiln.engine.sglang_pd._has_rust_sglang_router", lambda: False)
+    monkeypatch.setattr("kiln.engine.sglang_pd.shutil.which", lambda _: None)
+    with pytest.raises(ValueError, match="cache_aware"):
+        build_router_cmd(*router_args)
+    with pytest.raises(ValueError, match="power_of_two"):
+        create_pd_router_app([("http://p", 8998)], ["http://d"], policy="power_of_two")
+    with pytest.raises(SystemExit):
+        parse_pd_router_cli(["--prefill-policy", "cache_aware"])
+
+
+def test_fallback_random_policy_reports_and_uses_random_selection(monkeypatch):
+    from fastapi.testclient import TestClient
+    from kiln.engine.pd_router import create_pd_router_app
+
+    app = create_pd_router_app([("http://p1", 8998), ("http://p2", 8999)], ["http://d1", "http://d2"], policy="random")
+    monkeypatch.setattr("kiln.engine.pd_router.random.choice", lambda choices: choices[-1])
+    assert app.state.pd.select_pair() == ("http://p2", 8999, "http://d2")
+    with TestClient(app) as tc:
+        stats = tc.get("/router_stats").json()
+    assert stats["policy"] == "random"
+    assert stats["prefill_counts"] == {"http://p1": 0, "http://p2": 1}
+    assert stats["decode_counts"] == {"http://d1": 0, "http://d2": 1}

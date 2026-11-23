@@ -9,7 +9,7 @@ is missing, leaving only `MiniLB`), upstream `MiniLB` has two critical limitatio
 2. `MiniLB.generate()` concatenates `meta_info["input_token_logprobs"]` unconditionally
    when `return_logprob=True`, raising `TypeError` when `input_token_logprobs` is `None`.
 
-This lightweight FastAPI + `httpx.AsyncClient` router accepts the same CLI flags as
+This lightweight FastAPI + `httpx.AsyncClient` router accepts the basic topology flags from
 `sglang_router.launch_router --pd-disaggregation` and serves as an automatic fallback
 whenever the native Rust router is unavailable.
 """
@@ -30,6 +30,17 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+
+_POLICIES = ("round_robin", "random")
+
+
+def validate_fallback_policy(policy: str) -> None:
+    if policy not in _POLICIES:
+        raise ValueError(
+            f"The fallback PD router does not support policy {policy!r}. "
+            f"Choose {' or '.join(_POLICIES)}, or install the native SGLang router."
+        )
 
 
 def _maybe_wrap_ipv6(address: str | None) -> str:
@@ -93,6 +104,7 @@ class PDRouterState:
     decode_counts: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        validate_fallback_policy(self.policy)
         for u, _ in self.prefill_nodes:
             self.prefill_counts.setdefault(u, 0)
         for u in self.decode_urls:
@@ -357,11 +369,10 @@ def parse_pd_router_cli(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=30080)
     p.add_argument("--prefill", nargs="+", action="append", default=[])
     p.add_argument("--decode", nargs="+", action="append", default=[])
-    p.add_argument("--policy", type=str, default="round_robin")
+    p.add_argument("--policy", choices=_POLICIES, default="round_robin")
     p.add_argument("--request-timeout-secs", type=float, default=1800.0)
     p.add_argument("--log-level", type=str, default="warning")
-    ns, _unknown = p.parse_known_args(argv)
-    return ns
+    return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:

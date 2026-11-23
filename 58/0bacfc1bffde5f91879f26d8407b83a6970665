@@ -1,0 +1,41 @@
+tests/test_replay_latency.py
+  s_56a07b14c3664a::t_aeca35267ba51c 1-49
+  s_56a07b14c3664a::t_7c7a8beb192b07 50-51,61-68
+kiln/engine/sglang_server.py
+  s_56a07b14c3664a::t_741903750d251c 46,375,378-379,389,401
+kiln/engine/sglang_pd.py
+  s_56a07b14c3664a::t_741903750d251c 45,639,654
+kiln/engine/vllm_offline.py
+  s_56a07b14c3664a::t_741903750d251c 17,49,117,120-121
+kiln/engine/replay.py
+  s_56a07b14c3664a::t_741903750d251c 1-33
+kiln/engine/vllm_server.py
+  s_56a07b14c3664a::t_741903750d251c 37,222
+kiln/engine/sglang_offline.py
+  s_56a07b14c3664a::t_741903750d251c 19,220-225,228,241,244-245,253,267
+  s_56a07b14c3664a::t_aeca35267ba51c 226-227
+kiln/server/jobs.py
+  s_56a07b14c3664a::t_741903750d251c 490-494,498
+README.md
+  s_56a07b14c3664a::t_13a847c92eb1c3 117-118
+configs/dsv41_flash_h20_sglang_pd.yaml
+  s_56a07b14c3664a::t_a95b3dfd6511e4 3-5,8,11,78,87
+tests/test_sglang_pd.py
+  s_56a07b14c3664a::t_83f6b66d07f6aa 35-36,44-45,53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "580bacfc1bffde5f91879f26d8407b83a6970665",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

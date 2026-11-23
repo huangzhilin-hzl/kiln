@@ -1,0 +1,21 @@
+tests/test_probe.py
+  s_56a07b14c3664a::t_581b1e99f29cf7 256-277
+kiln/costmodel/model.py
+  s_56a07b14c3664a::t_72110fc8774972 82,380-381,509
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7cfbd2ff620223c8d91c3898c56c7ed239043dd4",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

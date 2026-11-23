@@ -1,0 +1,32 @@
+tests/test_phase_sharing.py
+  s_56a07b14c3664a::t_46ec0b17fb64a8 1-34
+kiln/engine/base.py
+  s_56a07b14c3664a::t_46ec0b17fb64a8 14-15,19,193-205,209-211
+  s_56a07b14c3664a::t_11d9a4a065fff8 212
+kiln/engine/mock.py
+  s_56a07b14c3664a::t_46ec0b17fb64a8 39,85,94
+kiln/engine/sglang_offline.py
+  s_56a07b14c3664a::t_46ec0b17fb64a8 141-142,237,265
+kiln/engine/sglang_server.py
+  s_56a07b14c3664a::t_46ec0b17fb64a8 211-212,371,399
+kiln/server/jobs.py
+  s_56a07b14c3664a::t_46ec0b17fb64a8 28,133-134,140-144,147-151
+configs/dsv41_flash_h20_sglang_pd.yaml
+  s_56a07b14c3664a::t_77bb367bc66c8b 6,12-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b4afcd671cd6ee4e2f3b313368e35bdbcef6a3d6",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

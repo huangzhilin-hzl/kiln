@@ -1,0 +1,42 @@
+kiln/engine/vllm_offline.py
+  s_56a07b14c3664a::t_9fa5ed7ddf697a 210-219
+  s_56a07b14c3664a::t_dd5451acf51339 13,200,206-209,220-221
+kiln/bench/correctness.py
+  s_56a07b14c3664a::t_9fa5ed7ddf697a 51-53
+  s_56a07b14c3664a::t_dd5451acf51339 34-50,54-68,75,77-78,110,124-130
+  s_56a07b14c3664a::t_47cc2c7e85a4eb 89-90,93
+kiln/engine/vllm_server.py
+  s_56a07b14c3664a::t_47cc2c7e85a4eb 26
+  s_56a07b14c3664a::t_dd5451acf51339 296,311-314,316-317
+kiln/engine/sglang_server.py
+  s_56a07b14c3664a::t_dd5451acf51339 480,500-501
+  s_56a07b14c3664a::t_47cc2c7e85a4eb 26
+kiln/server/jobs.py
+  s_56a07b14c3664a::t_dd5451acf51339 24,287-289
+tests/test_probe_logprob_gate.py
+  s_56a07b14c3664a::t_9fa5ed7ddf697a 1-59
+kiln/engine/sglang_ext.py
+  s_56a07b14c3664a::t_dd5451acf51339 33-34,170,172-173,178-180,188
+  s_56a07b14c3664a::t_9fa5ed7ddf697a 181-185,190-192
+kiln/engine/sglang_pd.py
+  s_56a07b14c3664a::t_47cc2c7e85a4eb 32
+  s_56a07b14c3664a::t_dd5451acf51339 726,746-747
+kiln/engine/sglang_offline.py
+  s_56a07b14c3664a::t_dd5451acf51339 15,347,361-362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "214fdf2c83d9d8571e667061780ce9ceb581f788",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

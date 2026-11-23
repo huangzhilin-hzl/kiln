@@ -1,0 +1,21 @@
+kiln/engine/sglang_server.py
+  s_56a07b14c3664a::t_13f0138dc658f7 33
+tests/test_http_prefill.py
+  s_56a07b14c3664a::t_ea7e3e090d2192 1-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8f07ff7082b7b4692ad6b2858813b18d2f841c96",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

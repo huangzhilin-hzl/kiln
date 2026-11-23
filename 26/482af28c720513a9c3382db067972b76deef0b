@@ -1,0 +1,21 @@
+kiln/engine/mock.py
+  s_56a07b14c3664a::t_12b59551168bdb 128
+tests/test_replay_latency.py
+  s_56a07b14c3664a::t_12b59551168bdb 52-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "26482af28c720513a9c3382db067972b76deef0b",
+  "prompts": {},
+  "sessions": {
+    "s_56a07b14c3664a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a2064b-ea7e-7c60-8f52-a66a8a6745e7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

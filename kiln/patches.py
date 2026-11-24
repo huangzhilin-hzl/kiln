@@ -296,8 +296,47 @@ def _infer_tags(tokens: Sequence[str]) -> list[str]:
     return out
 
 
+def _func_tail_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _is_composite_forward_rhs(node: ast.AST | None) -> bool:
+    if isinstance(node, ast.Call):
+        return _func_tail_name(node.func) == "make_composite_forward"
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call):
+        return _func_tail_name(node.value.func) == "make_composite_forward"
+    return False
+
+
+def _iter_toplevel_exec_nodes(stmts: Sequence[ast.stmt]):
+    """Yield AST nodes executed at module import time (stopping at def/class boundaries)."""
+    stack = list(reversed(stmts))
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        yield cur
+        for child in reversed(list(ast.iter_child_nodes(cur))):
+            stack.append(child)
+
+
+def _target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: list[str] = []
+        for elt in target.elts:
+            out.extend(_target_names(elt))
+        return out
+    return []
+
+
 def inspect_candidate_source(source: str) -> dict[str, Any]:
-    """Statically parse candidate source for tags, parent IDs, regimes, patches, targets, and mock speedups."""
+    """Statically parse candidate source for tags, parent IDs, regimes, patches, targets, phases, and build triggers."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -307,6 +346,10 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
             "parents": [],
             "regimes": [],
             "phases": [],
+            "effective_phase": "all",
+            "only_kiln_patches": False,
+            "needs_prebuild": False,
+            "build_triggers": [],
             "patches": [],
             "targets": [],
             "mock_speedup": None,
@@ -320,16 +363,25 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
     phases: list[str] = []
     patches: list[dict[str, Any]] = []
     targets: list[str] = []
+    build_triggers: list[str] = []
     seen_tags: set[str] = set()
     seen_parents: set[str] = set()
     seen_regimes: set[str] = set()
     seen_phases: set[str] = set()
     seen_targets: set[str] = set()
+    seen_triggers: set[str] = set()
     symbol_tokens: list[str] = []
     imported_aliases: dict[str, str] = {}
     mock_speedup: float | None = None
     mock_prefill_speedup: float | None = None
     mock_bucket_speedups: dict[str, float] = {}
+    explicit_phase: str | None = None
+    explicit_only_patches: bool | None = None
+    explicit_prebuild: bool | None = None
+    has_custom_make_forward = False
+    has_toplevel_mutation = False
+    imports_subprocess = False
+    string_literals: set[str] = set()
 
     def _add_tag(val: str) -> None:
         v = val.strip()
@@ -355,6 +407,11 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
             seen_targets.add(v)
             targets.append(v)
 
+    def _add_trigger(val: str) -> None:
+        if val and val not in seen_triggers:
+            seen_triggers.add(val)
+            build_triggers.append(val)
+
     # Top-level imports & metadata constants
     for stmt in tree.body:
         if isinstance(stmt, ast.Import):
@@ -362,14 +419,34 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
                 local = alias.asname or alias.name.split(".")[0]
                 imported_aliases[local] = alias.name
                 symbol_tokens.append(alias.name)
+                if alias.name == "subprocess" or alias.name.startswith("subprocess."):
+                    imports_subprocess = True
+                if "cpp_extension" in alias.name:
+                    _add_trigger("cpp_extension")
+                if "tvm_ffi" in alias.name:
+                    _add_trigger("tvm_ffi")
         elif isinstance(stmt, ast.ImportFrom):
             mod = stmt.module or ""
             symbol_tokens.append(mod)
+            if mod == "subprocess" or mod.startswith("subprocess."):
+                imports_subprocess = True
+            if "cpp_extension" in mod:
+                _add_trigger("cpp_extension")
+            if "tvm_ffi" in mod:
+                _add_trigger("tvm_ffi")
             for alias in stmt.names:
                 local = alias.asname or alias.name
                 full = f"{mod}.{alias.name}" if mod else alias.name
                 imported_aliases[local] = full
                 symbol_tokens.append(alias.name)
+                if alias.name == "load_inline":
+                    _add_trigger("load_inline")
+                elif alias.name in ("cpp_extension", "CUDAExtension", "CppExtension", "compile_extension"):
+                    _add_trigger("cpp_extension")
+                elif alias.name == "tvm_ffi":
+                    _add_trigger("tvm_ffi")
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "kiln_build":
+            _add_trigger("kiln_build")
         elif isinstance(stmt, ast.Assign):
             for tgt in stmt.targets:
                 if not isinstance(tgt, ast.Name):
@@ -380,6 +457,19 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
                 elif tgt.id == "KILN_PARENTS":
                     for item in _literal_str_seq(stmt.value):
                         _add_parent(item)
+                elif tgt.id == "KILN_PHASE":
+                    vals = _literal_str_seq(stmt.value)
+                    if vals:
+                        try:
+                            explicit_phase = _resolve_patch_phase(vals[0], "all")
+                        except ValueError:
+                            explicit_phase = "all"
+                elif tgt.id == "KILN_ONLY_PATCHES":
+                    if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, bool):
+                        explicit_only_patches = stmt.value.value
+                elif tgt.id == "KILN_PREBUILD":
+                    if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, bool):
+                        explicit_prebuild = stmt.value.value
                 elif tgt.id == "SPEEDUP":
                     num = _literal_num(stmt.value)
                     if num is not None:
@@ -391,10 +481,29 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
                 elif tgt.id == "BUCKET_SPEEDUPS":
                     mock_bucket_speedups = _literal_bucket_map(stmt.value)
 
-    # Walk AST for @kiln_patch decorators, class/module patching targets, and symbol hints
+    for top_node in _iter_toplevel_exec_nodes(tree.body):
+        if isinstance(top_node, ast.Assign):
+            for tgt in top_node.targets:
+                if isinstance(tgt, (ast.Attribute, ast.Subscript)):
+                    has_toplevel_mutation = True
+                if "make_forward" in _target_names(tgt) and not _is_composite_forward_rhs(top_node.value):
+                    has_custom_make_forward = True
+        elif isinstance(top_node, ast.AnnAssign) and top_node.target is not None:
+            if isinstance(top_node.target, (ast.Attribute, ast.Subscript)):
+                has_toplevel_mutation = True
+            if "make_forward" in _target_names(top_node.target) and not _is_composite_forward_rhs(top_node.value):
+                has_custom_make_forward = True
+        elif isinstance(top_node, ast.AugAssign) and isinstance(top_node.target, (ast.Attribute, ast.Subscript)):
+            has_toplevel_mutation = True
+
+    # Walk AST for @kiln_patch decorators, class/module patching targets, build calls, and symbol hints
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             symbol_tokens.append(node.name)
+            if node.name == "make_forward":
+                has_custom_make_forward = True
+            elif node.name == "kiln_build":
+                _add_trigger("kiln_build")
             for dec in node.decorator_list:
                 call = _is_kiln_patch_decorator(dec)
                 if call is None:
@@ -411,9 +520,39 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
                     phases.append(pinfo["phase"])
                 for t in pinfo["targets"]:
                     _add_target(t)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess" or alias.name.startswith("subprocess."):
+                    imports_subprocess = True
+                if "cpp_extension" in alias.name:
+                    _add_trigger("cpp_extension")
+                if "tvm_ffi" in alias.name:
+                    _add_trigger("tvm_ffi")
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod == "subprocess" or mod.startswith("subprocess."):
+                imports_subprocess = True
+            if "cpp_extension" in mod:
+                _add_trigger("cpp_extension")
+            if "tvm_ffi" in mod:
+                _add_trigger("tvm_ffi")
+            for alias in node.names:
+                if alias.name == "load_inline":
+                    _add_trigger("load_inline")
+                elif alias.name in ("cpp_extension", "CUDAExtension", "CppExtension", "compile_extension"):
+                    _add_trigger("cpp_extension")
+                elif alias.name == "tvm_ffi":
+                    _add_trigger("tvm_ffi")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) <= 64:
+            string_literals.add(node.value)
         elif isinstance(node, ast.ClassDef):
             symbol_tokens.append(node.name)
         elif isinstance(node, ast.Call):
+            tail = _func_tail_name(node.func)
+            if tail == "load_inline":
+                _add_trigger("load_inline")
+            elif tail in ("compile_extension", "CUDAExtension", "CppExtension"):
+                _add_trigger("cpp_extension")
             # isinstance(x, ClassName) or isinstance(x, (A, B))
             if isinstance(node.func, ast.Name) and node.func.id == "isinstance" and len(node.args) >= 2:
                 cls_arg = node.args[1]
@@ -457,6 +596,38 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
                 elif root_name == "model" and rest != "forward":
                     _add_target(chain)
 
+    if imports_subprocess and (
+        "nvcc" in string_literals
+        or ("-shared" in string_literals and "-fPIC" in string_literals)
+    ):
+        _add_trigger("c_compiler")
+
+    if explicit_only_patches is not None:
+        only_kiln_patches = bool(explicit_only_patches) and not has_toplevel_mutation
+    else:
+        only_kiln_patches = bool(patches) and (not has_custom_make_forward) and (not has_toplevel_mutation)
+
+    if explicit_phase is not None:
+        effective_phase = explicit_phase
+    elif only_kiln_patches:
+        patch_phases = {p["phase"] for p in patches}
+        if patch_phases == {"prefill"}:
+            effective_phase = "prefill"
+        elif patch_phases == {"decode"}:
+            effective_phase = "decode"
+        else:
+            effective_phase = "all"
+    else:
+        effective_phase = "all"
+
+    if explicit_prebuild is False:
+        needs_prebuild = False
+    elif explicit_prebuild is True:
+        _add_trigger("explicit")
+        needs_prebuild = True
+    else:
+        needs_prebuild = bool(build_triggers)
+
     for inferred in _infer_tags([*symbol_tokens, *targets]):
         _add_tag(inferred)
 
@@ -466,6 +637,10 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
         "parents": parents,
         "regimes": regimes,
         "phases": phases,
+        "effective_phase": effective_phase,
+        "only_kiln_patches": only_kiln_patches,
+        "needs_prebuild": needs_prebuild,
+        "build_triggers": build_triggers,
         "patches": patches,
         "targets": targets,
         "mock_speedup": mock_speedup,
@@ -565,6 +740,11 @@ def compose_candidates(
                 prod *= info["mock_speedup"]
         combined_buckets[bkey] = round(prod, 6)
 
+    parent_phases = {info["effective_phase"] for _, info in inspected}
+    merged_phase = next(iter(parent_phases)) if len(parent_phases) == 1 else "all"
+    merged_only_patches = all(bool(info.get("only_kiln_patches")) for _, info in inspected)
+    merged_needs_prebuild = any(bool(info.get("needs_prebuild")) for _, info in inspected)
+
     lines: list[str] = [
         '"""Auto-composed orthogonal candidate synthesized by `kiln merge`."""',
         "from __future__ import annotations",
@@ -576,6 +756,12 @@ def compose_candidates(
         f"KILN_PARENTS = {parent_ids!r}",
         f"KILN_TAGS = {merged_tags!r}",
     ]
+    if merged_phase in ("prefill", "decode"):
+        lines.append(f"KILN_PHASE = {merged_phase!r}")
+    if merged_only_patches:
+        lines.append("KILN_ONLY_PATCHES = True")
+    if merged_needs_prebuild:
+        lines.append("KILN_PREBUILD = True")
     if has_mock_speedup:
         lines.append(f"SPEEDUP = {round(combined_speedup, 6)!r}")
     if combined_buckets:
@@ -660,6 +846,23 @@ def compose_candidates(
         "        _restore_applied(applied, model)",
         "",
     ])
+    if merged_needs_prebuild:
+        lines.extend([
+            "def kiln_build() -> None:",
+            "    loaded: list[tuple[str, types.ModuleType]] = []",
+            "    try:",
+            "        for idx, (jid, src) in enumerate(_PARENT_SPECS):",
+            "            mod = _load_parent_module(idx, jid, src)",
+            "            loaded.append((mod.__name__, mod))",
+            "            build_fn = getattr(mod, 'kiln_build', None)",
+            "            if callable(build_fn):",
+            "                build_fn()",
+            "    finally:",
+            "        for mod_name, mod in reversed(loaded):",
+            "            linecache.cache.pop(getattr(mod, '__file__', None), None)",
+            "            sys.modules.pop(mod_name, None)",
+            "",
+        ])
 
     return {
         "source": "\n".join(lines),
@@ -723,6 +926,8 @@ def compose_pd_pair(
     elif mock_prefill_sp is not None:
         combined_buckets["prefill_large"] = round(float(mock_prefill_sp), 6)
 
+    pd_needs_prebuild = bool(info_p.get("needs_prebuild") or info_d.get("needs_prebuild"))
+
     lines: list[str] = [
         '"""Asymmetric Prefill/Decode candidate pair synthesized by `kiln merge --prefill --decode`."""',
         "from __future__ import annotations",
@@ -736,6 +941,8 @@ def compose_pd_pair(
         f"KILN_TAGS = {merged_tags!r}",
         f"KILN_PD_PAIR = {{'prefill': {p_id!r}, 'decode': {d_id!r}}}",
     ]
+    if pd_needs_prebuild:
+        lines.append("KILN_PREBUILD = True")
     if mock_decode_sp is not None:
         lines.append(f"SPEEDUP = {round(float(mock_decode_sp), 6)!r}")
     if mock_prefill_sp is not None:
@@ -830,6 +1037,27 @@ def compose_pd_pair(
         "        _restore_applied(applied, model)",
         "",
     ])
+    if pd_needs_prebuild:
+        lines.extend([
+            "def kiln_build() -> None:",
+            "    role = _active_role(None)",
+            "    specs = [('prefill', *_PREFILL_SPEC)] if role == 'prefill' else (",
+            "        [('decode', *_DECODE_SPEC)] if role == 'decode' else [('prefill', *_PREFILL_SPEC), ('decode', *_DECODE_SPEC)]",
+            "    )",
+            "    loaded: list[tuple[str, types.ModuleType]] = []",
+            "    try:",
+            "        for role_tag, jid, src in specs:",
+            "            mod = _load_role_module(role_tag, jid, src)",
+            "            loaded.append((mod.__name__, mod))",
+            "            build_fn = getattr(mod, 'kiln_build', None)",
+            "            if callable(build_fn):",
+            "                build_fn()",
+            "    finally:",
+            "        for mod_name, mod in reversed(loaded):",
+            "            linecache.cache.pop(getattr(mod, '__file__', None), None)",
+            "            sys.modules.pop(mod_name, None)",
+            "",
+        ])
 
     return {
         "source": "\n".join(lines),

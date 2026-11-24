@@ -1,0 +1,16 @@
+kiln/patches.py
+  h_7339bf36ecd0bc 299-337,339,349-352,366,372,378-384,410-414,422-427,431-436,442-449,460-472,484-499,503-506,523-547,551-555,599-630,640-643,743-747,759-764,849-865,929-930,944-945,1040-1060
+tests/test_prebuild_and_graph_tax.py
+  h_7339bf36ecd0bc 1-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6f264f6f4377d7dcd5002ca921ab178e615a8f9d",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

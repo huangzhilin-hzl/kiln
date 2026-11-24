@@ -147,7 +147,7 @@ Archived winner `candidates/dsv41_flash_h20_tp8_forward.py` (DeepSeek-V4.1-Flash
 
 | Path | Role | TKCC |
 |---|---|---|
-| `kiln/engine/` | Hot-reloadable vLLM (`vllm_offline`, `vllm_server`), SGLang (`sglang_offline`, `sglang_server`), CPU `mock`, baseline trace diff & roofline attribution | §4.2, Fig. 3 |
+| `kiln/engine/` | Hot-reloadable vLLM (`vllm_offline`, `vllm_server`), SGLang (`sglang_offline`, `sglang_server`), out-of-lock C++/CUDA `prebuild`, lazy baseline teardown & phase-aware CUDA graph skip, CPU `mock`, baseline trace diff & roofline attribution | §4.2, Fig. 3 |
 | `kiln/server/` | FastAPI job queues, remote workers, token auth, crash recovery, multi-island archive, lineage, and shared board | §4.2, Fig. 5c |
 | `kiln/micro/` | Lock-free isolated kernel sandbox, cold-boot layer tensor snapshots, `ptxas` spill & `ncu` bank-conflict counters | — |
 | `kiln/patches.py` | `@kiln_patch` modular patch contract, static AST target/conflict analysis, and orthogonal candidate composer | — |

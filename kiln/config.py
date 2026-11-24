@@ -133,6 +133,8 @@ class TierConfig(BaseModel):
     lazy_baseline: bool = False
     prebuild: Literal["auto", "always", "off"] = "auto"
     prebuild_timeout_s: float = Field(default=300.0, gt=0.0)
+    lazy_teardown: bool = True
+    idle_baseline_rebuild_s: float | None = Field(default=30.0, ge=0.0)
 
     @model_validator(mode="after")
     def _validate_screening(self) -> "TierConfig":

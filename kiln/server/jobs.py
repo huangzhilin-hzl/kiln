@@ -6,11 +6,13 @@ If the engine crashes, it restarts automatically and the job is marked as crashe
 """
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import math
 import queue
 import statistics
+import subprocess
 import threading
 import time
 import traceback
@@ -25,7 +27,15 @@ from kiln.bench.correctness import evaluate_correctness, validate_probe_logprobs
 from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
 from kiln.engine import Engine, make_engine
-from kiln.engine.base import InvalidBenchmark, MeasureResult, bucket_tps_for_requests, evaluating_phase, replay_itl_metrics
+from kiln.engine.base import (
+    InvalidBenchmark,
+    MeasureResult,
+    bucket_tps_for_requests,
+    evaluating_phase,
+    replay_itl_metrics,
+    shutdown_process_group,
+)
+from kiln.engine.prebuild import PrebuildResult, prebuild_candidate
 from kiln.engine.vllm_profiler import (
     TraceAnalysis,
     compute_roofline_attribution,
@@ -136,6 +146,19 @@ class SharedEngineAdapter(Engine):
     def teardown_candidate(self) -> None:
         self.owner.engine.teardown_candidate()
 
+    def teardown_candidate_lazy(self) -> None:
+        fn = getattr(self.owner.engine, "teardown_candidate_lazy", self.owner.engine.teardown_candidate)
+        fn()
+
+    def ensure_baseline(self) -> None:
+        fn = getattr(self.owner.engine, "ensure_baseline", None)
+        if callable(fn):
+            fn()
+
+    def needs_baseline_rebuild(self) -> bool:
+        fn = getattr(self.owner.engine, "needs_baseline_rebuild", None)
+        return bool(fn()) if callable(fn) else False
+
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
         with evaluating_phase(self.tier.phase):
             eng = self.owner.engine
@@ -177,7 +200,15 @@ class TierWorker:
         self.stop_requested = threading.Event()
         self.engine: Engine | None = None
         self.owner: TierWorker | None = None
+        self.borrowers: list[TierWorker] = []
         self.engine_lock = threading.RLock()
+        self._stats_lock = threading.Lock()
+        self._prebuild_lock = threading.Lock()
+        self._prebuild_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self._prebuild_futures: dict[str, concurrent.futures.Future[PrebuildResult]] = {}
+        self._prebuild_cancels: dict[str, threading.Event] = {}
+        self._prebuild_procs: dict[str, subprocess.Popen | None] = {}
+        self._last_job_finished_mono: float = time.monotonic()
         self.baseline_tps: float | None = None
         self.baseline_decode_tps: float | None = None
         self.baseline_prefill_tps: float | None = None
@@ -279,6 +310,7 @@ class TierWorker:
             self.ready.set()
 
     def _measure_baseline(self) -> None:
+        self._ensure_baseline_ready()
         cc = self.run.correctness
         probe = [r.prompt_ids for r in self.requests[: cc.num_prompts]]
         tokens, logprobs = self.engine.greedy_probe(probe, cc.max_new_tokens)
@@ -357,13 +389,201 @@ class TierWorker:
                 pass
         self._restart_engine()
 
+    # ------------------------------------------------------------------ prebuild & idle baseline
+    @property
+    def _effective_engine_kind(self) -> str:
+        return str(self.tier.engine_kind or self.run.engine.kind)
+
+    @property
+    def _root_worker(self) -> "TierWorker":
+        return self.owner if self.owner is not None else self
+
+    def _has_queued_jobs(self) -> bool:
+        with self.q.mutex:
+            return any(j is not None and j.status == "queued" for j in self.q.queue)
+
+    def _any_shared_queued(self) -> bool:
+        root = self._root_worker
+        if root._has_queued_jobs():
+            return True
+        return any(b._has_queued_jobs() for b in root.borrowers)
+
+    def _engine_needs_baseline_rebuild(self) -> bool:
+        eng = self.engine
+        if eng is None:
+            return False
+        fn = getattr(eng, "needs_baseline_rebuild", None)
+        return bool(fn()) if callable(fn) else False
+
+    def _ensure_baseline_ready(self) -> None:
+        eng = self.engine
+        if eng is None:
+            return
+        fn = getattr(eng, "ensure_baseline", None)
+        if not callable(fn) or not self._engine_needs_baseline_rebuild():
+            return
+        timeout_s = float(self.tier.timeout_s or 0)
+        _run_with_timeout(fn, timeout_s, f"{self.tier.name} ensure_baseline")
+
+    def _idle_rebuild_timeout(self) -> float | None:
+        delay = self.tier.idle_baseline_rebuild_s
+        if delay is None or not self.ready.is_set() or not self._engine_needs_baseline_rebuild():
+            return None
+        if self._any_shared_queued():
+            return None
+        elapsed = time.monotonic() - self._root_worker._last_job_finished_mono
+        return max(0.01, float(delay) - elapsed)
+
+    def _maybe_rebuild_idle_baseline(self) -> bool:
+        delay = self.tier.idle_baseline_rebuild_s
+        if delay is None or self.stop_requested.is_set() or not self._engine_needs_baseline_rebuild():
+            return False
+        with self.engine_lock:
+            if self.stop_requested.is_set() or self._any_shared_queued():
+                return False
+            if not self._engine_needs_baseline_rebuild():
+                return False
+            if (time.monotonic() - self._root_worker._last_job_finished_mono) < float(delay):
+                return False
+            try:
+                self._ensure_baseline_ready()
+                return True
+            except Exception as exc:
+                print(f"[kiln] {self.tier.name}: idle baseline rebuild failed ({exc}); restarting")
+                self.ready.clear()
+                try:
+                    self._restart_engine()
+                except Exception as restart_exc:
+                    self.boot_error = str(restart_exc)
+                return False
+
+    def _run_prebuild_now(self, job: Job, cancel_ev: threading.Event | None = None) -> PrebuildResult:
+        cpath = Path(job.candidate_path)
+        if not cpath.is_file():
+            return PrebuildResult(ok=True, skipped=True, reason="missing_file")
+
+        def _track_proc(proc: subprocess.Popen | None) -> None:
+            with self._prebuild_lock:
+                if proc is None:
+                    self._prebuild_procs.pop(job.id, None)
+                else:
+                    self._prebuild_procs[job.id] = proc
+
+        gpus = self.tier.gpus or (self.owner.tier.gpus if self.owner is not None else [])
+        return prebuild_candidate(
+            cpath,
+            mode=self.tier.prebuild,
+            timeout_s=float(self.tier.prebuild_timeout_s),
+            pd_role=self.tier.phase,
+            engine_kind=self._effective_engine_kind,
+            gpus=gpus,
+            cancel_event=cancel_ev,
+            on_proc=_track_proc,
+        )
+
+    def _start_prebuild(self, job: Job) -> None:
+        if not self.local or self.tier.prebuild == "off":
+            return
+        cpath = Path(job.candidate_path)
+        if not cpath.is_file():
+            return
+        try:
+            src = cpath.read_text(encoding="utf-8")
+        except OSError:
+            return
+        info = inspect_candidate_source(src)
+        # Fast-path candidates (valid syntax, no native build triggers under mode="auto") need no pool thread.
+        if info.get("syntax_ok") and self.tier.prebuild == "auto" and not info.get("needs_prebuild"):
+            return
+        with self._prebuild_lock:
+            if self.stop_requested.is_set() or job.id in self._prebuild_futures:
+                return
+            if self._prebuild_pool is None:
+                self._prebuild_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix=f"prebuild-{self.tier.name}"
+                )
+            cancel_ev = threading.Event()
+            self._prebuild_cancels[job.id] = cancel_ev
+            self._prebuild_futures[job.id] = self._prebuild_pool.submit(
+                self._run_prebuild_now, job, cancel_ev
+            )
+
+    def _await_prebuild(self, job: Job) -> PrebuildResult:
+        with self._prebuild_lock:
+            fut = self._prebuild_futures.get(job.id)
+        if fut is not None:
+            try:
+                return fut.result()
+            finally:
+                with self._prebuild_lock:
+                    self._prebuild_futures.pop(job.id, None)
+                    self._prebuild_cancels.pop(job.id, None)
+                    self._prebuild_procs.pop(job.id, None)
+        return self._run_prebuild_now(job)
+
+    def cancel_prebuild(self, jid: str) -> None:
+        with self._prebuild_lock:
+            ev = self._prebuild_cancels.pop(jid, None)
+            fut = self._prebuild_futures.pop(jid, None)
+            proc = self._prebuild_procs.pop(jid, None)
+        if ev is not None:
+            ev.set()
+        if fut is not None:
+            fut.cancel()
+        if proc is not None:
+            shutdown_process_group(proc, timeout=3.0)
+
+    def shutdown_prebuild(self) -> None:
+        with self._prebuild_lock:
+            jids = list({*self._prebuild_cancels, *self._prebuild_futures, *self._prebuild_procs})
+            pool = self._prebuild_pool
+            self._prebuild_pool = None
+        for jid in jids:
+            self.cancel_prebuild(jid)
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _fail_prebuild_job(self, job: Job, pre: PrebuildResult) -> None:
+        now = time.time()
+        started = job.started_at or now
+        extra = dict(job.extra or {})
+        extra["prebuild"] = pre.to_dict()
+        result = replace(
+            job,
+            status="crashed",
+            started_at=started,
+            finished_at=now,
+            error=pre.error or f"Candidate prebuild failed ({pre.reason})",
+            extra=extra,
+        )
+        with self._stats_lock:
+            self.crashes += 1
+            self.durations.append(max(0.0, now - started))
+        self._save(result)
+        job.__dict__.update(result.__dict__)
+        if self.on_job_finished is not None:
+            self.on_job_finished(job)
+
     # ------------------------------------------------------------------ loop
     def _loop(self) -> None:
         self.wait_until_ready()
         while not self.stop_requested.is_set():
-            job = self.q.get()
+            try:
+                idle_wait = self._idle_rebuild_timeout()
+                job = self.q.get(timeout=idle_wait)
+            except queue.Empty:
+                self._maybe_rebuild_idle_baseline()
+                continue
             if job is None:
                 return
+            if self.stop_requested.is_set() or job.status != "queued":
+                continue
+            pre = self._await_prebuild(job)
+            if self.stop_requested.is_set() or job.status != "queued":
+                continue
+            if not pre.ok:
+                self._fail_prebuild_job(job, pre)
+                continue
             with self.engine_lock:
                 if self.stop_requested.is_set():
                     return
@@ -378,7 +598,7 @@ class TierWorker:
                         self.boot_error = str(exc)
                 self.wait_until_ready()
                 if not self.stop_requested.is_set():
-                    self.execute_job(job)
+                    self.execute_job(job, _prebuild_result=pre)
 
     def wait_until_ready(self) -> None:
         while not self.ready.is_set() and not self.stop_requested.is_set():
@@ -390,11 +610,24 @@ class TierWorker:
                 self.boot_error = str(exc)
                 self.stop_requested.wait(5)
 
-    def execute_job(self, job: Job) -> None:
+    def execute_job(self, job: Job, *, _prebuild_result: PrebuildResult | None = None) -> None:
+        if job.status == "cancelled":
+            return
+        pre = _prebuild_result if _prebuild_result is not None else self._await_prebuild(job)
+        if job.status == "cancelled":
+            return
+        if not pre.ok:
+            if pre.reason == "cancelled":
+                return
+            self._fail_prebuild_job(job, pre)
+            return
+
         with self.engine_lock:
             if job.status == "cancelled":
                 return
             job.status, job.started_at = "running", time.time()
+            if not pre.skipped:
+                job.extra = {**(job.extra or {}), "prebuild": pre.to_dict()}
             self._save(job)
             result = replace(job)
             try:
@@ -409,9 +642,11 @@ class TierWorker:
                     result.error += f"\nEngine recovery failed: {exc}"
             finally:
                 result.finished_at = time.time()
+                self._root_worker._last_job_finished_mono = time.monotonic()
                 self._save(result)
                 job.__dict__.update(result.__dict__)
-                self.durations.append(result.finished_at - result.started_at)
+                with self._stats_lock:
+                    self.durations.append(result.finished_at - result.started_at)
                 if (
                     result.status == "done"
                     and self.tier.canary_every_n_jobs is not None
@@ -428,6 +663,7 @@ class TierWorker:
     def _run_canary(self) -> dict | None:
         if self.engine is None or not self.baseline_tps or self.baseline_tps <= 0:
             return None
+        self._ensure_baseline_ready()
         timeout_s = float(self.tier.timeout_s or 0)
         ax_dur = ((self.tier.agentx or {}).get("benchmark_duration_s") or 0)
         measure_timeout = (
@@ -719,12 +955,18 @@ class TierWorker:
             job.extra = extra
             job.speedup = cand_score / self.baseline_tps
         finally:
-            _run_with_timeout(eng.teardown_candidate, teardown_timeout, f"{self.tier.name} teardown")
+            teardown_fn = (
+                getattr(eng, "teardown_candidate_lazy", eng.teardown_candidate)
+                if self.tier.lazy_teardown
+                else eng.teardown_candidate
+            )
+            _run_with_timeout(teardown_fn, teardown_timeout, f"{self.tier.name} teardown")
         job.status = "done"
 
     # ------------------------------------------------------------------ api
     def submit(self, job: Job) -> None:
         self._save(job)
+        self._start_prebuild(job)
         self.q.put(job)
 
     def stats(self) -> dict:
@@ -786,6 +1028,8 @@ def _wire_shared_tiers(
             )
         borrower.owner = owner
         borrower.engine_lock = owner.engine_lock
+        if borrower not in owner.borrowers:
+            owner.borrowers.append(borrower)
         if t.trace_kernels and not owner.tier.trace_kernels and (not enforce_same_locality or borrower.local):
             owner.tier = owner.tier.model_copy(update={"trace_kernels": True})
 
@@ -831,6 +1075,7 @@ class JobManager:
             ):
                 self._requeue(worker, job)
             elif job.status == "queued":
+                worker._start_prebuild(job)
                 worker.q.put(job)
             elif job.finished_at and job.started_at:
                 worker.durations.append(job.finished_at - job.started_at)
@@ -845,6 +1090,7 @@ class JobManager:
         local_workers = [w for w in self.tiers.values() if w.local]
         for worker in local_workers:
             worker.stop_requested.set()
+            worker.shutdown_prebuild()
             worker.q.put(None)
         for worker in local_workers:
             if worker.thread.is_alive():
@@ -950,6 +1196,7 @@ class JobManager:
                     old.status = "cancelled"
                     old.finished_at = now
                     old.invalidated_reason = f"Superseded by {jid}"
+                    self.tiers[tier].cancel_prebuild(old.id)
                     self.tiers[tier]._save(old)
                     superseded_ids.append(old.id)
             else:
@@ -1009,6 +1256,7 @@ class JobManager:
             job.invalidated_reason = "Cancelled"
             worker = self.tiers.get(job.tier)
             if worker is not None:
+                worker.cancel_prebuild(job.id)
                 worker._save(job)
             self.lock.notify_all()
             return {"id": job.id, "status": job.status}
@@ -1724,6 +1972,9 @@ def run_remote_worker(
                     claimed = None
                     break
             if not claimed or claimed_worker is None:
+                for w in boot_order:
+                    if w.owner is None:
+                        w._maybe_rebuild_idle_baseline()
                 continue
             t_name = claimed_worker.tier.name
             with active_lock:
@@ -1773,5 +2024,6 @@ def run_remote_worker(
         heartbeat_thread.join()
         client.close()
         for w in workers.values():
+            w.shutdown_prebuild()
             if w.owner is None and w.engine:
                 w.engine.shutdown()

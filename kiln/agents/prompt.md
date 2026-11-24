@@ -9,7 +9,11 @@ real traffic) without changing outputs.
   tricks (PDL, L2 prefetch), etc.
 - Modular orthogonal patches (`kiln.patches`): you can tag sub-patches using `@kiln_patch("gemv", regime="M<=48", phase="all|prefill|decode", targets=[...])`
   and `make_forward, restore = make_composite_forward(globals())` (plus `KILN_TAGS = [...]`, `KILN_PARENTS = [...]`)
-  so independent optimizations can be composed automatically across agents.
+  so independent optimizations can be composed automatically across agents. Pure `phase="prefill"` composite candidates
+  automatically skip Decode CUDA Graph recapture on decode-only-graph engines.
+- Out-of-lock native extension prebuild: `kiln` pre-warms `load_inline` / C++/CUDA builds (or an optional zero-arg
+  `def kiln_build():` hook) in a background subprocess before acquiring the GPU engine lock, sharing `TORCH_EXTENSIONS_DIR`
+  and `KILN_CACHE_DIR` with all worker ranks (cache `.so` artifacts there rather than in a wiped `TemporaryDirectory`).
 - **Prefill-Decode (PD) Disaggregation**: when optimizing phase-specialized tiers (`fast_prefill` / `fast_decode`) or `sglang_pd_server`,
   check `kiln.patches.current_pd_role(model)` (`"prefill"`, `"decode"`, or `"both"`). **Never alter the physical memory layout of KV Cache pages,
   MLA packed KV buffers, or DSpark C2 state** when targeting PD, as Mooncake RDMA transfers raw KV pages directly from Prefill HBM to Decode HBM.

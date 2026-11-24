@@ -140,6 +140,8 @@ def test_prebuild_candidate_syntax_hook_lazy_load_inline_and_timeout(tmp_path, m
     from kiln.engine.prebuild import ensure_extension_cache_env, prebuild_candidate
     from kiln.engine.sglang_ext import bootstrap_env
 
+    monkeypatch.delenv("TORCH_EXTENSIONS_DIR", raising=False)
+    monkeypatch.delenv("KILN_CACHE_DIR", raising=False)
     monkeypatch.setenv("KILN_EXT_CACHE_ROOT", str(tmp_path / "ext_cache"))
     env = ensure_extension_cache_env({})
     assert env["TORCH_EXTENSIONS_DIR"] == str((tmp_path / "ext_cache" / "torch_extensions").resolve())
@@ -513,3 +515,244 @@ def test_sglang_lazy_teardown_topology_retention_and_pd_role_skip(tmp_path):
     assert events == []
     assert ctrl.kiln_info()["last_skipped_graph_rebuild"] is True
     assert ctrl.kiln_teardown_lazy()["baseline_graphs_valid"] is True
+
+
+def test_tier_worker_concurrent_out_of_lock_prebuild_and_fast_reject(tmp_path, monkeypatch):
+    import threading
+    import time
+    from pathlib import Path
+
+    from kiln.bench.traffic import Request, synth_traffic, load_traffic
+    from kiln.config import MicroConfig, RunConfig, TierConfig
+    from kiln.engine.mock import MockEngine
+    from kiln.server.jobs import JobManager
+
+    monkeypatch.delenv("TORCH_EXTENSIONS_DIR", raising=False)
+    monkeypatch.delenv("KILN_CACHE_DIR", raising=False)
+    monkeypatch.delenv("TORCH_EXTENSIONS_DIR", raising=False)
+    monkeypatch.delenv("KILN_CACHE_DIR", raising=False)
+    monkeypatch.setenv("KILN_EXT_CACHE_ROOT", str(tmp_path / "ext_cache"))
+    traffic = tmp_path / "t.jsonl"
+    synth_traffic(traffic, n=4, isl=32, osl=8)
+
+    slow_in_measure = threading.Event()
+    release_slow = threading.Event()
+    hot_reloaded_paths: list[str] = []
+    orig_measure = MockEngine.measure
+    orig_hot_reload = MockEngine.hot_reload
+
+    def slow_blocking_measure(self, requests, repeats, trace, *, skip_prefill=False):
+        if self.assessment_phase == "both" and self.speedup == 1.11:
+            slow_in_measure.set()
+            assert release_slow.wait(timeout=10.0)
+        return orig_measure(self, requests, repeats, trace, skip_prefill=skip_prefill)
+
+    def tracking_hot_reload(self, candidate_path: str) -> None:
+        hot_reloaded_paths.append(candidate_path)
+        orig_hot_reload(self, candidate_path)
+
+    monkeypatch.setattr(MockEngine, "measure", slow_blocking_measure)
+    monkeypatch.setattr(MockEngine, "hot_reload", tracking_hot_reload)
+
+    run = RunConfig(
+        name="concurrent_prebuild",
+        traffic_file=str(traffic),
+        workdir=str(tmp_path),
+        micro=MicroConfig(enabled=False),
+        tiers=[
+            TierConfig(name="fast", phase="decode", share_engine="slow", repeats=1),
+            TierConfig(name="slow", phase="both", repeats=1),
+        ],
+    )
+    # Verify features are enabled by default!
+    assert run.tiers[0].prebuild == "auto"
+    assert run.tiers[0].lazy_teardown is True
+    assert run.tiers[0].idle_baseline_rebuild_s == 30.0
+
+    mgr = JobManager(run, load_traffic(traffic))
+    mgr.start()
+    try:
+        assert mgr.tiers["slow"].ready.wait(timeout=5)
+        assert mgr.tiers["fast"].ready.wait(timeout=5)
+
+        # 1. Start a slow job that holds the shared `engine_lock` inside measure()
+        j_slow = mgr.submit("a_slow", "slow", "SPEEDUP = 1.11\n")
+        assert slow_in_measure.wait(timeout=5)
+
+        # 2. Submit a broken build job to `fast` while `slow` STILL holds `engine_lock`:
+        #    it must fail out-of-lock immediately without waiting for `slow`!
+        bad_build_src = (
+            "def kiln_build():\n"
+            "    raise RuntimeError('Error building extension: nvcc syntax error')\n"
+            "def make_forward(model):\n"
+            "    return None\n"
+        )
+        j_bad = mgr.submit("a_fast", "fast", bad_build_src)
+        deadline = time.time() + 5.0
+        while j_bad.status in ("queued", "running") and time.time() < deadline:
+            time.sleep(0.03)
+        assert j_bad.status == "crashed"
+        assert "nvcc syntax error" in (j_bad.error or "")
+        assert j_bad.extra["prebuild"]["ok"] is False
+        assert str(j_bad.candidate_path) not in hot_reloaded_paths
+
+        # 3. Submit a valid kiln_build() candidate to `fast` while `slow` STILL holds `engine_lock`:
+        #    the compilation marker file must appear on disk BEFORE `release_slow` is set!
+        built_file = tmp_path / "built_while_locked.txt"
+        good_build_src = (
+            f"from pathlib import Path\n"
+            f"SPEEDUP = 1.25\n"
+            f"def kiln_build():\n"
+            f"    Path({str(built_file)!r}).write_text('built_out_of_lock')\n"
+            f"def make_forward(model):\n"
+            f"    return None\n"
+        )
+        j_good = mgr.submit("a_fast", "fast", good_build_src)
+        deadline = time.time() + 5.0
+        while not built_file.exists() and time.time() < deadline:
+            time.sleep(0.03)
+        assert built_file.read_text() == "built_out_of_lock"
+        # `j_slow` is still holding `engine_lock`!
+        assert j_slow.status == "running"
+
+        # Now release `slow` and verify both `j_slow` and `j_good` complete cleanly
+        release_slow.set()
+        deadline = time.time() + 8.0
+        while (j_slow.status != "done" or j_good.status != "done") and time.time() < deadline:
+            time.sleep(0.03)
+        assert j_slow.status == "done"
+        assert j_good.status == "done"
+        assert j_good.extra["prebuild"]["ok"] is True
+        assert j_good.extra["prebuild"]["skipped"] is False
+    finally:
+        release_slow.set()
+        mgr.shutdown()
+
+
+def test_tier_worker_lazy_teardown_canary_and_idle_baseline_rebuild(tmp_path, monkeypatch):
+    import time
+    from pathlib import Path
+
+    from kiln.bench.traffic import Request, synth_traffic, load_traffic
+    from kiln.config import MicroConfig, RunConfig, TierConfig
+    from kiln.engine.base import Engine, MeasureResult
+    from kiln.server import jobs
+
+    captures: list[str] = []
+
+    class FakeGraphEngine(Engine):
+        def __init__(self, cfg, tier):
+            self.cfg, self.tier = cfg, tier
+            self.active_name: str | None = None
+            self.speedup: float = 1.0
+            self._dirty_baseline: bool = False
+
+        def start(self) -> None:
+            captures.append("boot_baseline")
+
+        def hot_reload(self, candidate_path: str) -> None:
+            ns: dict = {}
+            exec(Path(candidate_path).read_text(), ns)
+            self.active_name = str(ns.get("CAND_NAME", "cand"))
+            self.speedup = float(ns.get("SPEEDUP", 1.0))
+            captures.append(f"capture:{self.active_name}")
+            self._dirty_baseline = True
+
+        def teardown_candidate(self) -> None:
+            self.active_name = None
+            self.speedup = 1.0
+            captures.append("capture:eager_baseline")
+            self._dirty_baseline = False
+
+        def teardown_candidate_lazy(self) -> None:
+            self.active_name = None
+            self.speedup = 1.0
+            # Lazy teardown restores forward without capturing baseline!
+            self._dirty_baseline = True
+
+        def ensure_baseline(self) -> None:
+            if self._dirty_baseline:
+                captures.append("capture:ensure_baseline")
+                self._dirty_baseline = False
+
+        def needs_baseline_rebuild(self) -> bool:
+            return self._dirty_baseline
+
+        def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+            if self.active_name is None and self._dirty_baseline:
+                raise AssertionError("Baseline measured while baseline CUDA graphs were still dirty!")
+            tps = 1000.0 * self.speedup
+            return MeasureResult(decode_tps=tps, prefill_tps=20000.0, ttft_s=0.05, runs_decode_tps=[tps] * repeats)
+
+        def greedy_outputs(self, prompts: list[list[int]], max_new_tokens: int) -> list[list[int]]:
+            if self.active_name is None and self._dirty_baseline:
+                raise AssertionError("Baseline probed while baseline CUDA graphs were still dirty!")
+            return [[1] * max_new_tokens for _ in prompts]
+
+        def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(jobs, "make_engine", lambda cfg, tier: FakeGraphEngine(cfg, tier))
+    traffic = tmp_path / "t.jsonl"
+    synth_traffic(traffic, n=4, isl=32, osl=8)
+
+    run = RunConfig(
+        name="lazy_cycle",
+        traffic_file=str(traffic),
+        workdir=str(tmp_path),
+        micro=MicroConfig(enabled=False),
+        tiers=[
+            TierConfig(
+                name="fast",
+                repeats=1,
+                canary_every_n_jobs=2,
+                idle_baseline_rebuild_s=0.2,
+            )
+        ],
+    )
+    mgr = jobs.JobManager(run, load_traffic(traffic))
+    mgr.start()
+    try:
+        worker = mgr.tiers["fast"]
+        assert worker.ready.wait(timeout=5)
+        assert captures == ["boot_baseline"]
+
+        # Submit two jobs back-to-back:
+        # - j1 captures c1, lazy teardown skips baseline capture
+        # - j2 captures c2, lazy teardown skips baseline capture, then canary triggers ensure_baseline!
+        j1 = mgr.submit("a1", "fast", "CAND_NAME = 'c1'\nSPEEDUP = 1.10\n")
+        j2 = mgr.submit("a1", "fast", "CAND_NAME = 'c2'\nSPEEDUP = 1.20\n")
+        deadline = time.time() + 5.0
+        while (j1.status != "done" or j2.status != "done") and time.time() < deadline:
+            time.sleep(0.02)
+        assert j1.status == "done" and j2.status == "done"
+        assert worker.last_canary is not None
+        assert captures == [
+            "boot_baseline",
+            "capture:c1",
+            "capture:c2",
+            "capture:ensure_baseline",
+        ]
+
+        # Submit a 3rd job (no canary this turn), then let the queue sit idle > 0.2s:
+        # idle timer must automatically rebuild baseline CUDA graphs!
+        j3 = mgr.submit("a1", "fast", "CAND_NAME = 'c3'\nSPEEDUP = 1.15\n")
+        deadline = time.time() + 5.0
+        while j3.status != "done" and time.time() < deadline:
+            time.sleep(0.02)
+        assert j3.status == "done"
+
+        deadline = time.time() + 3.0
+        while worker.engine.needs_baseline_rebuild() and time.time() < deadline:
+            time.sleep(0.03)
+        assert worker.engine.needs_baseline_rebuild() is False
+        assert captures == [
+            "boot_baseline",
+            "capture:c1",
+            "capture:c2",
+            "capture:ensure_baseline",
+            "capture:c3",
+            "capture:ensure_baseline",
+        ]
+    finally:
+        mgr.shutdown()

@@ -30,6 +30,8 @@ class VLLMOfflineEngine(Engine):
         self.cfg, self.tier = cfg, tier
         self.llm = None
         self._trace_dir: str | None = None
+        self._candidate_active: bool = False
+        self._baseline_graphs_dirty: bool = False
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -67,15 +69,57 @@ class VLLMOfflineEngine(Engine):
         print(f"[kiln] {self.tier.name} info: {self.llm.collective_rpc('kiln_info')[0]}")
 
     def hot_reload(self, candidate_path: str) -> None:
-        secs = self.llm.collective_rpc("kiln_hot_reload", args=(os.path.abspath(candidate_path),),
+        rpc_args = (
+            (os.path.abspath(candidate_path),)
+            if self.assessment_phase == "both"
+            else (os.path.abspath(candidate_path), self.assessment_phase)
+        )
+        secs = self.llm.collective_rpc("kiln_hot_reload", args=rpc_args,
                                        timeout=self.tier.timeout_s)
         # Cached KV was written by the previous forward; never let a candidate reuse it.
         self.llm.reset_prefix_cache()
+        self._candidate_active = True
+        self._baseline_graphs_dirty = True
         print(f"[kiln] {self.tier.name}: hot reload {max(secs):.1f}s")
 
     def teardown_candidate(self) -> None:
         self.llm.collective_rpc("kiln_teardown", timeout=self.tier.timeout_s)
         self.llm.reset_prefix_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def teardown_candidate_lazy(self) -> None:
+        if (
+            "teardown_candidate" in self.__dict__
+            or type(self).teardown_candidate is not VLLMOfflineEngine.teardown_candidate
+        ):
+            self.teardown_candidate()
+            return
+        results = self.llm.collective_rpc("kiln_teardown_lazy", timeout=self.tier.timeout_s)
+        self.llm.reset_prefix_cache()
+        self._candidate_active = False
+        all_valid = bool(results) and all(
+            isinstance(r, dict) and bool(r.get("baseline_graphs_valid", False))
+            for r in results
+        )
+        self._baseline_graphs_dirty = not all_valid
+
+    def ensure_baseline(self) -> None:
+        if not self._baseline_graphs_dirty and not self._candidate_active:
+            return
+        was_active = self._candidate_active
+        results = self.llm.collective_rpc("kiln_ensure_baseline", timeout=self.tier.timeout_s)
+        any_rebuilt = was_active or any(
+            isinstance(r, dict) and bool(r.get("rebuilt", False))
+            for r in (results or ())
+        )
+        if any_rebuilt:
+            self.llm.reset_prefix_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def needs_baseline_rebuild(self) -> bool:
+        return bool(self._baseline_graphs_dirty)
 
     def shutdown(self) -> None:
         if self.llm is not None:
@@ -104,6 +148,8 @@ class VLLMOfflineEngine(Engine):
         self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
     ) -> MeasureResult:
         """Prefill and decode measured separately (TKCC: mixing them adds ~6% noise)."""
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         from vllm import SamplingParams
 
         prompts = self._prompts(requests)
@@ -167,6 +213,8 @@ class VLLMOfflineEngine(Engine):
     def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
         if self.llm is None:
             return None
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
 
@@ -188,6 +236,8 @@ class VLLMOfflineEngine(Engine):
     def greedy_probe(
         self, prompts: list[list[int]], max_new_tokens: int
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if "greedy_outputs" in self.__dict__:
             return self.greedy_outputs(prompts, max_new_tokens), None
         from vllm import SamplingParams

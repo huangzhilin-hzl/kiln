@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import os
 import sys
 import time
 import types
+from pathlib import Path
 
+from kiln.patches import inspect_candidate_source, normalize_pd_role
 
 from .patching import restore_forwards as _restore_forwards
 from .patching import snapshot_forwards as _snapshot_forwards
@@ -38,57 +41,190 @@ class HotReloadExt:
     _kiln_patched: list | None = None
     _kiln_module: types.ModuleType | None = None
     _kiln_dirty: bool = False
+    _kiln_baseline_graphs_valid: bool = True
+    _kiln_graphs_released: bool = False
+    _kiln_last_skipped_graph_rebuild: bool = False
     _kiln_snapshot_collector: object | None = None
 
-    # ------------------------------------------------------------------ public RPCs
-    def kiln_hot_reload(self, path: str) -> float:
-        """Install candidate `path`, recompile + recapture. Returns seconds taken."""
-        t0 = time.perf_counter()
-        model = self.model_runner.get_model()
-        self.kiln_teardown()
+    # ------------------------------------------------------------------ phase / graph guards
+    def _kiln_is_decode_only_graph_engine(self) -> bool:
+        vllm_cfg = getattr(self, "vllm_config", None)
+        model_cfg = getattr(self, "model_config", None)
+        runner = getattr(self, "model_runner", None)
+        if vllm_cfg is None or runner is None:
+            return False
+        comp_cfg = getattr(vllm_cfg, "compilation_config", None)
+        if comp_cfg is None:
+            return False
+        mode_val = getattr(comp_cfg, "mode", None)
+        is_no_compile = (
+            mode_val in (0, "0", None)
+            or str(mode_val).upper().endswith("NONE")
+        )
+        if not is_no_compile:
+            return False
+        if bool(getattr(model_cfg, "enforce_eager", False)):
+            return True
+        cg_mode = str(getattr(comp_cfg, "cudagraph_mode", "") or "").upper()
+        if not (
+            cg_mode.endswith("FULL_DECODE_ONLY")
+            or cg_mode.endswith("DECODE_ONLY")
+            or cg_mode.endswith("NONE")
+        ):
+            return False
+        if getattr(runner, "speculator", None) is not None:
+            return False
+        if getattr(getattr(runner, "model_state", None), "replay_cudagraphs", None) is not None:
+            return False
+        return True
 
-        name = f"kiln_candidate_{abs(hash((path, t0)))}"
-        spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)
-        self._kiln_patched = _snapshot_forwards(model)
-        self._kiln_module = mod
-        sys.modules[name] = mod
-        rebuild_started = False
+    def _kiln_can_skip_graph_rebuild(self, source: str | None, pd_role: str = "both") -> bool:
+        if not source:
+            return False
+        info = inspect_candidate_source(source)
+        if not info.get("syntax_ok"):
+            return False
+        eff_phase = info.get("effective_phase", "all")
+        role = normalize_pd_role(pd_role)
+        if (
+            info.get("only_kiln_patches")
+            and role in ("prefill", "decode")
+            and eff_phase in ("prefill", "decode")
+            and eff_phase != role
+        ):
+            return True
+        if eff_phase == "prefill" and self._kiln_is_decode_only_graph_engine():
+            return True
+        return False
+
+    def _kiln_rebuild_baseline(self) -> None:
         try:
-            spec.loader.exec_module(mod)
-            new_fwd = mod.make_forward(model)
-            if new_fwd is not None:
-                model.forward = new_fwd
-            rebuild_started = True
             self._kiln_rebuild()
-        except Exception:
-            self._kiln_restore_baseline(rebuild_started)
-            raise
-        return time.perf_counter() - t0
+            self._kiln_baseline_graphs_valid = True
+            self._kiln_graphs_released = False
+        except Exception as exc:
+            self._kiln_dirty = True
+            raise RuntimeError("Kiln baseline graph rebuild failed; restart the engine") from exc
 
-    def kiln_teardown(self) -> float:
-        """Restore baseline `.forward` across `model` and all submodules, then re-capture."""
+    # ------------------------------------------------------------------ public RPCs
+    def kiln_hot_reload(self, path: str, pd_role: str | None = None) -> float:
+        """Install candidate `path`, recompile + recapture when needed. Returns seconds taken."""
         t0 = time.perf_counter()
         if self._kiln_dirty:
             raise RuntimeError("Kiln candidate rollback failed; restart the engine")
         if self._kiln_patched is not None:
-            self._kiln_restore_baseline(rebuild=True)
+            self.kiln_teardown_lazy()
+
+        model = self.model_runner.get_model()
+        role = normalize_pd_role(pd_role if pd_role is not None else os.environ.get("KILN_PD_ROLE"))
+        p = Path(path)
+        source = p.read_text(encoding="utf-8") if p.is_file() else None
+        skip_rebuild = self._kiln_can_skip_graph_rebuild(source, role)
+        if skip_rebuild and not self._kiln_baseline_graphs_valid:
+            self._kiln_rebuild_baseline()
+
+        name = f"kiln_candidate_{abs(hash((path, t0)))}"
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load candidate module from {path}")
+        mod = importlib.util.module_from_spec(spec)
+        self._kiln_patched = _snapshot_forwards(model)
+        self._kiln_module = mod
+        try:
+            model._kiln_pd_role = role
+        except Exception:
+            pass
+        sys.modules[name] = mod
+        rebuild_started = False
+        had_env = "KILN_PD_ROLE" in os.environ
+        prev_env = os.environ.get("KILN_PD_ROLE")
+        try:
+            os.environ["KILN_PD_ROLE"] = role
+            try:
+                spec.loader.exec_module(mod)
+                new_fwd = mod.make_forward(model)
+                if new_fwd is not None:
+                    model.forward = new_fwd
+            finally:
+                if had_env and prev_env is not None:
+                    os.environ["KILN_PD_ROLE"] = prev_env
+                else:
+                    os.environ.pop("KILN_PD_ROLE", None)
+            if skip_rebuild:
+                self._kiln_last_skipped_graph_rebuild = True
+            else:
+                self._kiln_last_skipped_graph_rebuild = False
+                rebuild_started = True
+                self._kiln_baseline_graphs_valid = False
+                self._kiln_rebuild()
+                self._kiln_graphs_released = False
+        except Exception:
+            self._kiln_restore_baseline(rebuild=rebuild_started)
+            raise
         return time.perf_counter() - t0
 
-    def _kiln_restore_baseline(self, rebuild: bool) -> None:
+    def kiln_teardown_lazy(self) -> dict:
+        """Restore baseline `.forward` and drop candidate graphs without recapturing baseline graphs."""
+        t0 = time.perf_counter()
+        if self._kiln_dirty:
+            raise RuntimeError("Kiln candidate rollback failed; restart the engine")
+        if self._kiln_patched is not None:
+            self._kiln_restore_baseline(rebuild=False, release_if_invalid=True)
+        return {
+            "secs": time.perf_counter() - t0,
+            "baseline_graphs_valid": self._kiln_baseline_graphs_valid,
+        }
+
+    def kiln_ensure_baseline(self) -> dict:
+        """Ensure `.forward` is restored and baseline CUDA graphs are captured and valid."""
+        t0 = time.perf_counter()
+        if self._kiln_dirty:
+            raise RuntimeError("Kiln candidate rollback failed; restart the engine")
+        rebuilt = False
+        if self._kiln_patched is not None:
+            need_rebuild = not self._kiln_baseline_graphs_valid
+            self._kiln_restore_baseline(rebuild=need_rebuild)
+            rebuilt = need_rebuild
+        elif not self._kiln_baseline_graphs_valid:
+            self._kiln_rebuild_baseline()
+            rebuilt = True
+        return {
+            "secs": time.perf_counter() - t0,
+            "rebuilt": rebuilt,
+            "baseline_graphs_valid": self._kiln_baseline_graphs_valid,
+        }
+
+    def kiln_teardown(self) -> float:
+        """Restore baseline `.forward` across `model` and all submodules, then ensure baseline graphs."""
+        return float(self.kiln_ensure_baseline()["secs"])
+
+    def _kiln_restore_baseline(self, rebuild: bool, *, release_if_invalid: bool = False) -> None:
         mod = self._kiln_module
+        model = None
         try:
+            model = self.model_runner.get_model()
             try:
                 if mod is not None and hasattr(mod, "restore"):
-                    mod.restore(self.model_runner.get_model())
+                    mod.restore(model)
             finally:
                 _restore_forwards(self._kiln_patched)
             if rebuild:
                 self._kiln_rebuild()
+                self._kiln_baseline_graphs_valid = True
+                self._kiln_graphs_released = False
+            elif release_if_invalid and not self._kiln_baseline_graphs_valid and not self._kiln_graphs_released:
+                if getattr(self, "vllm_config", None) is not None or "_kiln_release_graphs" in self.__dict__:
+                    self._kiln_release_graphs()
+                self._kiln_graphs_released = True
         except Exception as exc:
             self._kiln_dirty = True
             raise RuntimeError("Kiln candidate rollback failed; restart the engine") from exc
         finally:
+            if model is not None and hasattr(model, "_kiln_pd_role"):
+                try:
+                    delattr(model, "_kiln_pd_role")
+                except Exception:
+                    pass
             if mod is not None:
                 sys.modules.pop(mod.__name__, None)
             self._kiln_module = None
@@ -103,6 +239,8 @@ class HotReloadExt:
             "cudagraph_mode": str(self.vllm_config.compilation_config.cudagraph_mode),
             "has_speculator": r.speculator is not None,
             "num_graphs": len(getattr(r.cudagraph_manager, "graphs", {}) or {}),
+            "baseline_graphs_valid": self._kiln_baseline_graphs_valid,
+            "last_skipped_graph_rebuild": self._kiln_last_skipped_graph_rebuild,
         }
 
     def kiln_enable_snapshot_capture(self, snapshot_dir: str, m_buckets=None, max_snapshot_mb: float = 64.0) -> dict:
@@ -162,7 +300,9 @@ class HotReloadExt:
         gc.collect()
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
-        self._kiln_fresh_graph_pool()
+        if not self._kiln_graphs_released:
+            self._kiln_fresh_graph_pool()
+        self._kiln_graphs_released = True
 
     def _kiln_fresh_graph_pool(self) -> None:
         """Capture into a fresh pool (the old one may still be referenced)."""

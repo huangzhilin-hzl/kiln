@@ -37,6 +37,8 @@ from .base import (
     shutdown_process_group,
 )
 from .sglang_ext import (
+    all_sglang_baseline_valid,
+    any_sglang_rebuilt,
     bootstrap_env,
     encode_rpc,
     extract_output_ids,
@@ -91,6 +93,8 @@ class SGLangServerEngine(Engine):
             or cfg.model
         )
         self._trace_dir: str | None = None
+        self._candidate_active: bool = False
+        self._baseline_graphs_dirty: bool = False
         admin_key = (
             tier.engine_overrides.get("admin_api_key")
             or cfg.extra_args.get("admin_api_key")
@@ -214,6 +218,8 @@ class SGLangServerEngine(Engine):
         )
         secs = self._rpc("kiln_hot_reload", *args)
         self._reset_cache()
+        self._candidate_active = True
+        self._baseline_graphs_dirty = True
         if isinstance(secs, (int, float)):
             print(f"[kiln] {self.tier.name}: hot reload {secs:.1f}s")
 
@@ -223,12 +229,41 @@ class SGLangServerEngine(Engine):
         args = [source, label] if pd_role is None else [source, label, pd_role]
         secs = self._rpc("kiln_hot_reload_source", *args)
         self._reset_cache()
+        self._candidate_active = True
+        self._baseline_graphs_dirty = True
         if isinstance(secs, (int, float)):
             print(f"[kiln] {self.tier.name}: hot reload (inline) {secs:.1f}s")
 
     def teardown_candidate(self) -> None:
         self._rpc("kiln_teardown")
         self._reset_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def teardown_candidate_lazy(self) -> None:
+        if (
+            "teardown_candidate" in self.__dict__
+            or type(self).teardown_candidate is not SGLangServerEngine.teardown_candidate
+        ):
+            self.teardown_candidate()
+            return
+        res = self._rpc("kiln_teardown_lazy")
+        self._reset_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = not all_sglang_baseline_valid(res)
+
+    def ensure_baseline(self) -> None:
+        if not self._baseline_graphs_dirty and not self._candidate_active:
+            return
+        was_active = self._candidate_active
+        res = self._rpc("kiln_ensure_baseline")
+        if was_active or any_sglang_rebuilt(res):
+            self._reset_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def needs_baseline_rebuild(self) -> bool:
+        return bool(self._baseline_graphs_dirty)
 
     # ---------------------------------------------------------------- measure
     def _generate_one_stats(self, prompt_ids: list[int], max_tokens: int, *, stream: bool = True) -> dict:
@@ -340,6 +375,8 @@ class SGLangServerEngine(Engine):
     def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
         if not self.is_alive():
             return None
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         self._rpc("kiln_enable_snapshot_capture", os.path.abspath(snapshot_dir), list(m_buckets))
         try:
             self._generate_one([1, 2, 3, 4], 2)
@@ -351,6 +388,8 @@ class SGLangServerEngine(Engine):
         self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
     ) -> MeasureResult:
         """Measure offline `requests` concurrently against `sglang.launch_server` (fast tier)."""
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         isl = sum(len(r.prompt_ids) for r in requests)
         prefill_tps = 0.0
         ttft_s = 0.0
@@ -424,6 +463,8 @@ class SGLangServerEngine(Engine):
 
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
         """Use offline `/generate` replay if `agentx` is None; else run real AgentX harness."""
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if self.agentx is None:
             return self.measure_requests(requests, repeats, trace)
         tp = int(
@@ -473,6 +514,8 @@ class SGLangServerEngine(Engine):
     def greedy_probe(
         self, prompts: list[list[int]], max_new_tokens: int
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if "greedy_outputs" in self.__dict__:
             return self.greedy_outputs(prompts, max_new_tokens), None
         self._reset_cache()

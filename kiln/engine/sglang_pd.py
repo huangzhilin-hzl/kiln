@@ -35,6 +35,8 @@ from kiln.config import EngineConfig, PDClusterConfig, PDNodeConfig, RunConfig, 
 
 from .base import Engine, InvalidBenchmark, MeasureResult, bucket_tps_for_requests, shutdown_process_group
 from .sglang_ext import (
+    all_sglang_baseline_valid,
+    any_sglang_rebuilt,
     bootstrap_env,
     encode_rpc,
     extract_output_ids,
@@ -362,6 +364,8 @@ class SGLangPDServerEngine(Engine):
         self._router_proc: subprocess.Popen | None = None
         self._log_files: list = []
         self._started = False
+        self._candidate_active: bool = False
+        self._baseline_graphs_dirty: bool = False
 
     # ---------------------------------------------------------------- lifecycle
     def _spawn_local_node(
@@ -573,6 +577,8 @@ class SGLangPDServerEngine(Engine):
                 pass
             raise
         self._reset_all_caches()
+        self._candidate_active = True
+        self._baseline_graphs_dirty = True
         nums = [float(x) for x in timings if isinstance(x, (int, float))]
         if nums:
             print(f"[kiln] {self.tier.name}: PD hot reload max {max(nums):.1f}s across {len(calls)} nodes")
@@ -586,6 +592,37 @@ class SGLangPDServerEngine(Engine):
             [(u, "kiln_teardown", []) for u in (*self.prefill_urls, *self.decode_urls)]
         )
         self._reset_all_caches()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def teardown_candidate_lazy(self) -> None:
+        if (
+            "teardown_candidate" in self.__dict__
+            or type(self).teardown_candidate is not SGLangPDServerEngine.teardown_candidate
+        ):
+            self.teardown_candidate()
+            return
+        results = self._broadcast_rpc(
+            [(u, "kiln_teardown_lazy", []) for u in (*self.prefill_urls, *self.decode_urls)]
+        )
+        self._reset_all_caches()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = not all_sglang_baseline_valid(results)
+
+    def ensure_baseline(self) -> None:
+        if not self._baseline_graphs_dirty and not self._candidate_active:
+            return
+        was_active = self._candidate_active
+        results = self._broadcast_rpc(
+            [(u, "kiln_ensure_baseline", []) for u in (*self.prefill_urls, *self.decode_urls)]
+        )
+        if was_active or any_sglang_rebuilt(results):
+            self._reset_all_caches()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def needs_baseline_rebuild(self) -> bool:
+        return bool(self._baseline_graphs_dirty)
 
     # ---------------------------------------------------------------- data plane (via router)
     def _generate_one(self, prompt_ids: list[int], max_tokens: int) -> int:
@@ -635,6 +672,8 @@ class SGLangPDServerEngine(Engine):
 
     def measure_requests(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
         """Measure concurrent requests end-to-end through the PD router."""
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         isl = sum(len(r.prompt_ids) for r in requests)
         workers = min(max(len(requests), 1), 32)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -675,6 +714,8 @@ class SGLangPDServerEngine(Engine):
         }
 
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if self.agentx is None:
             return self.measure_requests(requests, repeats, trace)
         artifact_root = Path("runs") / "agentx"
@@ -719,6 +760,8 @@ class SGLangPDServerEngine(Engine):
     def greedy_probe(
         self, prompts: list[list[int]], max_new_tokens: int
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if "greedy_outputs" in self.__dict__:
             return self.greedy_outputs(prompts, max_new_tokens), None
         self._reset_all_caches()

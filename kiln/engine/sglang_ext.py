@@ -31,6 +31,7 @@ import types
 from pathlib import Path
 
 from kiln.bench.correctness import logprob_value
+from kiln.patches import inspect_candidate_source, normalize_pd_role
 
 from .patching import restore_forwards, snapshot_forwards
 from .prebuild import ensure_extension_cache_env
@@ -107,6 +108,20 @@ def parse_rpc_message(message: str | None):
         return data
     except (TypeError, json.JSONDecodeError):
         return message
+
+
+def all_sglang_baseline_valid(res: object) -> bool:
+    """Return True when every SGLang rank RPC result reports `baseline_graphs_valid=True`."""
+    items = list(res) if isinstance(res, (list, tuple)) else ([res] if res is not None else [])
+    if not items:
+        return False
+    return all(isinstance(r, dict) and bool(r.get("baseline_graphs_valid", False)) for r in items)
+
+
+def any_sglang_rebuilt(res: object) -> bool:
+    """Return True when any SGLang rank RPC result reports `rebuilt=True`."""
+    items = list(res) if isinstance(res, (list, tuple)) else ([res] if res is not None else [])
+    return any(isinstance(r, dict) and bool(r.get("rebuilt", False)) for r in items)
 
 
 def bootstrap_dir() -> Path:
@@ -444,6 +459,10 @@ class SGLangHotReloadController:
         self._kiln_module: types.ModuleType | None = None
         self._kiln_temp_path: Path | None = None
         self._kiln_dirty: bool = False
+        self._kiln_baseline_graphs_valid: bool = True
+        self._kiln_graphs_released: bool = False
+        self._kiln_last_skipped_graph_rebuild: bool = False
+        self._graph_topology_recorded: bool = False
         self._target_graph_attrs: set[str] = set()
         self._capture_draft_graphs = False
         self._kiln_snapshot_collector: object | None = None
@@ -455,6 +474,10 @@ class SGLangHotReloadController:
             return self.kiln_hot_reload_source(*args, **kwargs)
         if method == "kiln_teardown":
             return self.kiln_teardown(*args, **kwargs)
+        if method == "kiln_teardown_lazy":
+            return self.kiln_teardown_lazy(*args, **kwargs)
+        if method == "kiln_ensure_baseline":
+            return self.kiln_ensure_baseline(*args, **kwargs)
         if method == "kiln_info":
             return self.kiln_info(*args, **kwargs)
         if method == "kiln_enable_snapshot_capture":
@@ -470,11 +493,78 @@ class SGLangHotReloadController:
             except Exception:
                 pass
 
+    def _record_graph_topology(self, target_runner, spec_worker, draft_runners) -> None:
+        cur_target = _active_graph_attrs(target_runner, _MODEL_RUNNER_GRAPH_ATTRS)
+        cur_draft = bool(_active_graph_attrs(spec_worker, _SPEC_WORKER_GRAPH_ATTRS)) or any(
+            _active_graph_attrs(runner, _MODEL_RUNNER_GRAPH_ATTRS) for runner in draft_runners
+        )
+        if not self._graph_topology_recorded or self._kiln_baseline_graphs_valid:
+            self._target_graph_attrs = cur_target
+            self._capture_draft_graphs = cur_draft
+            self._graph_topology_recorded = True
+        else:
+            self._target_graph_attrs |= cur_target
+            self._capture_draft_graphs = self._capture_draft_graphs or cur_draft
+
+    def _is_decode_only_graph_engine(self, server_args, spec_worker) -> bool:
+        if bool(getattr(server_args, "enable_torch_compile", False)):
+            return False
+        if bool(getattr(server_args, "enable_piecewise_cuda_graph", False)):
+            return False
+        if self._target_graph_attrs & {
+            "prefill_cuda_graph_runner",
+            "prefill_graph_runner",
+            "piecewise_cuda_graph_runner",
+        }:
+            return False
+        if spec_worker is not None or self._capture_draft_graphs:
+            return False
+        return True
+
+    def _can_skip_graph_rebuild(
+        self, source: str | None, role: str, server_args, spec_worker
+    ) -> bool:
+        if not source:
+            return False
+        info = inspect_candidate_source(source)
+        if not info.get("syntax_ok"):
+            return False
+        eff_phase = info.get("effective_phase", "all")
+        norm_role = normalize_pd_role(role)
+        if (
+            info.get("only_kiln_patches")
+            and norm_role in ("prefill", "decode")
+            and eff_phase in ("prefill", "decode")
+            and eff_phase != norm_role
+        ):
+            return True
+        if eff_phase == "prefill" and self._is_decode_only_graph_engine(server_args, spec_worker):
+            return True
+        return False
+
+    def _rebuild_baseline(self) -> None:
+        try:
+            self._rebuild()
+            self._kiln_baseline_graphs_valid = True
+        except Exception as exc:
+            self._kiln_dirty = True
+            raise RuntimeError("Kiln baseline graph rebuild failed; restart the engine") from exc
+
     def _install_from_path(
-        self, path: str, *, pd_role: str | None = None, temp_path: Path | None = None
+        self,
+        path: str,
+        *,
+        pd_role: str | None = None,
+        temp_path: Path | None = None,
+        source_text: str | None = None,
     ) -> float:
         t0 = time.perf_counter()
-        self.kiln_teardown()
+        if self._kiln_dirty:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            raise RuntimeError("Kiln candidate rollback failed; restart the engine")
+        if self._kiln_patched is not None:
+            self.kiln_teardown_lazy()
         _, target_runner, spec_worker, draft_runners = _resolve_workers(self.owner)
         model = _get_raw_model(target_runner)
 
@@ -489,12 +579,24 @@ class SGLangHotReloadController:
         mod = importlib.util.module_from_spec(spec)
         server_args = getattr(target_runner, "server_args", None) or getattr(self.scheduler, "server_args", None)
         role = resolve_sglang_pd_role(server_args, explicit_role=pd_role)
-        # Capture topology before releasing a graph. Failed capture can leave the
-        # runner unset, and teardown must still rebuild that graph for the baseline.
-        self._target_graph_attrs = _active_graph_attrs(target_runner, _MODEL_RUNNER_GRAPH_ATTRS)
-        self._capture_draft_graphs = bool(_active_graph_attrs(spec_worker, _SPEC_WORKER_GRAPH_ATTRS)) or any(
-            _active_graph_attrs(runner, _MODEL_RUNNER_GRAPH_ATTRS) for runner in draft_runners
-        )
+        # Capture topology before releasing a graph. Failed capture or lazy teardown
+        # can leave the runner unset, and rebuild must still restore that topology.
+        self._record_graph_topology(target_runner, spec_worker, draft_runners)
+
+        src = source_text
+        if src is None:
+            p_obj = Path(path)
+            if p_obj.is_file():
+                src = p_obj.read_text(encoding="utf-8")
+        skip_rebuild = self._can_skip_graph_rebuild(src, role, server_args, spec_worker)
+        if skip_rebuild and not self._kiln_baseline_graphs_valid:
+            try:
+                self._rebuild_baseline()
+            except Exception:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
+                raise
+
         self._kiln_patched = snapshot_forwards(model)
         self._kiln_module = mod
         self._kiln_temp_path = temp_path
@@ -518,15 +620,20 @@ class SGLangHotReloadController:
                     os.environ["KILN_PD_ROLE"] = prev_env
                 else:
                     os.environ.pop("KILN_PD_ROLE", None)
-            rebuild_started = True
-            self._rebuild()
+            if skip_rebuild:
+                self._kiln_last_skipped_graph_rebuild = True
+            else:
+                self._kiln_last_skipped_graph_rebuild = False
+                rebuild_started = True
+                self._kiln_baseline_graphs_valid = False
+                self._rebuild()
         except Exception:
             self._restore_baseline(rebuild=rebuild_started)
             raise
         return time.perf_counter() - t0
 
     def kiln_hot_reload(self, path: str, pd_role: str | None = None) -> float:
-        """Install candidate `path`, reset compile/graphs, and recapture. Returns seconds taken."""
+        """Install candidate `path`, reset compile/graphs when needed, and recapture. Returns seconds taken."""
         return self._install_from_path(path, pd_role=pd_role)
 
     def kiln_hot_reload_source(
@@ -535,24 +642,53 @@ class SGLangHotReloadController:
         """Materialize `source` on local temp storage (for `@triton.jit` source inspection) and hot-reload."""
         if not isinstance(source, str) or not source.strip():
             raise ValueError("Candidate source must be a non-empty string")
-        # Ensure teardown runs before writing a new temp file if a previous candidate was installed.
-        self.kiln_teardown()
+        # Ensure lazy teardown runs before writing a new temp file if a previous candidate was installed.
+        if self._kiln_patched is not None:
+            self.kiln_teardown_lazy()
         sha = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
         safe_stem = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in Path(label).stem) or "cand"
         tmp_path = Path(tempfile.gettempdir()) / f"kiln_sgl_{os.getpid()}_{safe_stem}_{sha}.py"
         tmp_path.write_text(source, encoding="utf-8")
-        return self._install_from_path(str(tmp_path), pd_role=pd_role, temp_path=tmp_path)
+        return self._install_from_path(
+            str(tmp_path), pd_role=pd_role, temp_path=tmp_path, source_text=source
+        )
 
-    def kiln_teardown(self) -> float:
-        """Restore baseline `.forward` across `model` and all submodules, then recapture."""
+    def kiln_teardown_lazy(self) -> dict:
+        """Restore baseline `.forward` and release candidate graphs without recapturing baseline graphs."""
         t0 = time.perf_counter()
         if self._kiln_dirty:
             raise RuntimeError("Kiln candidate rollback failed; restart the engine")
         if self._kiln_patched is not None:
-            self._restore_baseline(rebuild=True)
-        return time.perf_counter() - t0
+            self._restore_baseline(rebuild=False, release_if_invalid=True)
+        return {
+            "secs": time.perf_counter() - t0,
+            "baseline_graphs_valid": self._kiln_baseline_graphs_valid,
+        }
 
-    def _restore_baseline(self, rebuild: bool) -> None:
+    def kiln_ensure_baseline(self) -> dict:
+        """Ensure `.forward` is restored and baseline CUDA graphs are captured and valid."""
+        t0 = time.perf_counter()
+        if self._kiln_dirty:
+            raise RuntimeError("Kiln candidate rollback failed; restart the engine")
+        rebuilt = False
+        if self._kiln_patched is not None:
+            need_rebuild = not self._kiln_baseline_graphs_valid
+            self._restore_baseline(rebuild=need_rebuild)
+            rebuilt = need_rebuild
+        elif not self._kiln_baseline_graphs_valid:
+            self._rebuild_baseline()
+            rebuilt = True
+        return {
+            "secs": time.perf_counter() - t0,
+            "rebuilt": rebuilt,
+            "baseline_graphs_valid": self._kiln_baseline_graphs_valid,
+        }
+
+    def kiln_teardown(self) -> float:
+        """Restore baseline `.forward` across `model` and all submodules, then ensure baseline graphs."""
+        return float(self.kiln_ensure_baseline()["secs"])
+
+    def _restore_baseline(self, rebuild: bool, *, release_if_invalid: bool = False) -> None:
         mod = self._kiln_module
         temp_path = self._kiln_temp_path
         model = None
@@ -566,6 +702,9 @@ class SGLangHotReloadController:
                 restore_forwards(self._kiln_patched)
             if rebuild:
                 self._rebuild()
+                self._kiln_baseline_graphs_valid = True
+            elif release_if_invalid and not self._kiln_baseline_graphs_valid and not self._kiln_graphs_released:
+                self._release_graphs()
         except Exception as exc:
             self._kiln_dirty = True
             raise RuntimeError("Kiln candidate rollback failed; restart the engine") from exc
@@ -601,6 +740,8 @@ class SGLangHotReloadController:
             "enable_piecewise_cuda_graph": bool(getattr(server_args, "enable_piecewise_cuda_graph", False)),
             "has_speculator": spec_worker is not None,
             "num_graphs": num_graphs,
+            "baseline_graphs_valid": self._kiln_baseline_graphs_valid,
+            "last_skipped_graph_rebuild": self._kiln_last_skipped_graph_rebuild,
             "disaggregation_mode": str(disagg_mode or "null"),
             "pd_role": resolve_sglang_pd_role(server_args),
             "tp_rank": getattr(target_runner, "tp_rank", getattr(self.scheduler, "tp_rank", 0)),
@@ -638,13 +779,14 @@ class SGLangHotReloadController:
             return {"snapshots": []}
         return collector.close()
 
-    def _rebuild(self) -> None:
-        """Drop CUDA graphs, reset torch.compile & global graph pool, and recapture."""
+    def _release_graphs(self) -> None:
+        """Drop active CUDA graphs and reset torch.compile & global graph pool."""
         _, target_runner, spec_worker, draft_runners = _resolve_workers(self.owner)
+        self._record_graph_topology(target_runner, spec_worker, draft_runners)
 
         _sync_device()
 
-        # Best-effort radix/KV cache flush before warmup/recapture.
+        # Best-effort radix/KV cache flush before releasing/recapturing.
         flush = getattr(self.owner, "flush_cache", None) or getattr(self.scheduler, "flush_cache", None)
         if callable(flush):
             try:
@@ -668,11 +810,17 @@ class SGLangHotReloadController:
                 spec_worker._draft_sampler = None
 
         _reset_torch_compiler()
-        _reset_global_graph_pool()
+        if not self._kiln_graphs_released:
+            _reset_global_graph_pool()
 
         gc.collect()
         _sync_device()
         _empty_cache()
+        self._kiln_graphs_released = True
+
+    def _recapture_graphs(self) -> None:
+        """Recapture target and speculative draft CUDA graphs."""
+        _, target_runner, spec_worker, draft_runners = _resolve_workers(self.owner)
 
         # Recapture target graphs first (matches SGLang startup order for shared memory pool).
         had_prefill_cg = "prefill_cuda_graph_runner" in self._target_graph_attrs
@@ -711,6 +859,12 @@ class SGLangHotReloadController:
                         dr.init_cuda_graphs()
 
         _sync_device()
+        self._kiln_graphs_released = False
+
+    def _rebuild(self) -> None:
+        """Drop CUDA graphs, reset torch.compile & global graph pool, and recapture."""
+        self._release_graphs()
+        self._recapture_graphs()
 
 
 # --------------------------------------------------------------------------- SGLang class patches

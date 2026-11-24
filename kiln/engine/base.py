@@ -229,6 +229,18 @@ class Engine(abc.ABC):
     def teardown_candidate(self) -> None:
         """Restore the baseline forward."""
 
+    def teardown_candidate_lazy(self) -> None:
+        """Restore baseline `.forward` without recapturing baseline CUDA graphs immediately."""
+        self.teardown_candidate()
+
+    def ensure_baseline(self) -> None:
+        """Rebuild baseline CUDA graphs if a previous lazy teardown left them uncaptured."""
+        return None
+
+    def needs_baseline_rebuild(self) -> bool:
+        """Return True when baseline `.forward` is restored but baseline CUDA graphs need recapture."""
+        return False
+
     @abc.abstractmethod
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult: ...
 

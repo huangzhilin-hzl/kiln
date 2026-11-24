@@ -72,6 +72,8 @@ class VLLMServerEngine(Engine):
         self.agentx = AgentXConfig(**tier.agentx) if tier.agentx is not None else None
         self.served_name = cfg.model
         self._trace_dir: str | None = None
+        self._candidate_active: bool = False
+        self._baseline_graphs_dirty: bool = False
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -141,12 +143,54 @@ class VLLMServerEngine(Engine):
         raise RuntimeError("reset_prefix_cache kept failing")
 
     def hot_reload(self, candidate_path: str) -> None:
-        self._rpc("kiln_hot_reload", os.path.abspath(candidate_path))
+        rpc_args = (
+            [os.path.abspath(candidate_path)]
+            if self.assessment_phase == "both"
+            else [os.path.abspath(candidate_path), self.assessment_phase]
+        )
+        self._rpc("kiln_hot_reload", *rpc_args)
         self._reset_cache()
+        self._candidate_active = True
+        self._baseline_graphs_dirty = True
 
     def teardown_candidate(self) -> None:
         self._rpc("kiln_teardown")
         self._reset_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def teardown_candidate_lazy(self) -> None:
+        if (
+            "teardown_candidate" in self.__dict__
+            or type(self).teardown_candidate is not VLLMServerEngine.teardown_candidate
+        ):
+            self.teardown_candidate()
+            return
+        results = self._rpc("kiln_teardown_lazy")
+        self._reset_cache()
+        self._candidate_active = False
+        all_valid = bool(results) and all(
+            isinstance(r, dict) and bool(r.get("baseline_graphs_valid", False))
+            for r in results
+        )
+        self._baseline_graphs_dirty = not all_valid
+
+    def ensure_baseline(self) -> None:
+        if not self._baseline_graphs_dirty and not self._candidate_active:
+            return
+        was_active = self._candidate_active
+        results = self._rpc("kiln_ensure_baseline")
+        any_rebuilt = was_active or any(
+            isinstance(r, dict) and bool(r.get("rebuilt", False))
+            for r in (results or ())
+        )
+        if any_rebuilt:
+            self._reset_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def needs_baseline_rebuild(self) -> bool:
+        return bool(self._baseline_graphs_dirty)
 
     # ---------------------------------------------------------------- measure
     def _complete_one_stats(
@@ -194,6 +238,8 @@ class VLLMServerEngine(Engine):
     def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
         if not self.is_alive():
             return None
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         import json as _json
         self._rpc(
             "kiln_enable_snapshot_capture",
@@ -210,6 +256,8 @@ class VLLMServerEngine(Engine):
         self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
     ) -> MeasureResult:
         """Measure offline `requests` concurrently against `vllm serve` (fast tier)."""
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         prefill_tps = 0.0
         ttft_s = 0.0
         workers = min(max(len(requests), 1), 32)
@@ -254,6 +302,8 @@ class VLLMServerEngine(Engine):
 
     def measure(self, requests: list[Request], repeats: int, trace: bool) -> MeasureResult:
         """Use offline `/v1/completions` replay if `agentx` is None; else run real AgentX harness."""
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if self.agentx is None:
             return self.measure_requests(requests, repeats, trace)
         tp = int(self.tier.engine_overrides.get("tensor_parallel_size", self.cfg.tensor_parallel_size))
@@ -291,6 +341,8 @@ class VLLMServerEngine(Engine):
     def greedy_probe(
         self, prompts: list[list[int]], max_new_tokens: int
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if "greedy_outputs" in self.__dict__:
             return self.greedy_outputs(prompts, max_new_tokens), None
         out_ids: list[list[int]] = []

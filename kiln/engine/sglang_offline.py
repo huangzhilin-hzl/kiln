@@ -19,6 +19,8 @@ from kiln.config import EngineConfig, TierConfig
 from .base import Engine, MeasureResult, bucket_tps_for_requests, reap_zombies
 from .replay import mean_ttft
 from .sglang_ext import (
+    all_sglang_baseline_valid,
+    any_sglang_rebuilt,
     bootstrap_env,
     encode_rpc,
     extract_output_ids,
@@ -62,6 +64,8 @@ class SGLangOfflineEngine(Engine):
         self.cfg, self.tier = cfg, tier
         self.engine = None
         self._trace_dir: str | None = None
+        self._candidate_active: bool = False
+        self._baseline_graphs_dirty: bool = False
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -145,6 +149,8 @@ class SGLangOfflineEngine(Engine):
         secs = self._rpc("kiln_hot_reload", *args)
         # Cached KV was written by the previous forward; never let a candidate reuse it.
         self._flush_cache()
+        self._candidate_active = True
+        self._baseline_graphs_dirty = True
         if isinstance(secs, (int, float)):
             print(f"[kiln] {self.tier.name}: hot reload {secs:.1f}s")
 
@@ -154,12 +160,41 @@ class SGLangOfflineEngine(Engine):
         args = [source, label] if pd_role is None else [source, label, pd_role]
         secs = self._rpc("kiln_hot_reload_source", *args)
         self._flush_cache()
+        self._candidate_active = True
+        self._baseline_graphs_dirty = True
         if isinstance(secs, (int, float)):
             print(f"[kiln] {self.tier.name}: hot reload (inline) {secs:.1f}s")
 
     def teardown_candidate(self) -> None:
         self._rpc("kiln_teardown")
         self._flush_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def teardown_candidate_lazy(self) -> None:
+        if (
+            "teardown_candidate" in self.__dict__
+            or type(self).teardown_candidate is not SGLangOfflineEngine.teardown_candidate
+        ):
+            self.teardown_candidate()
+            return
+        res = self._rpc("kiln_teardown_lazy")
+        self._flush_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = not all_sglang_baseline_valid(res)
+
+    def ensure_baseline(self) -> None:
+        if not self._baseline_graphs_dirty and not self._candidate_active:
+            return
+        was_active = self._candidate_active
+        res = self._rpc("kiln_ensure_baseline")
+        if was_active or any_sglang_rebuilt(res):
+            self._flush_cache()
+        self._candidate_active = False
+        self._baseline_graphs_dirty = False
+
+    def needs_baseline_rebuild(self) -> bool:
+        return bool(self._baseline_graphs_dirty)
 
     def _iter_child_procs(self) -> list:
         if self.engine is None:
@@ -231,6 +266,8 @@ class SGLangOfflineEngine(Engine):
         self, requests: list[Request], repeats: int, trace: bool, *, skip_prefill: bool = False
     ) -> MeasureResult:
         """Prefill and decode measured separately (TKCC: mixing them adds ~6% noise)."""
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         prompts = [r.prompt_ids for r in requests]
         isl = sum(len(r.prompt_ids) for r in requests)
         warm = {"max_new_tokens": 1, "temperature": 0.0}
@@ -326,6 +363,8 @@ class SGLangOfflineEngine(Engine):
     def capture_snapshots(self, snapshot_dir: str, m_buckets: list[int]) -> dict | None:
         if self.engine is None:
             return None
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         self._rpc("kiln_enable_snapshot_capture", os.path.abspath(snapshot_dir), list(m_buckets))
         try:
             self.engine.generate(
@@ -339,6 +378,8 @@ class SGLangOfflineEngine(Engine):
     def greedy_probe(
         self, prompts: list[list[int]], max_new_tokens: int
     ) -> tuple[list[list[int]], list[list[dict[int, float]]] | None]:
+        if not self._candidate_active and self._baseline_graphs_dirty:
+            self.ensure_baseline()
         if "greedy_outputs" in self.__dict__:
             return self.greedy_outputs(prompts, max_new_tokens), None
         sp = {"max_new_tokens": max_new_tokens, "temperature": 0.0, "ignore_eos": True}

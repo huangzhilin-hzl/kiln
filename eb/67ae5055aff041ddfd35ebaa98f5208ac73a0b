@@ -1,0 +1,30 @@
+tests/test_prebuild_and_graph_tax.py
+  s_bb25830bc222a5::t_8d266afc8ea6c7 518-529,534-758
+  s_bb25830bc222a5::t_4a536067b3c829 143-144,531-533
+  s_bb25830bc222a5::t_1ec601d2f3a197 530
+kiln/server/jobs.py
+  s_bb25830bc222a5::t_aa7eb71ce7ac2a 2027
+  s_bb25830bc222a5::t_5180f4c60c89f6 9,15,30-38,149-161,203,205-211,313,392-566,571-576,579-586,601,613-624,629-630,645,648-649,666,958-963,969,1031-1032,1078,1093,1199,1259,1975-1977
+README.md
+  s_bb25830bc222a5::t_fa405f49834eb2 150
+kiln/agents/prompt.md
+  s_bb25830bc222a5::t_be0b9a128f50a8 12-16
+kiln/config.py
+  s_bb25830bc222a5::t_b7eab39a0cf2ce 136-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "eb67ae5055aff041ddfd35ebaa98f5208ac73a0b",
+  "prompts": {},
+  "sessions": {
+    "s_bb25830bc222a5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20c77-4cfc-70b2-9a7d-5a747509a363",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

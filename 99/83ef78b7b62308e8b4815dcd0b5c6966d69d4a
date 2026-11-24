@@ -1,0 +1,20 @@
+kiln/engine/sglang_ext.py
+  s_d451e5ea0f168c::t_442cb11608e301 118
+  s_d451e5ea0f168c::t_3119b7c6990700 36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9983ef78b7b62308e8b4815dcd0b5c6966d69d4a",
+  "prompts": {},
+  "sessions": {
+    "s_d451e5ea0f168c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20cef-c9d3-7eb1-9cc1-50a25b173773",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

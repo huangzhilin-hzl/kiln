@@ -131,6 +131,8 @@ class TierConfig(BaseModel):
     screen_top_k: int | None = Field(default=None, ge=1)
     trace_policy: Literal["always", "on_improve", "never"] = "always"
     lazy_baseline: bool = False
+    prebuild: Literal["auto", "always", "off"] = "auto"
+    prebuild_timeout_s: float = Field(default=300.0, gt=0.0)
 
     @model_validator(mode="after")
     def _validate_screening(self) -> "TierConfig":

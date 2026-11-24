@@ -33,6 +33,7 @@ from pathlib import Path
 from kiln.bench.correctness import logprob_value
 
 from .patching import restore_forwards, snapshot_forwards
+from .prebuild import ensure_extension_cache_env
 
 KILN_RPC_PREFIX = "__kiln_rpc__:"
 
@@ -114,7 +115,7 @@ def bootstrap_dir() -> Path:
 
 def bootstrap_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     """Return an env dict that installs kiln's SGLang import hook in spawned workers."""
-    env = dict(os.environ if base_env is None else base_env)
+    env = ensure_extension_cache_env(os.environ if base_env is None else base_env)
     bdir = str(bootstrap_dir())
     pkg_root = str(Path(__file__).resolve().parents[2])
     existing = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]

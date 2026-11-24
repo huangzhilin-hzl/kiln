@@ -35,6 +35,7 @@ from .base import (
     read_prometheus_metrics,
     shutdown_process_group,
 )
+from .prebuild import ensure_extension_cache_env
 from .replay import read_completion, time_http_prefill
 from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
@@ -89,12 +90,12 @@ class VLLMServerEngine(Engine):
         path_env = f"{venv_bin}{os.pathsep}{os.environ.get('PATH', '')}"
         vllm_bin = shutil.which("vllm", path=path_env) or "vllm"
         cmd = [vllm_bin, "serve", self.cfg.model, *_cli_args(args)]
-        env = {
+        env = ensure_extension_cache_env({
             **os.environ,
             "PATH": path_env,
             "VLLM_SERVER_DEV_MODE": "1",
             "VLLM_DISABLE_COMPILE_CACHE": "1",
-        }
+        })
         env.pop("VLLM_TORCH_PROFILER_DIR", None)
         if self.tier.gpus:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.tier.gpus))

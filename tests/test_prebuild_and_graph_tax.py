@@ -130,3 +130,123 @@ def test_inspect_candidate_build_triggers_and_compose_propagation():
     info_pd = inspect_candidate_source(pd_merged["source"])
     assert info_pd["needs_prebuild"] is True
     assert "kiln_build" in info_pd["build_triggers"]
+
+
+def test_prebuild_candidate_syntax_hook_lazy_load_inline_and_timeout(tmp_path, monkeypatch):
+    import os
+    import threading
+    from pathlib import Path
+
+    from kiln.engine.prebuild import ensure_extension_cache_env, prebuild_candidate
+    from kiln.engine.sglang_ext import bootstrap_env
+
+    monkeypatch.setenv("KILN_EXT_CACHE_ROOT", str(tmp_path / "ext_cache"))
+    env = ensure_extension_cache_env({})
+    assert env["TORCH_EXTENSIONS_DIR"] == str((tmp_path / "ext_cache" / "torch_extensions").resolve())
+    assert env["KILN_CACHE_DIR"] == str((tmp_path / "ext_cache" / "ext").resolve())
+    assert Path(env["TORCH_EXTENSIONS_DIR"]).is_dir()
+    assert Path(env["KILN_CACHE_DIR"]).is_dir()
+
+    sgl_env = bootstrap_env({"KILN_EXT_CACHE_ROOT": str(tmp_path / "ext_cache")})
+    assert sgl_env["TORCH_EXTENSIONS_DIR"] == env["TORCH_EXTENSIONS_DIR"]
+    assert sgl_env["KILN_CACHE_DIR"] == env["KILN_CACHE_DIR"]
+
+    # 1. Plain candidate with no build triggers is skipped in <10ms under mode="auto"
+    plain = tmp_path / "plain.py"
+    plain.write_text("SPEEDUP = 1.05\ndef make_forward(model):\n    return None\n")
+    r_plain = prebuild_candidate(plain, mode="auto")
+    assert r_plain.ok is True and r_plain.skipped is True and r_plain.reason == "no_build_triggers"
+
+    # 2. SyntaxError fails fast in-process without spawning a subprocess
+    bad_syn = tmp_path / "bad_syn.py"
+    bad_syn.write_text("def broken(:\n")
+    r_syn = prebuild_candidate(bad_syn, mode="auto")
+    assert r_syn.ok is False and r_syn.reason == "syntax_error" and "SyntaxError" in (r_syn.error or "")
+
+    # 3. Explicit kiln_build() hook populates shared KILN_CACHE_DIR in isolated subprocess
+    hook_ok = tmp_path / "hook_ok.py"
+    hook_ok.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def kiln_build():\n"
+        "    out = Path(os.environ['KILN_CACHE_DIR']) / 'built_marker.txt'\n"
+        "    out.write_text(os.environ.get('KILN_PD_ROLE', ''))\n"
+        "def make_forward(model):\n"
+        "    return None\n"
+    )
+    r_hook = prebuild_candidate(hook_ok, mode="auto", pd_role="prefill", base_env=dict(os.environ))
+    assert r_hook.ok is True and r_hook.skipped is False and r_hook.reason == "prebuilt"
+    assert (Path(env["KILN_CACHE_DIR"]) / "built_marker.txt").read_text() == "prefill"
+
+    # 4. Failing kiln_build() rejects candidate cleanly with compiler error
+    hook_fail = tmp_path / "hook_fail.py"
+    hook_fail.write_text(
+        "def kiln_build():\n"
+        "    raise RuntimeError('Error building extension: nvcc fatal : unsupported gpu architecture')\n"
+        "def make_forward(model):\n"
+        "    return None\n"
+    )
+    r_fail = prebuild_candidate(hook_fail, mode="auto", base_env=dict(os.environ))
+    assert r_fail.ok is False and r_fail.reason == "kiln_build_failed"
+    assert "nvcc fatal" in (r_fail.error or "")
+
+    # 5. Lazy load_inline inside make_forward(model) warms cache AND catches build errors
+    fake_torch_dir = tmp_path / "fake_pkgs"
+    (fake_torch_dir / "torch" / "utils").mkdir(parents=True)
+    (fake_torch_dir / "torch" / "__init__.py").write_text("")
+    (fake_torch_dir / "torch" / "utils" / "__init__.py").write_text("")
+    (fake_torch_dir / "torch" / "utils" / "cpp_extension.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def load_inline(name, cpp_sources='', cuda_sources='', **kw):\n"
+        "    if 'SYNTAX_ERR_CUDA' in cuda_sources:\n"
+        "        raise RuntimeError(f'Error building extension {name!r}: identifier undefined')\n"
+        "    p = Path(os.environ['TORCH_EXTENSIONS_DIR']) / f'{name}.so'\n"
+        "    p.write_text('compiled')\n"
+        "    return str(p)\n"
+        "def load(name, sources, **kw):\n"
+        "    return load_inline(name)\n"
+    )
+    custom_env = {
+        **os.environ,
+        "PYTHONPATH": f"{fake_torch_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+    }
+
+    lazy_ok = tmp_path / "lazy_ok.py"
+    lazy_ok.write_text(
+        "from torch.utils.cpp_extension import load_inline\n"
+        "def make_forward(model):\n"
+        "    load_inline(name='fast_k', cuda_sources='__global__ void k(){}')\n"
+        "    return model.nonexistent_real_model_attr.layers[0]\n"  # dummy model raises AttributeError after build!
+    )
+    r_lazy_ok = prebuild_candidate(lazy_ok, mode="auto", base_env=custom_env)
+    assert r_lazy_ok.ok is True and r_lazy_ok.extensions_built == 1
+    assert (Path(env["TORCH_EXTENSIONS_DIR"]) / "fast_k.so").read_text() == "compiled"
+
+    lazy_bad = tmp_path / "lazy_bad.py"
+    lazy_bad.write_text(
+        "from torch.utils.cpp_extension import load_inline\n"
+        "def make_forward(model):\n"
+        "    load_inline(name='broken_k', cuda_sources='SYNTAX_ERR_CUDA')\n"
+        "    return model.layers[0]\n"
+    )
+    r_lazy_bad = prebuild_candidate(lazy_bad, mode="auto", base_env=custom_env)
+    assert r_lazy_bad.ok is False and r_lazy_bad.reason == "compile_error"
+    assert "Error building extension" in (r_lazy_bad.error or "")
+
+    # 6. Timeout / cancellation terminates hung build subprocess group cleanly
+    hung = tmp_path / "hung.py"
+    hung.write_text(
+        "import time\n"
+        "def kiln_build():\n"
+        "    time.sleep(30)\n"
+        "def make_forward(model):\n"
+        "    return None\n"
+    )
+    r_to = prebuild_candidate(hung, mode="auto", timeout_s=0.25, base_env=dict(os.environ))
+    assert r_to.ok is False and r_to.reason == "timeout"
+
+    cancel_ev = threading.Event()
+    threading.Timer(0.15, cancel_ev.set).start()
+    r_cancel = prebuild_candidate(hung, mode="auto", timeout_s=10.0, cancel_event=cancel_ev, base_env=dict(os.environ))
+    assert r_cancel.ok is False and r_cancel.reason == "cancelled"

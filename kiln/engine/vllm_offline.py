@@ -15,6 +15,7 @@ from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
 
 from .base import Engine, MeasureResult, bucket_tps_for_requests
+from .prebuild import ensure_extension_cache_env
 from .replay import mean_ttft
 from .vllm_profiler import build_trace_payload, configure_torch_profiler
 
@@ -38,6 +39,7 @@ class VLLMOfflineEngine(Engine):
     def _start(self) -> None:
         if self.tier.gpus:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.tier.gpus))
+        os.environ.update(ensure_extension_cache_env(os.environ))
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
         # A candidate can patch child forwards without changing vLLM's compile cache key.
         os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"

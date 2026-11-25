@@ -50,6 +50,8 @@ class MicroReq(BaseModel):
     snapshot_tag: str | None = None
     enable_ncu: bool | None = None
     enable_ptxas: bool | None = None
+    mode: Literal["numeric", "timing"] = "numeric"
+    timeout_s: FiniteFloat | None = Field(default=None, gt=0)
 
 
 class PostReq(BaseModel):
@@ -246,6 +248,8 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
                 snapshot_tag=req.snapshot_tag,
                 enable_ncu=req.enable_ncu,
                 enable_ptxas=req.enable_ptxas,
+                mode=req.mode,
+                timeout_s=req.timeout_s,
             )
         except ValueError as e:
             raise HTTPException(400, str(e))

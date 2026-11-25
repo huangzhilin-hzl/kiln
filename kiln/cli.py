@@ -359,6 +359,8 @@ def cmd_micro(a):
             snapshot_tag=a.snapshot,
             enable_ncu=True if a.ncu else None,
             enable_ptxas=False if a.no_ptxas else None,
+            mode=a.mode,
+            timeout_s=a.timeout,
         )
     else:
         payload = {
@@ -368,8 +370,11 @@ def cmd_micro(a):
             "snapshot_tag": a.snapshot,
             "enable_ncu": True if a.ncu else None,
             "enable_ptxas": False if a.no_ptxas else None,
+            "mode": a.mode,
+            "timeout_s": a.timeout,
         }
-        r = http.post(f"{_url()}/micro", json=payload, timeout=180.0)
+        http_timeout = max(180.0, float(a.timeout) + 60.0) if a.timeout else 180.0
+        r = http.post(f"{_url()}/micro", json=payload, timeout=http_timeout)
         r.raise_for_status()
         res = r.json()
 
@@ -784,6 +789,9 @@ def main(argv=None):
     s.add_argument("--snapshot", help="snapshot tag to replay (e.g. attention, moe, mhc)")
     s.add_argument("--ncu", action="store_true", help="collect Nsight Compute HBM/bank-conflict counters")
     s.add_argument("--no-ptxas", action="store_true", help="skip ptxas spill inspection")
+    s.add_argument("--mode", choices=("numeric", "timing"), default="numeric",
+                   help="numeric (shared lock) or timing (exclusive GPU lock + ABBA cold-L2 timing)")
+    s.add_argument("--timeout", type=float, help="per-run sandbox timeout in seconds (clamped to micro.max_timeout_s)")
     s.add_argument("--local", action="store_true", help="run sandbox locally without kiln serve")
     s.add_argument("-c", "--config", help="optional RunConfig YAML when running with --local")
     s.add_argument("--promote-fast", action="store_true", help="auto-submit to fast tier if micro passes ready_for_fast")

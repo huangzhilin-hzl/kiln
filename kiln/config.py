@@ -429,7 +429,8 @@ class MicroConfig(BaseModel):
     enabled: bool = True
     gpus: list[int] = Field(default_factory=list)
     max_concurrent: int = Field(default=2, ge=1)
-    timeout_s: float = 60.0
+    timeout_s: float = Field(default=60.0, gt=0.0)
+    max_timeout_s: float = Field(default=300.0, gt=0.0)
     m_buckets: list[int] = Field(default_factory=lambda: [1, 8, 32, 64, 256, 1024])
     capture_on_boot: bool = True
     max_snapshot_mb: float = 64.0

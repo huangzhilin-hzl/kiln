@@ -14,9 +14,10 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 
@@ -145,27 +146,90 @@ def _copy_inputs(inputs: Any) -> Any:
     return copy.deepcopy(inputs, memo)
 
 
+_L2_FLUSH_BUFFERS: dict[tuple[int, int], Any] = {}
+
+
+def cold_l2_flush(bytes_to_flush: int = 128 * 1024 * 1024, device: str = "cuda") -> None:
+    """Evict GPU L2 cache lines using a reusable scratch buffer before timing a kernel."""
+    if bytes_to_flush <= 0:
+        return
+    if device == "cuda" and _torch is not None and _torch.cuda.is_available():
+        dev_idx = _torch.cuda.current_device()
+        key = (dev_idx, int(bytes_to_flush))
+        buf = _L2_FLUSH_BUFFERS.get(key)
+        if buf is None:
+            buf = _torch.empty(int(bytes_to_flush), dtype=_torch.uint8, device="cuda")
+            _L2_FLUSH_BUFFERS[key] = buf
+        buf.zero_()
+
+
+def _time_once_ms(
+    fn: Callable,
+    inputs: Any,
+    device: str,
+    *,
+    flush_l2: bool = False,
+    flush_bytes: int = 128 * 1024 * 1024,
+) -> float:
+    sample = _copy_inputs(inputs)
+    if flush_l2:
+        cold_l2_flush(flush_bytes, device=device)
+    if device == "cuda" and _torch is not None and _torch.cuda.is_available():
+        s_ev = _torch.cuda.Event(enable_timing=True)
+        e_ev = _torch.cuda.Event(enable_timing=True)
+        s_ev.record()
+        _call_with_inputs(fn, sample)
+        e_ev.record()
+        _torch.cuda.synchronize()
+        return float(s_ev.elapsed_time(e_ev))
+    t0 = time.perf_counter()
+    _call_with_inputs(fn, sample)
+    return (time.perf_counter() - t0) * 1000.0
+
+
+def abba_time_callables(
+    ref_fn: Callable,
+    cand_fn: Callable,
+    inputs: Any,
+    device: str = "cpu",
+    *,
+    warmup: int = 2,
+    pairs: int = 5,
+    flush_l2: bool = False,
+    flush_bytes: int = 128 * 1024 * 1024,
+) -> dict[str, Any]:
+    """Interleaved A-B-B-A timing with optional cold-L2 flush to cancel thermal/clock drift."""
+    for _ in range(max(0, warmup)):
+        _call_with_inputs(ref_fn, _copy_inputs(inputs))
+        _call_with_inputs(cand_fn, _copy_inputs(inputs))
+    _sync_if_cuda(device)
+
+    ref_samples: list[float] = []
+    cand_samples: list[float] = []
+    for _ in range(max(1, pairs)):
+        # A, B, B, A ordering balances linear drift symmetrically.
+        ref_samples.append(_time_once_ms(ref_fn, inputs, device, flush_l2=flush_l2, flush_bytes=flush_bytes))
+        cand_samples.append(_time_once_ms(cand_fn, inputs, device, flush_l2=flush_l2, flush_bytes=flush_bytes))
+        cand_samples.append(_time_once_ms(cand_fn, inputs, device, flush_l2=flush_l2, flush_bytes=flush_bytes))
+        ref_samples.append(_time_once_ms(ref_fn, inputs, device, flush_l2=flush_l2, flush_bytes=flush_bytes))
+
+    ref_ms = float(statistics.median(ref_samples))
+    cand_ms = float(statistics.median(cand_samples))
+    speedup = (ref_ms / cand_ms) if (cand_ms > 0 and ref_ms > 0) else None
+    return {
+        "ref_ms": ref_ms,
+        "cand_ms": cand_ms,
+        "speedup": speedup,
+        "ref_samples_ms": ref_samples,
+        "cand_samples_ms": cand_samples,
+    }
+
+
 def _time_callable(fn: Callable, inputs: Any, device: str, warmup: int = 2, iters: int = 5) -> float:
     for _ in range(warmup):
         _call_with_inputs(fn, _copy_inputs(inputs))
     _sync_if_cuda(device)
-    samples_ms: list[float] = []
-    if device == "cuda" and _torch is not None and _torch.cuda.is_available():
-        for _ in range(iters):
-            sample = _copy_inputs(inputs)
-            s_ev = _torch.cuda.Event(enable_timing=True)
-            e_ev = _torch.cuda.Event(enable_timing=True)
-            s_ev.record()
-            _call_with_inputs(fn, sample)
-            e_ev.record()
-            _torch.cuda.synchronize()
-            samples_ms.append(float(s_ev.elapsed_time(e_ev)))
-    else:
-        for _ in range(iters):
-            sample = _copy_inputs(inputs)
-            t0 = time.perf_counter()
-            _call_with_inputs(fn, sample)
-            samples_ms.append((time.perf_counter() - t0) * 1000.0)
+    samples_ms = [_time_once_ms(fn, inputs, device) for _ in range(iters)]
     return float(statistics.median(samples_ms))
 
 
@@ -191,7 +255,14 @@ def _call_with_inputs(fn: Callable, inputs: Any):
     return fn(inputs)
 
 
-def _evaluate_case(case: dict[str, Any], device: str, atol: float, rtol: float) -> dict[str, Any]:
+def _evaluate_case(
+    case: dict[str, Any],
+    device: str,
+    atol: float,
+    rtol: float,
+    *,
+    mode: str = "numeric",
+) -> dict[str, Any]:
     m_val = int(case.get("m", 0))
     if "inputs_fn" in case and callable(case["inputs_fn"]):
         try:
@@ -213,9 +284,25 @@ def _evaluate_case(case: dict[str, Any], device: str, atol: float, rtol: float) 
         cand_out = _call_with_inputs(cand_fn, _copy_inputs(inputs))
         _sync_if_cuda(device)
         ok, max_diff, detail = _check_close(expected, cand_out, atol, rtol)
-        ref_ms = _time_callable(ref_fn, inputs, device)
-        cand_ms = _time_callable(cand_fn, inputs, device)
-        speedup = (ref_ms / cand_ms) if cand_ms > 0 and ref_ms > 0 else None
+        use_abba = (mode == "timing") or bool(case.get("abba", False))
+        if use_abba:
+            flush_l2 = bool(case.get("flush_l2", device == "cuda"))
+            flush_bytes = int(case.get("flush_bytes", 128 * 1024 * 1024))
+            timing = abba_time_callables(
+                ref_fn,
+                cand_fn,
+                inputs,
+                device=device,
+                flush_l2=flush_l2,
+                flush_bytes=flush_bytes,
+            )
+            ref_ms = timing["ref_ms"]
+            cand_ms = timing["cand_ms"]
+            speedup = timing["speedup"]
+        else:
+            ref_ms = _time_callable(ref_fn, inputs, device)
+            cand_ms = _time_callable(cand_fn, inputs, device)
+            speedup = (ref_ms / cand_ms) if cand_ms > 0 and ref_ms > 0 else None
     elif callable(cand_fn) and inputs is not None and "ref_output" in case:
         cand_out = _call_with_inputs(cand_fn, _copy_inputs(inputs))
         _sync_if_cuda(device)
@@ -301,6 +388,7 @@ def execute_candidate_file(
     atol: float = 1e-2,
     rtol: float = 1e-2,
     padded_nan_check: bool = True,
+    mode: Literal["numeric", "timing"] = "numeric",
 ) -> dict[str, Any]:
     """Execute one micro candidate in-process (intended to be called inside a fresh subprocess)."""
     device = "cuda" if (_torch is not None and _torch.cuda.is_available()) else "cpu"
@@ -364,7 +452,7 @@ def execute_candidate_file(
                 "or `MICRO_SNAPSHOT` + `micro_kernel(...)` matching an available snapshot."
             )
 
-        buckets = [_evaluate_case(c, device, atol=atol, rtol=rtol) for c in cases]
+        buckets = [_evaluate_case(c, device, atol=atol, rtol=rtol, mode=mode) for c in cases]
         all_correct = all(b["correct"] for b in buckets)
 
         padded_ok, padded_detail = (
@@ -405,6 +493,7 @@ def _sandbox_main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--atol", type=float, default=1e-2)
     p.add_argument("--rtol", type=float, default=1e-2)
     p.add_argument("--no-padded-nan-check", action="store_true")
+    p.add_argument("--mode", choices=("numeric", "timing"), default="numeric")
     a = p.parse_args(argv)
 
     buckets = [int(x) for x in a.m_buckets.split(",") if x.strip()] if a.m_buckets else list(DEFAULT_M_BUCKETS)
@@ -418,6 +507,7 @@ def _sandbox_main(argv: Sequence[str] | None = None) -> int:
             atol=a.atol,
             rtol=a.rtol,
             padded_nan_check=not a.no_padded_nan_check,
+            mode=a.mode,
         )
     except Exception as exc:
         res = {
@@ -434,6 +524,52 @@ def _sandbox_main(argv: Sequence[str] | None = None) -> int:
     return 0 if res.get("status") != "crashed" else 2
 
 
+class _MicroRWLock:
+    """Writer-preferring reader-writer lock: `numeric` runs share slots, `timing` runs exclusively."""
+
+    def __init__(self, max_readers: int = 2):
+        self.max_readers = max(1, int(max_readers))
+        self._cond = threading.Condition()
+        self._active_readers = 0
+        self._writer_active = False
+        self._writers_waiting = 0
+
+    @contextmanager
+    def acquire(self, mode: str = "numeric"):
+        if mode not in ("numeric", "timing"):
+            raise ValueError(f"Invalid micro mode {mode!r}; expected 'numeric' or 'timing'")
+        if mode == "numeric":
+            with self._cond:
+                while (
+                    self._writer_active
+                    or self._writers_waiting > 0
+                    or self._active_readers >= self.max_readers
+                ):
+                    self._cond.wait()
+                self._active_readers += 1
+            try:
+                yield
+            finally:
+                with self._cond:
+                    self._active_readers -= 1
+                    self._cond.notify_all()
+        else:
+            with self._cond:
+                self._writers_waiting += 1
+                try:
+                    while self._writer_active or self._active_readers > 0:
+                        self._cond.wait()
+                    self._writer_active = True
+                finally:
+                    self._writers_waiting -= 1
+            try:
+                yield
+            finally:
+                with self._cond:
+                    self._writer_active = False
+                    self._cond.notify_all()
+
+
 class MicroRunner:
     """Lock-free concurrent micro-kernel validator completely decoupled from `TierWorker.engine_lock`."""
 
@@ -443,7 +579,7 @@ class MicroRunner:
         self.micro_dir = self.root / "micro"
         self.micro_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir = self.root / "micro_snapshots"
-        self.sem = threading.Semaphore(run.micro.max_concurrent)
+        self.rw_lock = _MicroRWLock(run.micro.max_concurrent)
 
     def _load_hw_profile(self) -> dict[str, Any] | None:
         try:
@@ -470,10 +606,20 @@ class MicroRunner:
         snapshot_tag: str | None = None,
         enable_ncu: bool | None = None,
         enable_ptxas: bool | None = None,
+        mode: Literal["numeric", "timing"] = "numeric",
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         cfg = self.run.micro
         if not cfg.enabled:
             raise ValueError("Micro sandbox is disabled in RunConfig (`micro.enabled: false`)")
+        if mode not in ("numeric", "timing"):
+            raise ValueError(f"Invalid micro mode {mode!r}; expected 'numeric' or 'timing'")
+        if timeout_s is not None:
+            if not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0:
+                raise ValueError("timeout_s must be a positive finite number")
+            effective_timeout = min(float(timeout_s), float(cfg.max_timeout_s))
+        else:
+            effective_timeout = float(cfg.timeout_s)
 
         mid = time.strftime("%H%M%S") + "-" + uuid.uuid4().hex[:6]
         mdir = self.micro_dir / mid
@@ -484,7 +630,11 @@ class MicroRunner:
         triton_cache = (mdir / ".triton").resolve()
         triton_cache.mkdir(parents=True, exist_ok=True)
 
-        env = ensure_extension_cache_env({**os.environ, "TRITON_CACHE_DIR": str(triton_cache)})
+        env = ensure_extension_cache_env({
+            **os.environ,
+            "TRITON_CACHE_DIR": str(triton_cache),
+            "KILN_MICRO_MODE": mode,
+        })
         effective_ptxas = resolve_ptxas_binary(ptxas_path=cfg.ptxas_path, env=env)
         if effective_ptxas and (cfg.ptxas_path or not env.get("TRITON_PTXAS_PATH")):
             env["TRITON_PTXAS_PATH"] = effective_ptxas
@@ -504,6 +654,8 @@ class MicroRunner:
             str(cfg.atol),
             "--rtol",
             str(cfg.rtol),
+            "--mode",
+            mode,
         ]
         if self.snapshot_dir.is_dir():
             cmd.extend(["--snapshot-dir", str(self.snapshot_dir)])
@@ -515,7 +667,7 @@ class MicroRunner:
             cmd.append("--no-padded-nan-check")
 
         t0 = time.time()
-        with self.sem:
+        with self.rw_lock.acquire(mode):
             timed_out = False
             stderr_tail = ""
             try:
@@ -524,7 +676,7 @@ class MicroRunner:
                     env=env,
                     capture_output=True,
                     text=True,
-                    timeout=cfg.timeout_s,
+                    timeout=effective_timeout,
                 )
                 stderr_tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-1500:]
             except subprocess.TimeoutExpired:
@@ -539,7 +691,7 @@ class MicroRunner:
                     "geomean_speedup": None,
                     "buckets": [],
                     "inline_ptx": [],
-                    "error": f"micro sandbox timed out after {cfg.timeout_s:.1f}s",
+                    "error": f"micro sandbox timed out after {effective_timeout:.1f}s",
                 }
             elif out_path.is_file():
                 raw_out = json.loads(out_path.read_text(encoding="utf-8"))
@@ -598,6 +750,8 @@ class MicroRunner:
             "id": mid,
             "agent": agent,
             "note": note,
+            "mode": mode,
+            "timeout_s": effective_timeout,
             "snapshot_tag": snapshot_tag,
             "status": raw_out.get("status", "crashed"),
             "device": raw_out.get("device"),

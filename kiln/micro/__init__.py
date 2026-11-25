@@ -9,7 +9,7 @@ from .counters import (
     parse_ptx_or_ptxas_text,
     resolve_ptxas_binary,
 )
-from .sandbox import MicroRunner, execute_candidate_file
+from .sandbox import MicroRunner, abba_time_callables, cold_l2_flush, execute_candidate_file
 from .snapshots import (
     DEFAULT_M_BUCKETS,
     SnapshotCollector,
@@ -24,7 +24,9 @@ __all__ = [
     "DEFAULT_M_BUCKETS",
     "MicroRunner",
     "SnapshotCollector",
+    "abba_time_callables",
     "classify_submodule_tag",
+    "cold_l2_flush",
     "collect_ncu_counters",
     "detect_ptxas_toolchain",
     "execute_candidate_file",

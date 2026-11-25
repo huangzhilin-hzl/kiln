@@ -1,0 +1,26 @@
+kiln/config.py
+  h_7339bf36ecd0bc 138-140
+kiln/engine/base.py
+  h_7339bf36ecd0bc 13,90-103
+kiln/engine/vllm_ext.py
+  h_7339bf36ecd0bc 122-124
+kiln/engine/vllm_profiler.py
+  h_7339bf36ecd0bc 315-316,368-370,378-383,593,601-603,606
+kiln/patches.py
+  h_7339bf36ecd0bc 384-431,450,743
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 37,198-199,203,343-344,437,439-457,598-602,971-977,980-985,1102,1271-1276,1285,1632,1641-1658,1685,1692-1746,1848-1853
+tests/test_b300_kiln_improvements.py
+  h_7339bf36ecd0bc 602-704
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fe7267fb552e6293f435e1ba1cae9b12de7d6904",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

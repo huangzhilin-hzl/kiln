@@ -21,7 +21,13 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from kiln.config import RunConfig
-from kiln.micro.counters import collect_ncu_counters, inspect_ptxas_and_spills
+from kiln.engine.prebuild import ensure_extension_cache_env
+from kiln.micro.counters import (
+    collect_ncu_counters,
+    detect_ptxas_toolchain,
+    inspect_ptxas_and_spills,
+    resolve_ptxas_binary,
+)
 from kiln.micro.snapshots import DEFAULT_M_BUCKETS, load_snapshot_payload, load_snapshots
 
 try:
@@ -478,7 +484,11 @@ class MicroRunner:
         triton_cache = (mdir / ".triton").resolve()
         triton_cache.mkdir(parents=True, exist_ok=True)
 
-        env = {**os.environ, "TRITON_CACHE_DIR": str(triton_cache)}
+        env = ensure_extension_cache_env({**os.environ, "TRITON_CACHE_DIR": str(triton_cache)})
+        effective_ptxas = resolve_ptxas_binary(ptxas_path=cfg.ptxas_path, env=env)
+        if effective_ptxas and (cfg.ptxas_path or not env.get("TRITON_PTXAS_PATH")):
+            env["TRITON_PTXAS_PATH"] = effective_ptxas
+        toolchain = detect_ptxas_toolchain(ptxas_path=effective_ptxas, env=env)
         if cfg.gpus:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, cfg.gpus))
 
@@ -548,9 +558,22 @@ class MicroRunner:
             inline_ptx = raw_out.pop("inline_ptx", [])
             use_ptxas = cfg.enable_ptxas if enable_ptxas is None else bool(enable_ptxas)
             ptxas_diag = (
-                inspect_ptxas_and_spills(cache_dir=triton_cache, ptx_texts=inline_ptx)
+                inspect_ptxas_and_spills(
+                    cache_dir=triton_cache,
+                    ptx_texts=inline_ptx,
+                    ptxas_path=effective_ptxas,
+                    env=env,
+                )
                 if use_ptxas
-                else {"available": False, "any_spills": False, "max_registers": 0, "kernels": [], "warnings": []}
+                else {
+                    "available": False,
+                    "ptxas_path": toolchain["ptxas_path"],
+                    "ptxas_version": toolchain["ptxas_version"],
+                    "any_spills": False,
+                    "max_registers": 0,
+                    "kernels": [],
+                    "warnings": [],
+                }
             )
 
             use_ncu = cfg.enable_ncu if enable_ncu is None else bool(enable_ncu)
@@ -583,6 +606,7 @@ class MicroRunner:
             "padded_nan_detail": raw_out.get("padded_nan_detail"),
             "geomean_speedup": sp,
             "buckets": raw_out.get("buckets", []),
+            "toolchain": toolchain,
             "ptxas": ptxas_diag,
             "ncu": ncu_diag,
             "roofline": roofline_summary,

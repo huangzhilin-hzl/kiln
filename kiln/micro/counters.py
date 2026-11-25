@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 _PTXAS_ENTRY_RE = re.compile(r"Compiling entry function\s+['\"]([^'\"]+)['\"]")
 _PTXAS_REGS_RE = re.compile(r"Used\s+(\d+)\s+registers?", re.IGNORECASE)
@@ -136,13 +137,89 @@ def _detect_ptx_target(ptx_text: str, arch: str | None = None) -> str:
     return m.group(1) if m else "sm_90"
 
 
+def _executable_path(raw: str | None, path_env: str | None = None) -> str | None:
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    p = Path(s).expanduser()
+    if (os.sep in s or (os.altsep and os.altsep in s)) and p.is_file():
+        return str(p.resolve())
+    return shutil.which(s, path=path_env)
+
+
+def resolve_ptxas_binary(
+    ptxas_path: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve `ptxas` matching worker/Triton precedence: explicit -> TRITON_PTXAS_PATH -> CUDA_HOME -> PATH."""
+    src_env = os.environ if env is None else env
+    path_env = src_env.get("PATH")
+    candidates: list[str | None] = [
+        ptxas_path,
+        src_env.get("TRITON_PTXAS_PATH"),
+    ]
+    for home_key in ("CUDA_HOME", "CUDA_PATH"):
+        home = (src_env.get(home_key) or "").strip()
+        if home:
+            candidates.append(str(Path(home) / "bin" / "ptxas"))
+    candidates.append("ptxas")
+    for cand in candidates:
+        resolved = _executable_path(cand, path_env=path_env)
+        if resolved:
+            return resolved
+    return None
+
+
+def get_ptxas_version(ptxas_bin: str | None) -> str | None:
+    """Return a concise `ptxas --version` string (e.g. `Cuda compilation tools, release 12.8, V12.8.93`)."""
+    if not ptxas_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [ptxas_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    if not out:
+        return None
+    for line in out.splitlines():
+        s = line.strip()
+        if "release " in s.lower() or "cuda compilation tools" in s.lower():
+            return s[:160]
+    first = next((ln.strip() for ln in out.splitlines() if ln.strip()), None)
+    return first[:160] if first else None
+
+
+def detect_ptxas_toolchain(
+    ptxas_path: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return resolved `ptxas` path, version, and `TRITON_PTXAS_PATH` metadata."""
+    src_env = os.environ if env is None else env
+    resolved = resolve_ptxas_binary(ptxas_path=ptxas_path, env=src_env)
+    return {
+        "ptxas_path": resolved,
+        "ptxas_version": get_ptxas_version(resolved) if resolved else None,
+        "triton_ptxas_path": src_env.get("TRITON_PTXAS_PATH") or None,
+    }
+
+
 def inspect_ptxas_and_spills(
     cache_dir: Path | None = None,
     ptx_texts: Sequence[str] = (),
     run_ptxas_bin: bool = True,
     arch: str | None = None,
+    ptxas_path: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Inspect cached `.ptx` files and inline PTX strings for registers and local-memory spills."""
+    ptxas_bin = resolve_ptxas_binary(ptxas_path=ptxas_path, env=env) if run_ptxas_bin else None
+    ptxas_ver = get_ptxas_version(ptxas_bin) if ptxas_bin else None
+
     ptx_sources: list[tuple[str, str]] = []
     if cache_dir is not None and Path(cache_dir).is_dir():
         for p in sorted(Path(cache_dir).rglob("*.ptx")):
@@ -157,6 +234,8 @@ def inspect_ptxas_and_spills(
     if not ptx_sources:
         return {
             "available": False,
+            "ptxas_path": ptxas_bin,
+            "ptxas_version": ptxas_ver,
             "ptx_files": 0,
             "any_spills": False,
             "max_registers": 0,
@@ -164,9 +243,9 @@ def inspect_ptxas_and_spills(
             "warnings": [],
         }
 
-    ptxas_bin = shutil.which("ptxas") if run_ptxas_bin else None
     all_kernels: list[dict[str, Any]] = []
     used_ptxas = False
+    ptxas_warnings: list[str] = []
 
     for src_label, txt in ptx_sources:
         parsed: list[dict[str, Any]] = []
@@ -176,8 +255,9 @@ def inspect_ptxas_and_spills(
                 f.write(txt)
             tmp_cubin = tmp_ptx.with_suffix(".cubin")
             try:
+                target_arch = _detect_ptx_target(txt, arch)
                 proc = subprocess.run(
-                    [ptxas_bin, "-v", f"-arch={_detect_ptx_target(txt, arch)}", "-o", str(tmp_cubin), str(tmp_ptx)],
+                    [ptxas_bin, "-v", f"-arch={target_arch}", "-o", str(tmp_cubin), str(tmp_ptx)],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -186,8 +266,14 @@ def inspect_ptxas_and_spills(
                 parsed = parse_ptx_or_ptxas_text(diag)
                 if parsed:
                     used_ptxas = True
-            except Exception:
+                elif proc.returncode != 0:
+                    err_line = next((ln.strip() for ln in diag.splitlines() if ln.strip()), f"rc={proc.returncode}")
+                    ptxas_warnings.append(
+                        f"ptxas ({ptxas_bin}) failed for {target_arch} on {src_label}: {err_line[:180]}"
+                    )
+            except Exception as exc:
                 parsed = []
+                ptxas_warnings.append(f"ptxas invocation error on {src_label}: {exc}")
             finally:
                 tmp_ptx.unlink(missing_ok=True)
                 tmp_cubin.unlink(missing_ok=True)
@@ -199,7 +285,7 @@ def inspect_ptxas_and_spills(
 
     any_spills = any(k.get("has_spills") for k in all_kernels)
     max_regs = max((int(k.get("registers", 0)) for k in all_kernels), default=0)
-    warnings: list[str] = []
+    warnings: list[str] = list(ptxas_warnings)
     for k in all_kernels:
         for w in k.get("warnings", ()):
             warnings.append(f"{k['kernel']}: {w}")
@@ -207,6 +293,8 @@ def inspect_ptxas_and_spills(
     return {
         "available": True,
         "used_ptxas_bin": used_ptxas,
+        "ptxas_path": ptxas_bin,
+        "ptxas_version": ptxas_ver,
         "ptx_files": len(ptx_sources),
         "any_spills": any_spills,
         "max_registers": max_regs,

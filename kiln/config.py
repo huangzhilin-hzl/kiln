@@ -434,6 +434,7 @@ class MicroConfig(BaseModel):
     capture_on_boot: bool = True
     max_snapshot_mb: float = 64.0
     enable_ptxas: bool = True
+    ptxas_path: str | None = None
     enable_ncu: bool = False
     ncu_timeout_s: float = 45.0
     atol: float = 1e-2

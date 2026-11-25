@@ -17,14 +17,18 @@ The slow tier needs `pip install 'agentx-harness==1.0.12'` (the version pinned i
 """
 from __future__ import annotations
 
+import csv
 import json
+import math
 import os
 import random
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Callable
 
 DEFAULT_DATASET = "semianalysis_cc_traces_weka_062126"
 DEFAULT_HF_REPO = "semianalysisai/cc-traces-weka-062126"
@@ -159,6 +163,10 @@ class AgentXConfig:
     unsafe_override: bool = False
     extra_args: list[str] = field(default_factory=list)
     binary: str = "agentx"
+    spec_collapse_min_ratio: float | None = 0.30
+    spec_collapse_window_s: float = 120.0
+    spec_collapse_poll_s: float = 15.0
+    spec_collapse_min_drafts: int = 100
 
     def __post_init__(self) -> None:
         if self.benchmark_duration_s is not None:
@@ -169,6 +177,14 @@ class AgentXConfig:
                     "AgentX benchmark_duration_s must be at least 900 seconds or null "
                     "(or set unsafe_override: true)"
                 )
+
+
+class SpecAcceptanceCollapsed(RuntimeError):
+    """Raised when rolling speculative-decode acceptance collapses far below baseline."""
+
+    def __init__(self, message: str, snapshot: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.snapshot: dict[str, Any] = dict(snapshot or {})
 
 
 @dataclass
@@ -187,6 +203,16 @@ class AgentXResult:
     benchmark_duration_s: float | None = None
     error_count: int | None = None
     was_cancelled: bool | None = None
+    spec_decode_accepted_tokens: float | None = None
+    spec_decode_num_drafts: float | None = None
+    spec_decode_draft_tokens: float | None = None
+    spec_decode_acc_per_draft: float | None = None
+    spec_decode_mean_accept_len: float | None = None
+    spec_accept_rate: float | None = None
+    num_preemptions: float | None = None
+    kv_cache_usage_avg: float | None = None
+    spec_acceptance_collapsed: bool | None = None
+    spec_collapse_detail: str | None = None
 
     @property
     def interactivity_p90(self) -> float | None:   # InferenceX: 1 / P90 ITL (tok/s/user)
@@ -229,6 +255,159 @@ def _error_count(data: dict) -> int | None:
     return None
 
 
+def _csv_float(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    s = str(raw).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _norm_prom_metric_name(name: str) -> str:
+    base = name.strip().split("{", 1)[0].strip()
+    if base.endswith("_total"):
+        base = base[: -len("_total")]
+    return base
+
+
+def parse_server_metrics_csv(export_path: str | Path) -> dict[str, float]:
+    """Parse sibling `server_metrics_export.csv` for vLLM spec-decode, preemption, and KV metrics."""
+    p = Path(export_path)
+    csv_path = p if p.name.endswith(".csv") else p.with_name("server_metrics_export.csv")
+    if not csv_path.is_file():
+        return {}
+
+    raw_text = csv_path.read_text(encoding="utf-8", errors="ignore")
+    if not raw_text.strip():
+        return {}
+
+    # AIPerf server_metrics_export.csv can contain multiple blank-line-separated sections.
+    sections: list[list[str]] = []
+    cur: list[str] = []
+    for line in raw_text.splitlines():
+        if not line.strip():
+            if cur:
+                sections.append(cur)
+                cur = []
+            continue
+        cur.append(line)
+    if cur:
+        sections.append(cur)
+
+    counters: dict[str, float] = {}
+    gauges: dict[str, float] = {}
+
+    counter_targets = {
+        "vllm:spec_decode_num_accepted_tokens": "spec_decode_accepted_tokens",
+        "vllm:spec_decode_num_drafts": "spec_decode_num_drafts",
+        "vllm:spec_decode_num_draft_tokens": "spec_decode_draft_tokens",
+        "vllm:num_preemptions": "num_preemptions",
+    }
+    gauge_targets = {
+        "vllm:spec_decode_mean_acceptance_length": "spec_decode_mean_accept_len",
+        "vllm:spec_decode_avg_acceptance_length": "spec_decode_mean_accept_len",
+        "vllm:spec_decode_draft_acceptance_rate": "spec_accept_rate",
+        "vllm:kv_cache_usage_perc": "kv_cache_usage_avg",
+        "vllm:gpu_cache_usage_perc": "kv_cache_usage_avg",
+    }
+
+    for sec_lines in sections:
+        rows = list(csv.reader(sec_lines))
+        if len(rows) < 2:
+            continue
+        headers = [h.strip() for h in rows[0]]
+        lower_headers = [h.lower() for h in headers]
+
+        name_idx: int | None = None
+        for cand_col in ("metric", "metric_name", "metric name", "name"):
+            if cand_col in lower_headers:
+                name_idx = lower_headers.index(cand_col)
+                break
+        if name_idx is None:
+            continue
+
+        col_idx = {lh: i for i, lh in enumerate(lower_headers)}
+
+        def _get(row: list[str], *keys: str) -> float | None:
+            for k in keys:
+                idx = col_idx.get(k)
+                if idx is not None and idx < len(row):
+                    val = _csv_float(row[idx])
+                    if val is not None:
+                        return val
+            return None
+
+        for row in rows[1:]:
+            if name_idx >= len(row):
+                continue
+            mname = _norm_prom_metric_name(row[name_idx])
+            if not mname:
+                continue
+
+            if mname in counter_targets:
+                out_k = counter_targets[mname]
+                val = _get(row, "delta", "total", "sum", "change", "increase")
+                if val is None:
+                    first_v = _get(row, "first", "first_value", "min")
+                    last_v = _get(row, "last", "last_value", "max")
+                    if first_v is not None and last_v is not None and last_v >= first_v:
+                        val = last_v - first_v
+                    else:
+                        val = _get(row, "value", "avg", "mean", "max")
+                if val is not None:
+                    counters[out_k] = counters.get(out_k, 0.0) + val
+            elif mname in gauge_targets:
+                out_k = gauge_targets[mname]
+                val = _get(row, "avg", "mean", "value", "p50", "last", "max")
+                if val is not None:
+                    gauges[out_k] = val
+
+    out: dict[str, float] = {**counters, **gauges}
+    acc = out.get("spec_decode_accepted_tokens")
+    drafts = out.get("spec_decode_num_drafts")
+    draft_toks = out.get("spec_decode_draft_tokens")
+    if acc is not None and drafts is not None and drafts > 0:
+        acc_per_draft = acc / drafts
+        out["spec_decode_acc_per_draft"] = round(acc_per_draft, 6)
+        out.setdefault("spec_decode_mean_accept_len", round(1.0 + acc_per_draft, 6))
+    elif "spec_decode_mean_accept_len" in out:
+        out["spec_decode_acc_per_draft"] = round(max(0.0, out["spec_decode_mean_accept_len"] - 1.0), 6)
+    if acc is not None and draft_toks is not None and draft_toks > 0:
+        out.setdefault("spec_accept_rate", round(acc / draft_toks, 6))
+    return out
+
+
+def detect_spec_acceptance_collapse(
+    cand_acc_per_draft: float | None,
+    baseline_acc_per_draft: float | None,
+    min_ratio: float | None = 0.30,
+) -> tuple[bool, str | None]:
+    """Return `(collapsed, detail)` if candidate spec acceptance drops below `min_ratio` of baseline."""
+    if (
+        min_ratio is None
+        or min_ratio <= 0
+        or cand_acc_per_draft is None
+        or baseline_acc_per_draft is None
+        or not math.isfinite(cand_acc_per_draft)
+        or not math.isfinite(baseline_acc_per_draft)
+        or baseline_acc_per_draft <= 0
+    ):
+        return False, None
+    ratio = cand_acc_per_draft / baseline_acc_per_draft
+    if ratio < min_ratio:
+        return (
+            True,
+            f"Spec-decode acceptance collapsed: {cand_acc_per_draft:.3f} vs baseline "
+            f"{baseline_acc_per_draft:.3f} acc/draft ({100.0 * ratio:.1f}% < {100.0 * min_ratio:.0f}%)",
+        )
+    return False, None
+
+
 def parse_agentx_export(path: str | Path, num_gpus: int) -> AgentXResult:
     data = json.loads(Path(path).read_text())
     # Per-run exports keep measured metrics at the root. Warmup metrics
@@ -240,6 +419,7 @@ def parse_agentx_export(path: str | Path, num_gpus: int) -> AgentXResult:
     if req_cnt is None:
         req_cnt = _metric(data, "decode_duration", "count")
     cancelled = data.get("was_cancelled") if isinstance(data.get("was_cancelled"), bool) else None
+    srv = parse_server_metrics_csv(path)
     return AgentXResult(
         total_tput_per_gpu=float(tot) / max(num_gpus, 1),
         output_tput=float(out),
@@ -255,6 +435,14 @@ def parse_agentx_export(path: str | Path, num_gpus: int) -> AgentXResult:
         benchmark_duration_s=_metric(data, "benchmark_duration", "avg"),
         error_count=_error_count(data),
         was_cancelled=cancelled,
+        spec_decode_accepted_tokens=srv.get("spec_decode_accepted_tokens"),
+        spec_decode_num_drafts=srv.get("spec_decode_num_drafts"),
+        spec_decode_draft_tokens=srv.get("spec_decode_draft_tokens"),
+        spec_decode_acc_per_draft=srv.get("spec_decode_acc_per_draft"),
+        spec_decode_mean_accept_len=srv.get("spec_decode_mean_accept_len"),
+        spec_accept_rate=srv.get("spec_accept_rate"),
+        num_preemptions=srv.get("num_preemptions"),
+        kv_cache_usage_avg=srv.get("kv_cache_usage_avg"),
     )
 
 
@@ -355,15 +543,70 @@ def agentx_result_to_extra(
         "benchmark_duration_s",
         "error_count",
         "was_cancelled",
+        "spec_decode_accepted_tokens",
+        "spec_decode_num_drafts",
+        "spec_decode_draft_tokens",
+        "spec_decode_acc_per_draft",
+        "spec_decode_mean_accept_len",
+        "spec_accept_rate",
+        "num_preemptions",
+        "kv_cache_usage_avg",
+        "spec_acceptance_collapsed",
+        "spec_collapse_detail",
     ):
         val = getattr(last, attr, None)
         if val is not None:
             extra[attr] = val
+    if last.spec_decode_mean_accept_len is not None:
+        extra.setdefault("spec_accept_length", last.spec_decode_mean_accept_len)
     return extra
 
 
-def run_agentx_profile(url: str, model: str, tokenizer: str, cfg: AgentXConfig,
-                       artifact_dir: str | Path, num_gpus: int, timeout_s: float) -> AgentXResult:
+def _default_spec_counter_reader(url: str) -> Callable[[], dict[str, float]]:
+    import httpx
+    from kiln.engine.base import parse_prometheus_metric
+
+    target = f"{url.rstrip('/')}/metrics"
+
+    def _read() -> dict[str, float]:
+        try:
+            r = httpx.get(target, trust_env=False, timeout=3.0)
+            if r.status_code != 200 or not r.text:
+                return {}
+            out: dict[str, float] = {}
+            acc = parse_prometheus_metric(
+                r.text,
+                ("vllm:spec_decode_num_accepted_tokens_total", "vllm:spec_decode_num_accepted_tokens"),
+            )
+            drafts = parse_prometheus_metric(
+                r.text,
+                ("vllm:spec_decode_num_drafts_total", "vllm:spec_decode_num_drafts"),
+            )
+            if acc is not None:
+                out["accepted_tokens"] = acc
+            if drafts is not None:
+                out["num_drafts"] = drafts
+            return out
+        except Exception:
+            return {}
+
+    return _read
+
+
+def run_agentx_profile(
+    url: str,
+    model: str,
+    tokenizer: str,
+    cfg: AgentXConfig,
+    artifact_dir: str | Path,
+    num_gpus: int,
+    timeout_s: float,
+    *,
+    baseline_spec_acc_per_draft: float | None = None,
+    metrics_reader: Callable[[], dict[str, float]] | None = None,
+) -> AgentXResult:
+    from kiln.engine.base import shutdown_process_group
+
     venv_bin = str(Path(sys.executable).parent)
     path_env = f"{venv_bin}{os.pathsep}{os.environ.get('PATH', '')}"
     binary = shutil.which(cfg.binary, path=path_env)
@@ -383,9 +626,87 @@ def run_agentx_profile(url: str, model: str, tokenizer: str, cfg: AgentXConfig,
         cmd.append("--unsafe-override")
     cmd += cfg.extra_args
     env = {**os.environ, "PATH": path_env}
+
+    monitor_spec = (
+        baseline_spec_acc_per_draft is not None
+        and baseline_spec_acc_per_draft > 0
+        and cfg.spec_collapse_min_ratio is not None
+        and cfg.spec_collapse_min_ratio > 0
+    )
+    reader = metrics_reader if metrics_reader is not None else (_default_spec_counter_reader(url) if monitor_spec else None)
+    init_snap = reader() if (monitor_spec and reader is not None) else {}
+    init_acc = init_snap.get("accepted_tokens")
+    init_drafts = init_snap.get("num_drafts")
+
+    t0 = time.monotonic()
     with open(artifact_dir / "agentx.log", "w") as log:
-        subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout_s)
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            poll_s = max(0.05, float(cfg.spec_collapse_poll_s)) if monitor_spec else 1.0
+            while True:
+                rc = proc.poll()
+                if rc is not None:
+                    break
+                elapsed = time.monotonic() - t0
+                if timeout_s and elapsed >= float(timeout_s):
+                    shutdown_process_group(proc, timeout=10.0)
+                    raise subprocess.TimeoutExpired(cmd, timeout_s)
+                if monitor_spec and reader is not None and elapsed >= float(cfg.spec_collapse_window_s):
+                    cur = reader()
+                    c_acc = cur.get("accepted_tokens")
+                    c_drafts = cur.get("num_drafts")
+                    if c_acc is not None and c_drafts is not None:
+                        if init_acc is None or init_drafts is None:
+                            init_acc, init_drafts = c_acc, c_drafts
+                        else:
+                            d_acc = max(0.0, c_acc - init_acc)
+                            d_drafts = c_drafts - init_drafts
+                            if d_drafts >= max(1, int(cfg.spec_collapse_min_drafts)):
+                                obs_rate = d_acc / d_drafts
+                                collapsed, detail = detect_spec_acceptance_collapse(
+                                    obs_rate,
+                                    baseline_spec_acc_per_draft,
+                                    min_ratio=cfg.spec_collapse_min_ratio,
+                                )
+                                if collapsed:
+                                    shutdown_process_group(proc, timeout=10.0)
+                                    snap = {
+                                        "baseline_acc_per_draft": round(float(baseline_spec_acc_per_draft), 4),
+                                        "observed_acc_per_draft": round(obs_rate, 4),
+                                        "ratio": round(obs_rate / float(baseline_spec_acc_per_draft), 4),
+                                        "window_drafts": int(round(d_drafts)),
+                                        "window_accepted_tokens": int(round(d_acc)),
+                                        "elapsed_s": round(elapsed, 2),
+                                    }
+                                    raise SpecAcceptanceCollapsed(detail or "Spec-decode acceptance collapsed", snap)
+                wait_slice = min(poll_s, max(0.05, float(timeout_s) - elapsed)) if timeout_s else poll_s
+                try:
+                    proc.wait(timeout=wait_slice)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
+        except BaseException:
+            if proc.poll() is None:
+                shutdown_process_group(proc, timeout=10.0)
+            raise
+
     hits = sorted(artifact_dir.rglob("profile_export_aiperf.json"))
     if not hits:
         raise RuntimeError(f"no profile_export_aiperf.json under {artifact_dir}")
-    return parse_agentx_export(hits[-1], num_gpus)
+    res = parse_agentx_export(hits[-1], num_gpus)
+    if monitor_spec and res.spec_decode_acc_per_draft is not None:
+        collapsed, detail = detect_spec_acceptance_collapse(
+            res.spec_decode_acc_per_draft,
+            baseline_spec_acc_per_draft,
+            min_ratio=cfg.spec_collapse_min_ratio,
+        )
+        res.spec_acceptance_collapsed = collapsed
+        res.spec_collapse_detail = detail
+    return res

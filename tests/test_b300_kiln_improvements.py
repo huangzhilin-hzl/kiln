@@ -243,3 +243,102 @@ def test_micro_http_endpoint_accepts_mode_and_timeout(tmp_path: Path, monkeypatc
         assert body["status"] == "done"
         assert body["mode"] == "timing"
         assert body["timeout_s"] == 45.0
+
+
+# --------------------------------------------------------------------------- Commit 3: AgentX spec-decode acceptance & collapse abort
+def test_agentx_parses_server_metrics_csv_and_detects_collapse(tmp_path: Path):
+    import json
+    from kiln.bench.agentx import (
+        agentx_result_to_extra,
+        detect_spec_acceptance_collapse,
+        parse_agentx_export,
+        parse_server_metrics_csv,
+    )
+
+    exp_dir = tmp_path / "run_healthy"
+    exp_dir.mkdir()
+    export_json = exp_dir / "profile_export_aiperf.json"
+    export_json.write_text(json.dumps({
+        "total_token_throughput": {"avg": 79907.2},
+        "output_token_throughput": {"avg": 676.2},
+        "inter_token_latency": {"p50": 4.41, "p90": 8.6},
+        "time_to_first_token": {"p50": 265.0},
+        "active_decode_throughput": {"avg": 850.0},
+        "benchmark_duration": {"avg": 900.0},
+        "metadata": {"submission_valid": True},
+    }), encoding="utf-8")
+    (exp_dir / "server_metrics_export.csv").write_text(
+        "Metric,Type,Unit,First,Last,Avg,Total\n"
+        "vllm:spec_decode_num_accepted_tokens_total,counter,tokens,1000,22200,0,21200\n"
+        "vllm:spec_decode_num_drafts_total,counter,drafts,500,10500,0,10000\n"
+        "vllm:spec_decode_num_draft_tokens_total,counter,tokens,3500,73500,0,70000\n"
+        "vllm:num_preemptions_total,counter,count,0,3,0,3\n"
+        "vllm:kv_cache_usage_perc,gauge,ratio,0.1,0.4,0.28,0\n",
+        encoding="utf-8",
+    )
+
+    srv = parse_server_metrics_csv(export_json)
+    assert srv["spec_decode_accepted_tokens"] == pytest.approx(21200.0)
+    assert srv["spec_decode_num_drafts"] == pytest.approx(10000.0)
+    assert srv["spec_decode_acc_per_draft"] == pytest.approx(2.12)
+    assert srv["spec_decode_mean_accept_len"] == pytest.approx(3.12)
+    assert srv["spec_accept_rate"] == pytest.approx(21200.0 / 70000.0, rel=1e-4)
+    assert srv["num_preemptions"] == pytest.approx(3.0)
+    assert srv["kv_cache_usage_avg"] == pytest.approx(0.28)
+
+    res = parse_agentx_export(export_json, num_gpus=1)
+    assert res.spec_decode_acc_per_draft == pytest.approx(2.12)
+    assert res.spec_decode_mean_accept_len == pytest.approx(3.12)
+    extra = agentx_result_to_extra(res, [], unsafe_override=False)
+    assert extra["spec_decode_acc_per_draft"] == pytest.approx(2.12)
+    assert extra["spec_accept_length"] == pytest.approx(3.12)
+
+    collapsed_ok, detail_ok = detect_spec_acceptance_collapse(2.05, 2.12, min_ratio=0.30)
+    assert not collapsed_ok and detail_ok is None
+    collapsed_bad, detail_bad = detect_spec_acceptance_collapse(0.401, 2.12, min_ratio=0.30)
+    assert collapsed_bad and "0.401" in (detail_bad or "")
+
+
+def test_agentx_rolling_spec_collapse_watchdog_aborts_early(tmp_path: Path):
+    import time
+    from kiln.bench.agentx import AgentXConfig, SpecAcceptanceCollapsed, run_agentx_profile
+
+    fake_agentx = tmp_path / "fake_agentx"
+    fake_agentx.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    fake_agentx.chmod(fake_agentx.stat().st_mode | stat.S_IXUSR)
+
+    cfg = AgentXConfig(
+        binary=str(fake_agentx),
+        benchmark_duration_s=10,
+        unsafe_override=True,
+        spec_collapse_min_ratio=0.30,
+        spec_collapse_window_s=0.1,
+        spec_collapse_poll_s=0.05,
+        spec_collapse_min_drafts=50,
+    )
+    calls = {"n": 0}
+
+    def fake_metrics():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"accepted_tokens": 1000.0, "num_drafts": 500.0}
+        # Collapsed delta: 40 accepted over 100 drafts = 0.40 vs 2.12 baseline (<30%)
+        return {"accepted_tokens": 1040.0, "num_drafts": 600.0}
+
+    t0 = time.monotonic()
+    with pytest.raises(SpecAcceptanceCollapsed) as ei:
+        run_agentx_profile(
+            "http://127.0.0.1:19999",
+            "dummy-model",
+            "dummy-tok",
+            cfg,
+            tmp_path / "ax_out",
+            num_gpus=1,
+            timeout_s=15.0,
+            baseline_spec_acc_per_draft=2.12,
+            metrics_reader=fake_metrics,
+        )
+    elapsed = time.monotonic() - t0
+    assert elapsed < 3.0, f"expected early abort, took {elapsed:.2f}s"
+    assert ei.value.snapshot["observed_acc_per_draft"] == pytest.approx(0.4, abs=1e-3)
+    assert ei.value.snapshot["window_drafts"] == 100

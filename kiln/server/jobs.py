@@ -22,7 +22,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Callable
 
-from kiln.bench.agentx import compare_agentx_paired
+from kiln.bench.agentx import compare_agentx_paired, detect_spec_acceptance_collapse
 from kiln.bench.correctness import evaluate_correctness, validate_probe_logprobs
 from kiln.bench.traffic import Request
 from kiln.config import RunConfig, TierConfig
@@ -913,6 +913,17 @@ class TierWorker:
                 paired = compare_agentx_paired(self.baseline_extra["export"], extra["export"])
                 if paired is not None:
                     extra["paired"] = paired
+            base_acc = self.baseline_extra.get("spec_decode_acc_per_draft")
+            cand_acc = extra.get("spec_decode_acc_per_draft")
+            if isinstance(base_acc, (int, float)) and isinstance(cand_acc, (int, float)):
+                ax_cfg = self.tier.agentx or {}
+                min_ratio = ax_cfg.get("spec_collapse_min_ratio", 0.30)
+                collapsed, detail = detect_spec_acceptance_collapse(cand_acc, base_acc, min_ratio=min_ratio)
+                extra["spec_acceptance_collapsed"] = collapsed
+                if collapsed:
+                    extra["spec_collapse_detail"] = detail
+                    job.status, job.error, job.extra = "invalid", detail, extra
+                    return
 
             bucket_tps = extra.get("bucket_tps")
             if isinstance(bucket_tps, dict):

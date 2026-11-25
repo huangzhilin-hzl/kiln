@@ -191,7 +191,13 @@ def build_server_replay_extra(
         extra["output_tput"] = decode_tps
     extra.update(replay_itl_metrics(itl_samples_ms))
     if spec_metrics:
-        for k in ("spec_accept_length", "spec_accept_rate"):
+        for k in (
+            "spec_accept_length",
+            "spec_accept_rate",
+            "spec_decode_acc_per_draft",
+            "spec_decode_accepted_tokens",
+            "spec_decode_num_drafts",
+        ):
             v = spec_metrics.get(k)
             if isinstance(v, (int, float)) and math.isfinite(v):
                 extra[k] = float(v)

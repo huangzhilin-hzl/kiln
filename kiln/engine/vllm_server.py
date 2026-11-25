@@ -22,7 +22,12 @@ from pathlib import Path
 
 import httpx
 
-from kiln.bench.agentx import AgentXConfig, agentx_result_to_extra, run_agentx_profile
+from kiln.bench.agentx import (
+    AgentXConfig,
+    SpecAcceptanceCollapsed,
+    agentx_result_to_extra,
+    run_agentx_profile,
+)
 from kiln.bench.correctness import collect_probe_logprobs, logprob_value
 from kiln.bench.traffic import Request
 from kiln.config import EngineConfig, TierConfig
@@ -74,6 +79,7 @@ class VLLMServerEngine(Engine):
         self._trace_dir: str | None = None
         self._candidate_active: bool = False
         self._baseline_graphs_dirty: bool = False
+        self._baseline_spec_acc_per_draft: float | None = None
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -209,7 +215,7 @@ class VLLMServerEngine(Engine):
         return self._complete_one_stats(prompt_ids, max_tokens, stream=False)[0]
 
     def _read_spec_metrics(self) -> dict[str, float]:
-        return read_prometheus_metrics(
+        raw = read_prometheus_metrics(
             self.http,
             self.url,
             {
@@ -218,8 +224,22 @@ class VLLMServerEngine(Engine):
                     "vllm:spec_decode_avg_acceptance_length",
                 ),
                 "spec_accept_rate": ("vllm:spec_decode_draft_acceptance_rate",),
+                "spec_decode_accepted_tokens": (
+                    "vllm:spec_decode_num_accepted_tokens_total",
+                    "vllm:spec_decode_num_accepted_tokens",
+                ),
+                "spec_decode_num_drafts": (
+                    "vllm:spec_decode_num_drafts_total",
+                    "vllm:spec_decode_num_drafts",
+                ),
             },
         )
+        acc = raw.get("spec_decode_accepted_tokens")
+        drafts = raw.get("spec_decode_num_drafts")
+        if acc is not None and drafts is not None and drafts > 0:
+            raw["spec_decode_acc_per_draft"] = round(acc / drafts, 6)
+            raw.setdefault("spec_accept_length", round(1.0 + acc / drafts, 6))
+        return raw
 
     def _kernel_report(self, pool: concurrent.futures.ThreadPoolExecutor,
                        requests: list[Request]) -> tuple[str | None, dict | None]:
@@ -312,24 +332,42 @@ class VLLMServerEngine(Engine):
         artifact_root.mkdir(parents=True, exist_ok=True)
         runs: list[float] = []
         extra = {"metric": "agentx_total_tput_per_gpu", "repeats": []}
+        base_acc = self._baseline_spec_acc_per_draft if self._candidate_active else None
         for _ in range(repeats):
             self._reset_cache()
             artifact_dir = tempfile.mkdtemp(prefix=f"{self.tier.name}_", dir=artifact_root)
-            last = run_agentx_profile(
-                self.url, self.served_name, self.cfg.tokenizer or self.cfg.model, self.agentx,
-                artifact_dir, n_gpus,
-                timeout_s=max(self.tier.timeout_s, (self.agentx.benchmark_duration_s or 7200) * 3))
+            try:
+                last = run_agentx_profile(
+                    self.url, self.served_name, self.cfg.tokenizer or self.cfg.model, self.agentx,
+                    artifact_dir, n_gpus,
+                    timeout_s=max(self.tier.timeout_s, (self.agentx.benchmark_duration_s or 7200) * 3),
+                    baseline_spec_acc_per_draft=base_acc,
+                )
+            except SpecAcceptanceCollapsed as exc:
+                extra["submission_valid"] = False
+                extra["spec_acceptance_collapsed"] = True
+                extra["spec_collapse"] = exc.snapshot
+                raise InvalidBenchmark(str(exc), extra) from exc
             result = asdict(last)
             for key, value in result.items():
                 if isinstance(value, float) and not math.isfinite(value):
                     result[key] = None
             extra["repeats"].append(result)
+            if last.spec_acceptance_collapsed:
+                extra = agentx_result_to_extra(last, extra["repeats"], self.agentx.unsafe_override)
+                extra["submission_valid"] = False
+                raise InvalidBenchmark(
+                    last.spec_collapse_detail or f"Spec-decode acceptance collapsed: {last.raw_path}",
+                    extra,
+                )
             require_valid = not self.agentx.unsafe_override
             if (require_valid and last.submission_valid is not True) or not (
                 math.isfinite(last.total_tput_per_gpu) and last.total_tput_per_gpu > 0
             ):
                 extra["submission_valid"] = False
                 raise InvalidBenchmark(f"Invalid AgentX measurement: {last.raw_path}", extra)
+            if not self._candidate_active and last.spec_decode_acc_per_draft is not None:
+                self._baseline_spec_acc_per_draft = last.spec_decode_acc_per_draft
             runs.append(last.total_tput_per_gpu)
         extra = agentx_result_to_extra(last, extra["repeats"], self.agentx.unsafe_override)
         return MeasureResult(

@@ -1,0 +1,16 @@
+kiln/cli.py
+  h_7339bf36ecd0bc 531-640,650-659,966-973
+tests/test_b300_kiln_improvements.py
+  h_7339bf36ecd0bc 345-406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e0e9d50b18bd0ba40e9c2bab45c6386a60041575",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

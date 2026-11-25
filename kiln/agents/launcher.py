@@ -14,9 +14,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping
 
 from kiln.agents.refs_index import ensure_refs_index
 from kiln.config import RunConfig
+from kiln.engine.base import shutdown_process_group
 
 PROMPT = Path(__file__).with_name("prompt.md")
 REPO = Path(__file__).resolve().parents[2]
@@ -246,6 +248,8 @@ def _write_slot_status(
         "last_rc": rc,
         "failures": slot.get("failures", 0),
         "quota_retries": slot.get("quota_retries", 0),
+        "stale_restarts": slot.get("stale_restarts", 0),
+        "last_activity_at": slot.get("last_activity_at"),
         "wake_at": slot.get("wake_at"),
     }
     status_path = ws / "status.json"
@@ -253,13 +257,81 @@ def _write_slot_status(
     return status_path
 
 
+def _load_codex_cached_models(cache_path: Path | None = None) -> set[str] | None:
+    """Load available Codex model slugs/IDs from `~/.codex/models_cache.json` when present."""
+    if cache_path is None:
+        codex_home = os.environ.get("CODEX_HOME")
+        base = Path(codex_home).expanduser() if codex_home else (Path.home() / ".codex")
+        cache_path = base / "models_cache.json"
+    if not cache_path.is_file():
+        return None
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    items = raw.get("models") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return None
+    models: set[str] = set()
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            models.add(item.strip())
+        elif isinstance(item, dict):
+            for key in ("slug", "id", "model", "name"):
+                val = item.get(key)
+                if isinstance(val, str) and val.strip():
+                    models.add(val.strip())
+    return models or None
+
+
+def _looks_like_local_path(val: str) -> bool:
+    s = val.strip()
+    return s.startswith(("/", "./", "../", "~"))
+
+
+def _validate_offline_model_paths(
+    run: RunConfig, env: Mapping[str, str] | None = None
+) -> list[str]:
+    """Validate local filesystem model/tokenizer paths and offline HF cache readiness."""
+    if run.engine.kind == "mock":
+        return []
+    src_env = os.environ if env is None else env
+    offline = any(
+        str(src_env.get(k, "")).strip().lower() in ("1", "true", "yes")
+        for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    )
+    hf_cache_root = Path(
+        src_env.get("HF_HUB_CACHE")
+        or (Path(src_env["HF_HOME"]).expanduser() / "hub" if src_env.get("HF_HOME") else Path.home() / ".cache" / "huggingface" / "hub")
+    )
+    errors: list[str] = []
+    for field_name, raw_val in (("engine.model", run.engine.model), ("engine.tokenizer", run.engine.tokenizer)):
+        if not raw_val or not str(raw_val).strip():
+            continue
+        val = str(raw_val).strip()
+        expanded = Path(val).expanduser()
+        if _looks_like_local_path(val):
+            if not expanded.exists():
+                errors.append(f"{field_name} local path does not exist: {val}")
+        elif offline and not expanded.exists():
+            # Check standard HF Hub cache layout (`models--org--repo`).
+            cache_dir = hf_cache_root / ("models--" + val.replace("/", "--"))
+            if not cache_dir.is_dir():
+                errors.append(
+                    f"HF_HUB_OFFLINE is enabled and {field_name}={val!r} is neither a local path "
+                    f"nor present in HF cache ({cache_dir})"
+                )
+    return errors
+
+
 def doctor_slots(
     run: RunConfig,
     server_url: str | None = None,
     probe_cli: bool = True,
     probe_timeout_s: float = 20.0,
+    codex_models_cache: Path | None = None,
 ) -> dict:
-    """Validate server connectivity, CLI availability, proxy/env, and optional minimal model probe."""
+    """Validate server connectivity, CLI availability, Codex model cache, offline paths, and optional CLI probe."""
     import httpx
     from kiln.server.auth import auth_headers
 
@@ -278,6 +350,9 @@ def doctor_slots(
     except Exception as exc:
         server_error = str(exc)
 
+    offline_errors = _validate_offline_model_paths(run)
+    codex_cached = _load_codex_cached_models(codex_models_cache)
+
     refs_dir = REPO / "refs"
     venv_bin = str(Path(sys.executable).parent)
     reports: list[dict] = []
@@ -295,11 +370,18 @@ def doctor_slots(
         cli_found = bool(resolved_exe)
         version_str: str | None = None
         probe_ok: bool | None = None
+        model_cache_ok: bool | None = None
         err: str | None = None
+
+        if slot.provider == "codex" and slot.model and codex_cached is not None:
+            model_cache_ok = slot.model in codex_cached
+            if not model_cache_ok:
+                sample = ", ".join(sorted(codex_cached)[:8])
+                err = f"Codex model {slot.model!r} not found in models_cache.json (available: {sample})"
 
         if not cli_found:
             err = f"CLI {exe!r} not found on PATH"
-        else:
+        elif model_cache_ok is not False:
             try:
                 v = subprocess.run(
                     [resolved_exe, "--version"],
@@ -355,7 +437,7 @@ def doctor_slots(
                     probe_ok = False
                     err = str(exc)
 
-        ok = cli_found and (True if not probe_cli else bool(probe_ok))
+        ok = cli_found and (model_cache_ok is not False) and (True if not probe_cli else bool(probe_ok))
         reports.append({
             "agent": name,
             "provider": slot.provider,
@@ -363,6 +445,7 @@ def doctor_slots(
             "role": slot.role,
             "binary": resolved_exe,
             "cli_found": cli_found,
+            "model_cache_ok": model_cache_ok,
             "version": version_str,
             "probe_ok": probe_ok,
             "ok": ok,
@@ -373,9 +456,32 @@ def doctor_slots(
         "server_url": target_url,
         "server_ok": server_ok,
         "server_error": server_error,
-        "ok": server_ok and all(r["ok"] for r in reports),
+        "offline_path_errors": offline_errors,
+        "ok": server_ok and (not offline_errors) and all(r["ok"] for r in reports),
         "slots": reports,
     }
+
+
+def _terminate_slot_proc(proc) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    if isinstance(proc, subprocess.Popen):
+        shutdown_process_group(proc, timeout=5.0)
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        try:
+            proc.send_signal(signal.SIGTERM)
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _spawn_agent(cmd: list[str], ws: Path, env: dict[str, str], prompt_text: str):
@@ -384,10 +490,12 @@ def _spawn_agent(cmd: list[str], ws: Path, env: dict[str, str], prompt_text: str
         if any("{prompt}" in tok for tok in cmd):
             argv = [tok.replace("{prompt}", prompt_text) for tok in cmd]
             p = subprocess.Popen(argv, cwd=ws, env=env,
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
             return p, log
         p = subprocess.Popen(cmd, cwd=ws, env=env,
-                             stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
+                             stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=True)
     except Exception:
         log.close()
         raise
@@ -398,6 +506,65 @@ def _spawn_agent(cmd: list[str], ws: Path, env: dict[str, str], prompt_text: str
     except BrokenPipeError:
         pass  # The supervisor below handles the child exit.
     return p, log
+
+
+def _check_and_handle_stale_slot(
+    slot: dict,
+    now: float,
+    stale_timeout_s: float | None,
+    *,
+    respawn_on_exit: bool,
+    deadline: float,
+    spawn_fn=_spawn_agent,
+) -> str | None:
+    """Terminate and optionally respawn a running agent slot whose log stays silent past `stale_timeout_s`."""
+    if stale_timeout_s is None or stale_timeout_s <= 0:
+        return None
+    proc = slot.get("proc")
+    if proc is None or proc.poll() is not None:
+        return None
+    last_act = float(slot.get("last_activity_at") or slot.get("started_at") or now)
+    silent_s = now - last_act
+    if silent_s < float(stale_timeout_s):
+        return None
+
+    ws: Path = slot["ws"]
+    print(
+        f"[kiln] {slot['name']} log silent for {silent_s:.0f}s (>= stale_timeout_s={stale_timeout_s:.0f}s); "
+        f"terminating hung process"
+    )
+    _terminate_slot_proc(proc)
+    if slot.get("log") is not None and not slot["log"].closed:
+        slot["log"].close()
+    slot["proc"] = None
+    slot["stale_restarts"] = int(slot.get("stale_restarts", 0)) + 1
+
+    with open(ws / "agent.log", "a", encoding="utf-8") as lf:
+        lf.write(
+            f"\n[kiln] {slot['name']} terminated after {silent_s:.0f}s of silence "
+            f"(stale_timeout_s={stale_timeout_s:.0f}s)\n"
+        )
+
+    if not respawn_on_exit or now >= deadline:
+        slot["active"] = False
+        _write_slot_status(ws, slot, "stopped", now=now)
+        return "stopped"
+
+    p, log = spawn_fn(slot["cmd"], ws, slot["env"], slot["prompt"] + CONTINUE_NOTE)
+    log_bytes = (ws / "agent.log").stat().st_size if (ws / "agent.log").exists() else 0
+    slot.update(
+        proc=p,
+        log=log,
+        wake_at=None,
+        started_at=now,
+        last_activity_at=now,
+        last_heartbeat_at=now,
+        last_log_bytes=log_bytes,
+    )
+    _write_slot_status(ws, slot, "running", now=now)
+    info = f"provider={slot['provider']}" + (f", model={slot['model']}" if slot.get("model") else "")
+    print(f"[kiln] respawned stale {slot['name']} (pid {p.pid}, {info})")
+    return "respawned"
 
 
 def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> None:
@@ -468,8 +635,9 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                 "idx": i - 1, "name": name, "ws": ws, "cmd": slot_cmd,
                 "provider": slot.provider, "model": slot.model, "role": slot.role,
                 "env": env, "prompt": prompt, "proc": p, "log": log,
-                "started_at": now_spawn, "last_heartbeat_at": now_spawn, "last_log_bytes": log_size,
-                "failures": 0, "quota_retries": 0, "wake_at": None, "active": True,
+                "started_at": now_spawn, "last_activity_at": now_spawn,
+                "last_heartbeat_at": now_spawn, "last_log_bytes": log_size,
+                "failures": 0, "quota_retries": 0, "stale_restarts": 0, "wake_at": None, "active": True,
             }
             _write_slot_status(ws, slot_state, "running", now=now_spawn)
             slots.append(slot_state)
@@ -497,7 +665,7 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                         log_bytes = (s["ws"] / "agent.log").stat().st_size if (s["ws"] / "agent.log").exists() else 0
                         s.update(
                             proc=p, log=log, wake_at=None,
-                            started_at=now, last_heartbeat_at=now, last_log_bytes=log_bytes,
+                            started_at=now, last_activity_at=now, last_heartbeat_at=now, last_log_bytes=log_bytes,
                         )
                         _write_slot_status(s["ws"], s, "running", now=now)
                         info = f"provider={s['provider']}" + (f", model={s['model']}" if s.get("model") else "")
@@ -508,13 +676,24 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                 rc = s["proc"].poll()
                 if rc is None:
                     cur_bytes = (s["ws"] / "agent.log").stat().st_size if (s["ws"] / "agent.log").exists() else 0
-                    if cur_bytes == s["last_log_bytes"] and now - s["last_heartbeat_at"] >= 300.0:
-                        elapsed = now - (s.get("started_at") or now)
-                        print(f"[kiln] {s['name']} running ({elapsed:.0f}s elapsed, log silent at {cur_bytes}B)")
-                        s["last_heartbeat_at"] = now
-                    elif cur_bytes != s["last_log_bytes"]:
+                    if cur_bytes != s["last_log_bytes"]:
                         s["last_log_bytes"] = cur_bytes
+                        s["last_activity_at"] = now
                         s["last_heartbeat_at"] = now
+                    else:
+                        action = _check_and_handle_stale_slot(
+                            s,
+                            now,
+                            run.agents.stale_timeout_s,
+                            respawn_on_exit=run.agents.respawn_on_exit,
+                            deadline=deadline,
+                        )
+                        if action is not None:
+                            continue
+                        if now - s["last_heartbeat_at"] >= 300.0:
+                            elapsed = now - (s.get("started_at") or now)
+                            print(f"[kiln] {s['name']} running ({elapsed:.0f}s elapsed, log silent at {cur_bytes}B)")
+                            s["last_heartbeat_at"] = now
                     _write_slot_status(s["ws"], s, "running", now=now)
                     continue
                 s["log"].close()
@@ -559,7 +738,7 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
                 log_bytes = (s["ws"] / "agent.log").stat().st_size if (s["ws"] / "agent.log").exists() else 0
                 s.update(
                     proc=p, log=log, wake_at=None,
-                    started_at=now, last_heartbeat_at=now, last_log_bytes=log_bytes,
+                    started_at=now, last_activity_at=now, last_heartbeat_at=now, last_log_bytes=log_bytes,
                 )
                 _write_slot_status(s["ws"], s, "running", now=now, rc=rc)
                 info = f"provider={s['provider']}" + (f", model={s['model']}" if s.get("model") else "")
@@ -570,7 +749,7 @@ def launch(run: RunConfig, baseline: str = "candidates/baseline_forward.py") -> 
         for s in slots:
             p = s["proc"]
             if p is not None and p.poll() is None:
-                p.send_signal(signal.SIGTERM)
+                _terminate_slot_proc(p)
                 print(f"[kiln] stopped {s['name']}")
                 s["proc"] = None
                 _write_slot_status(s["ws"], s, "stopped")

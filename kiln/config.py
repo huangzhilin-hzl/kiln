@@ -341,6 +341,7 @@ class AgentConfig(BaseModel):
     slots: list[AgentSlotConfig] = Field(default_factory=list)
     budget_hours: float = 12.0
     respawn_on_exit: bool = True     # re-launch single-turn CLI agents (e.g. `codex exec`) until budget_hours
+    stale_timeout_s: float | None = Field(default=1800.0, gt=0.0)  # kill & respawn silent/hung agent after N seconds
     isolate_credentials: bool = True # strip host cluster/cloud creds (KUBECONFIG, SSH_AUTH_SOCK, etc.)
     synthesizer_slot: bool = False   # auto-assign the final slot as `synthesizer` when no integrator/synthesizer exists
 

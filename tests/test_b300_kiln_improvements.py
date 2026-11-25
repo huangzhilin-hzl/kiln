@@ -702,3 +702,135 @@ def test_idle_slow_tier_auto_promotes_top_unpromoted_fast_candidate(tmp_path: Pa
 
     # Second call while promoted is queued must NOT duplicate-promote
     assert mgr.maybe_auto_promote_idle_tier("slow", now_mono=now0 + 30.0) is None
+
+
+# --------------------------------------------------------------------------- Commit 8: Launcher doctor checks & stale-agent watchdog
+def test_doctor_validates_codex_model_cache_and_offline_paths(tmp_path: Path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import httpx
+    from kiln.agents.launcher import _validate_offline_model_paths, doctor_slots
+    from kiln.config import AgentConfig, AgentSlotConfig, EngineConfig
+
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/usr/bin/env python3\nimport sys\nprint('codex 0.1')\n", encoding="utf-8")
+    fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IXUSR)
+
+    cache_file = tmp_path / "models_cache.json"
+    cache_file.write_text(json.dumps({"models": [{"slug": "gpt-5.4"}, {"slug": "gpt-5.3-codex"}]}), encoding="utf-8")
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: SimpleNamespace(raise_for_status=lambda: None))
+    run_bad_model = RunConfig(
+        name="doc-codex",
+        workdir=str(tmp_path),
+        agents=AgentConfig(slots=[
+            AgentSlotConfig(provider="codex", command=f"{fake_codex} exec --model gpt-5.4 -", model="gpt-5.4"),
+            AgentSlotConfig(provider="codex", command=f"{fake_codex} exec --model gpt-6.2-sol -", model="gpt-6.2-sol"),
+        ]),
+    )
+    rep = doctor_slots(run_bad_model, server_url="http://127.0.0.1:18765", probe_cli=False, codex_models_cache=cache_file)
+    assert rep["ok"] is False
+    assert rep["slots"][0]["ok"] is True and rep["slots"][0]["model_cache_ok"] is True
+    assert rep["slots"][1]["ok"] is False and rep["slots"][1]["model_cache_ok"] is False
+    assert "gpt-6.2-sol" in (rep["slots"][1]["error"] or "")
+
+    # Offline / local path validation
+    run_missing_local = RunConfig(
+        name="doc-local",
+        engine=EngineConfig(kind="vllm_server", model="/nonexistent/local/model/dir"),
+    )
+    errs = _validate_offline_model_paths(run_missing_local, env={})
+    assert len(errs) == 1 and "does not exist" in errs[0]
+
+    run_offline_hub = RunConfig(
+        name="doc-offline",
+        engine=EngineConfig(kind="vllm_server", model="thinkingmachines/Inkling-2-Mini"),
+    )
+    errs_off = _validate_offline_model_paths(
+        run_offline_hub, env={"HF_HUB_OFFLINE": "1", "HF_HUB_CACHE": str(tmp_path / "empty_hf")}
+    )
+    assert len(errs_off) == 1 and "HF_HUB_OFFLINE" in errs_off[0]
+
+    cached_dir = tmp_path / "hf_ok" / "models--thinkingmachines--Inkling-2-Mini"
+    cached_dir.mkdir(parents=True)
+    assert _validate_offline_model_paths(
+        run_offline_hub, env={"HF_HUB_OFFLINE": "1", "HF_HUB_CACHE": str(tmp_path / "hf_ok")}
+    ) == []
+
+
+def test_stale_agent_watchdog_terminates_and_respawns_hung_slot(tmp_path: Path):
+    import json
+    from kiln.agents.launcher import _check_and_handle_stale_slot
+
+    class _HungProc:
+        def __init__(self, pid: int):
+            self.pid = pid
+            self.terminated = False
+            self._rc: int | None = None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self.terminated = True
+            self._rc = -15
+
+        def wait(self, timeout=None):
+            return self._rc
+
+        def kill(self):
+            self._rc = -9
+
+    ws = tmp_path / "agent_1"
+    ws.mkdir()
+    log_path = ws / "agent.log"
+    old_log = open(log_path, "ab")
+    old_proc = _HungProc(101)
+    new_proc = _HungProc(202)
+    spawned: list[str] = []
+
+    def fake_spawn(cmd, ws_arg, env, prompt_text):
+        spawned.append(prompt_text)
+        return new_proc, open(ws_arg / "agent.log", "ab")
+
+    slot = {
+        "name": "agent_1",
+        "ws": ws,
+        "cmd": ["codex", "exec", "-"],
+        "provider": "codex",
+        "model": "gpt-5.4",
+        "role": "explorer",
+        "env": {},
+        "prompt": "BASE_PROMPT",
+        "proc": old_proc,
+        "log": old_log,
+        "started_at": 1000.0,
+        "last_activity_at": 1000.0,
+        "last_heartbeat_at": 1000.0,
+        "last_log_bytes": 0,
+        "failures": 0,
+        "quota_retries": 0,
+        "stale_restarts": 0,
+        "wake_at": None,
+        "active": True,
+    }
+
+    # Not yet stale
+    assert _check_and_handle_stale_slot(
+        slot, now=1500.0, stale_timeout_s=1800.0, respawn_on_exit=True, deadline=9999.0, spawn_fn=fake_spawn
+    ) is None
+    assert not old_proc.terminated
+
+    # Past stale_timeout_s -> terminated and respawned
+    action = _check_and_handle_stale_slot(
+        slot, now=2900.0, stale_timeout_s=1800.0, respawn_on_exit=True, deadline=9999.0, spawn_fn=fake_spawn
+    )
+    assert action == "respawned"
+    assert old_proc.terminated is True
+    assert old_log.closed is True
+    assert slot["proc"] is new_proc
+    assert slot["stale_restarts"] == 1
+    assert len(spawned) == 1 and "Continuation" in spawned[0]
+    st = json.loads((ws / "status.json").read_text(encoding="utf-8"))
+    assert st["pid"] == 202 and st["stale_restarts"] == 1
+    slot["log"].close()

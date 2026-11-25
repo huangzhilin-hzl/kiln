@@ -436,7 +436,10 @@ def cmd_status(a):
 
 
 def cmd_leaderboard(a):
-    _print(http.get(f"{_url()}/leaderboard", params={"tier": a.tier, "k": a.k, "sort_by": a.sort}).json())
+    params = {"tier": a.tier, "k": a.k, "sort_by": a.sort}
+    if getattr(a, "pareto", False):
+        params["pareto"] = True
+    _print(http.get(f"{_url()}/leaderboard", params=params).json())
 
 
 def write_official_agentx_config(src_path: str | Path, out_path: str | Path, duration_s: int = 900) -> Path:
@@ -954,9 +957,12 @@ def main(argv=None):
     s = sp.add_parser("leaderboard"); s.add_argument("--tier", default="slow")
     s.add_argument("-k", type=int, default=10)
     s.add_argument("--sort", default="speedup",
-                   help="sort key: speedup, decode_tps, prefill_tps, ttft_s, decode_small, decode_mid, prefill_large, "
-                        "output_tput, active_decode_tps, itl_p50_ms, itl_p90_ms, interactivity_p90, "
-                        "spec_accept_length, spec_accept_rate, paired_speedup")
+                   help="sort key: speedup, decode_tps, prefill_tps, ttft_s, ttft_p50_ms, decode_small, decode_mid, "
+                        "prefill_large, output_tput, active_decode_tps, itl_p50_ms, itl_p90_ms, interactivity_p90, "
+                        "spec_accept_length, spec_accept_rate, spec_acc_per_draft, paired_speedup, "
+                        "paired_output_tps_speedup")
+    s.add_argument("--pareto", action="store_true",
+                   help="return only the multi-objective Pareto frontier (throughput, active_decode, ITL, TTFT)")
     s.set_defaults(f=cmd_leaderboard)
 
     s = sp.add_parser("promote", help="promote winning jobs to another tier or generate 900s official config")

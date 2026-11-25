@@ -327,9 +327,9 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
         return {"id": promoted.id, "tier": promoted.tier, "promoted_from": jid}
 
     @app.get("/leaderboard")
-    def leaderboard(tier: str = "slow", k: int = 10, sort_by: str = "speedup"):
+    def leaderboard(tier: str = "slow", k: int = 10, sort_by: str = "speedup", pareto: bool = False):
         try:
-            return mgr.leaderboard(tier, k, sort_by=sort_by)
+            return mgr.leaderboard(tier, k, sort_by=sort_by, pareto=pareto)
         except ValueError as e:
             raise HTTPException(400, str(e))
 

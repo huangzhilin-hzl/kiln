@@ -504,3 +504,98 @@ def test_certify_and_cascade_ast_invalidation_via_api(tmp_path: Path):
         assert client.get(f"/jobs/{j_sib}").json()["status"] == "invalidated"
         assert client.get(f"/jobs/{j_queued_slow}").json()["status"] == "cancelled"
         assert client.get(f"/jobs/{j_clean}").json()["status"] == "done"
+
+
+# --------------------------------------------------------------------------- Commit 6: Slow Pareto leaderboard & multi-metric sorting
+def test_leaderboard_pareto_frontier_and_extended_sort_keys(tmp_path: Path):
+    from fastapi.testclient import TestClient
+    from kiln.bench.traffic import synth_traffic
+    from kiln.config import EngineConfig, TierConfig
+    from kiln.server.app import create_app
+    from kiln.server.jobs import Job
+
+    traffic = tmp_path / "traffic.jsonl"
+    synth_traffic(str(traffic), n=2, isl=16, osl=8)
+    run = RunConfig(
+        name="pareto-lb-test",
+        engine=EngineConfig(kind="mock"),
+        tiers=[TierConfig(name="slow", repeats=1)],
+        traffic_file=str(traffic),
+        workdir=str(tmp_path / "runs"),
+    )
+    app = create_app(run, local_tiers=set())
+    mgr = app.state.mgr
+
+    def _add_slow_job(jid: str, speedup: float, extra: dict):
+        jdir = mgr.jobs_dir / jid
+        jdir.mkdir(parents=True, exist_ok=True)
+        cpath = jdir / "candidate.py"
+        cpath.write_text("def make_forward(m): return m.forward\n", encoding="utf-8")
+        job = Job(
+            id=jid,
+            agent="agent_1",
+            tier="slow",
+            note=jid,
+            candidate_path=str(cpath),
+            status="done",
+            speedup=speedup,
+            decode_tps=78000.0 * speedup,
+            token_match=1.0,
+            max_logit_abs_diff=0.0,
+            extra={
+                "metric": "agentx_total_tput_per_gpu",
+                "submission_valid": True,
+                "repeats": [{"total_tput_per_gpu": 78000.0 * speedup}],
+                "benchmark_duration_s": 900.0,
+                **extra,
+            },
+        )
+        mgr.jobs[jid] = job
+
+    # j_tput: best overall speedup/output_tput
+    _add_slow_job("j_tput", 1.0238, {
+        "output_tput": 676.2, "active_decode_tps": 845.0, "itl_p50_ms": 4.46, "itl_p90_ms": 8.65,
+        "interactivity_p90": 115.6, "ttft_p50_ms": 270.0, "spec_decode_acc_per_draft": 2.123,
+        "paired": {"decode_duration_speedup": 1.03, "paired_output_tps_speedup": 1.035},
+    })
+    # j_itl: Pareto winner on ITL p50 / p90 & active_decode_tps
+    _add_slow_job("j_itl", 1.0150, {
+        "output_tput": 668.0, "active_decode_tps": 867.2, "itl_p50_ms": 4.387, "itl_p90_ms": 8.414,
+        "interactivity_p90": 118.85, "ttft_p50_ms": 275.0, "spec_decode_acc_per_draft": 2.110,
+        "paired": {"decode_duration_speedup": 1.05, "paired_output_tps_speedup": 1.06},
+    })
+    # j_ttft: Pareto winner on TTFT p50
+    _add_slow_job("j_ttft", 1.0204, {
+        "output_tput": 672.0, "active_decode_tps": 840.0, "itl_p50_ms": 4.50, "itl_p90_ms": 8.70,
+        "interactivity_p90": 114.9, "ttft_p50_ms": 259.27, "spec_decode_acc_per_draft": 2.135,
+        "paired": {"decode_duration_speedup": 1.02, "paired_output_tps_speedup": 1.025},
+    })
+    # j_dominated: strictly worse than j_tput on EVERY objective
+    _add_slow_job("j_dominated", 1.0050, {
+        "output_tput": 650.0, "active_decode_tps": 820.0, "itl_p50_ms": 4.80, "itl_p90_ms": 9.10,
+        "interactivity_p90": 109.9, "ttft_p50_ms": 290.0, "spec_decode_acc_per_draft": 2.08,
+        "paired": {"decode_duration_speedup": 1.00, "paired_output_tps_speedup": 1.00},
+    })
+
+    with TestClient(app) as client:
+        by_ttft = client.get("/leaderboard", params={"tier": "slow", "sort_by": "ttft_p50_ms"}).json()
+        assert by_ttft[0]["id"] == "j_ttft"
+        assert by_ttft[0]["ttft_p50_ms"] == pytest.approx(259.27)
+        assert by_ttft[0]["benchmark_duration_s"] == pytest.approx(900.0)
+
+        by_spec = client.get("/leaderboard", params={"tier": "slow", "sort_by": "spec_acc_per_draft"}).json()
+        assert by_spec[0]["id"] == "j_ttft"
+        assert by_spec[0]["spec_decode_acc_per_draft"] == pytest.approx(2.135)
+
+        by_paired_out = client.get("/leaderboard", params={"tier": "slow", "sort_by": "paired_output_tps_speedup"}).json()
+        assert by_paired_out[0]["id"] == "j_itl"
+        assert by_paired_out[0]["paired_output_tps_speedup"] == pytest.approx(1.06)
+
+        pareto_rows = client.get("/leaderboard", params={"tier": "slow", "pareto": "true"}).json()
+        pareto_ids = {r["id"] for r in pareto_rows}
+        assert pareto_ids == {"j_tput", "j_itl", "j_ttft"}
+        assert "j_dominated" not in pareto_ids
+        best_map = {r["id"]: set(r["pareto_best_on"]) for r in pareto_rows}
+        assert "speedup" in best_map["j_tput"]
+        assert "itl_p50_ms" in best_map["j_itl"] and "active_decode_tps" in best_map["j_itl"]
+        assert "ttft_p50_ms" in best_map["j_ttft"]

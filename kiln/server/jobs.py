@@ -1654,6 +1654,7 @@ class JobManager:
         "decode_tps",
         "prefill_tps",
         "ttft_s",
+        "ttft_p50_ms",
         "decode_small",
         "decode_mid",
         "prefill_large",
@@ -1664,8 +1665,20 @@ class JobManager:
         "interactivity_p90",
         "spec_accept_length",
         "spec_accept_rate",
+        "spec_acc_per_draft",
         "paired_speedup",
+        "paired_output_tps_speedup",
     }
+
+    _PARETO_OBJECTIVES: tuple[tuple[str, bool], ...] = (
+        ("speedup", False),
+        ("active_decode_tps", False),
+        ("output_tput", False),
+        ("interactivity_p90", False),
+        ("itl_p50_ms", True),
+        ("itl_p90_ms", True),
+        ("ttft_p50_ms", True),
+    )
 
     @staticmethod
     def _leaderboard_metric(j: Job, key: str) -> float | None:
@@ -1683,6 +1696,18 @@ class JobManager:
         if key == "paired_speedup":
             paired = j.extra.get("paired") if isinstance(j.extra, dict) else None
             return paired.get("decode_duration_speedup") if isinstance(paired, dict) else None
+        if key == "paired_output_tps_speedup":
+            paired = j.extra.get("paired") if isinstance(j.extra, dict) else None
+            return paired.get("paired_output_tps_speedup") if isinstance(paired, dict) else None
+        if key == "spec_acc_per_draft":
+            ex = j.extra if isinstance(j.extra, dict) else {}
+            v = ex.get("spec_decode_acc_per_draft")
+            if isinstance(v, (int, float)):
+                return float(v)
+            ml = ex.get("spec_decode_mean_accept_len", ex.get("spec_accept_length"))
+            if isinstance(ml, (int, float)):
+                return max(0.0, float(ml) - 1.0)
+            return None
         val = j.extra.get(key) if isinstance(j.extra, dict) else None
         return float(val) if isinstance(val, (int, float)) else None
 
@@ -1703,10 +1728,15 @@ class JobManager:
             ("active_decode_tps", 2),
             ("itl_p50_ms", 3),
             ("itl_p90_ms", 3),
+            ("ttft_p50_ms", 3),
+            ("benchmark_duration_s", 2),
             ("interactivity_p90", 2),
             ("effective_concurrency", 3),
             ("spec_accept_length", 3),
             ("spec_accept_rate", 4),
+            ("spec_decode_acc_per_draft", 4),
+            ("spec_decode_mean_accept_len", 4),
+            ("num_preemptions", 1),
         ):
             val = ex.get(key)
             if isinstance(val, (int, float)):
@@ -1715,8 +1745,11 @@ class JobManager:
             if key in ex and ex[key] is not None:
                 row[key] = ex[key]
         paired = ex.get("paired")
-        if isinstance(paired, dict) and isinstance(paired.get("decode_duration_speedup"), (int, float)):
-            row["paired_decode_speedup"] = round(float(paired["decode_duration_speedup"]), 4)
+        if isinstance(paired, dict):
+            if isinstance(paired.get("decode_duration_speedup"), (int, float)):
+                row["paired_decode_speedup"] = round(float(paired["decode_duration_speedup"]), 4)
+            if isinstance(paired.get("paired_output_tps_speedup"), (int, float)):
+                row["paired_output_tps_speedup"] = round(float(paired["paired_output_tps_speedup"]), 4)
         bs = ex.get("bucket_speedups")
         if isinstance(bs, dict) and bs:
             row["bucket_speedups"] = {str(k): round(float(v), 4) for k, v in bs.items() if isinstance(v, (int, float))}
@@ -1791,12 +1824,85 @@ class JobManager:
                   and j.extra.get("repeats")))
         ]
 
-    def leaderboard(self, tier: str = "slow", k: int = 10, sort_by: str = "speedup") -> list[dict]:
+    @classmethod
+    def _pareto_frontier(cls, done: list[Job]) -> tuple[list[Job], dict[str, list[str]]]:
+        """Return non-dominated jobs across slow throughput/latency objectives and best-on labels."""
+        if not done:
+            return [], {}
+        vecs: dict[str, dict[str, float]] = {}
+        for j in done:
+            v: dict[str, float] = {}
+            for key, _asc in cls._PARETO_OBJECTIVES:
+                val = cls._leaderboard_metric(j, key)
+                if val is not None and math.isfinite(val):
+                    v[key] = float(val)
+            vecs[j.id] = v
+
+        # Identify which objectives each job leads (within 1e-9).
+        best_val: dict[str, float] = {}
+        for key, asc in cls._PARETO_OBJECTIVES:
+            vals = [vecs[j.id][key] for j in done if key in vecs[j.id]]
+            if vals:
+                best_val[key] = min(vals) if asc else max(vals)
+
+        frontier: list[Job] = []
+        best_on: dict[str, list[str]] = {}
+        for cand in done:
+            vc = vecs[cand.id]
+            dominated = False
+            for other in done:
+                if other.id == cand.id:
+                    continue
+                vo = vecs[other.id]
+                shared = [k for k in vc if k in vo]
+                if not shared:
+                    continue
+                all_ge = True
+                strictly_better = False
+                for key, asc in cls._PARETO_OBJECTIVES:
+                    if key not in vc or key not in vo:
+                        continue
+                    c_val, o_val = vc[key], vo[key]
+                    if asc:
+                        if o_val > c_val + 1e-12:
+                            all_ge = False
+                            break
+                        if o_val < c_val - 1e-12:
+                            strictly_better = True
+                    else:
+                        if o_val < c_val - 1e-12:
+                            all_ge = False
+                            break
+                        if o_val > c_val + 1e-12:
+                            strictly_better = True
+                if all_ge and strictly_better:
+                    dominated = True
+                    break
+            if not dominated:
+                frontier.append(cand)
+                wins = []
+                for key, asc in cls._PARETO_OBJECTIVES:
+                    if key in vc and key in best_val:
+                        if abs(vc[key] - best_val[key]) <= 1e-9:
+                            wins.append(key)
+                best_on[cand.id] = wins
+        return frontier, best_on
+
+    def leaderboard(
+        self,
+        tier: str = "slow",
+        k: int = 10,
+        sort_by: str = "speedup",
+        pareto: bool = False,
+    ) -> list[dict]:
         if sort_by not in self._LEADERBOARD_SORTS:
             raise ValueError(f"unsupported sort_by {sort_by!r}; choose from {sorted(self._LEADERBOARD_SORTS)}")
-        asc = sort_by in ("itl_p50_ms", "itl_p90_ms", "ttft_s")
+        asc = sort_by in ("itl_p50_ms", "itl_p90_ms", "ttft_s", "ttft_p50_ms")
         with self.lock:
             done = self._valid_done_jobs_locked(tier)
+            best_on: dict[str, list[str]] = {}
+            if pareto:
+                done, best_on = self._pareto_frontier(done)
 
             def _sort_key(j: Job) -> tuple[int, float]:
                 val = self._leaderboard_metric(j, sort_by)
@@ -1805,7 +1911,14 @@ class JobManager:
                 return (0, float(val) if asc else -float(val))
 
             done.sort(key=_sort_key)
-            return [self._leaderboard_row(j) for j in done[:k]]
+            rows = []
+            for j in done[:k]:
+                row = self._leaderboard_row(j)
+                if pareto:
+                    row["pareto"] = True
+                    row["pareto_best_on"] = best_on.get(j.id, [])
+                rows.append(row)
+            return rows
 
     @staticmethod
     def _parents_of(j: Job) -> list[str]:

@@ -342,3 +342,65 @@ def test_agentx_rolling_spec_collapse_watchdog_aborts_early(tmp_path: Path):
     assert elapsed < 3.0, f"expected early abort, took {elapsed:.2f}s"
     assert ei.value.snapshot["observed_acc_per_draft"] == pytest.approx(0.4, abs=1e-3)
     assert ei.value.snapshot["window_drafts"] == 100
+
+
+# --------------------------------------------------------------------------- Commit 4: Tunnel active health probe
+def test_tunnel_loop_restarts_wedged_port_forward_on_failed_probes():
+    from kiln.cli import run_tunnel_loop
+
+    class _FakeProc:
+        def __init__(self, idx: int):
+            self.idx = idx
+            self.terminated = False
+            self._rc: int | None = None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self.terminated = True
+            self._rc = -15
+
+        def wait(self, timeout=None):
+            return self._rc
+
+        def kill(self):
+            self._rc = -9
+
+    spawned: list[_FakeProc] = []
+    clock = {"t": 0.0}
+    probes = [True, False, False, False, True, False, False, False]
+    probe_idx = {"i": 0}
+
+    def fake_popen(cmd, env):
+        p = _FakeProc(len(spawned))
+        spawned.append(p)
+        return p
+
+    def fake_probe(port: int) -> bool:
+        assert port == 18766
+        i = probe_idx["i"]
+        probe_idx["i"] += 1
+        return probes[i] if i < len(probes) else False
+
+    def fake_sleep(dt: float):
+        clock["t"] += dt
+
+    restarts = run_tunnel_loop(
+        ["kubectl", "port-forward", "pod/x", "18766:18766"],
+        {},
+        local_port=18766,
+        reconnect_delay=1.0,
+        health_check=True,
+        health_interval=2.0,
+        health_failures=3,
+        startup_grace_s=1.0,
+        max_restarts=2,
+        popen_fn=fake_popen,
+        probe_fn=fake_probe,
+        sleep_fn=fake_sleep,
+        clock_fn=lambda: clock["t"],
+    )
+    assert restarts == 2
+    assert len(spawned) == 2
+    assert all(p.terminated for p in spawned), "both wedged port-forward processes must be terminated"

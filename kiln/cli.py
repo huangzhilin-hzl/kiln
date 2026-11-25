@@ -528,8 +528,117 @@ def tunnel_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def probe_tunnel_health(local_port: int, path: str = "/status", timeout_s: float = 3.0) -> bool:
+    """Return True if the forwarded local port responds over HTTP (200/401/403)."""
+    try:
+        r = httpx.get(
+            f"http://127.0.0.1:{local_port}{path}",
+            headers=auth_headers(),
+            trust_env=False,
+            timeout=timeout_s,
+        )
+        return r.status_code in (200, 401, 403)
+    except Exception:
+        return False
+
+
+def _stop_tunnel_proc(proc) -> None:
+    import subprocess as _subproc
+
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    try:
+        if isinstance(proc, _subproc.Popen):
+            from kiln.engine.base import shutdown_process_group
+            shutdown_process_group(proc, timeout=5.0)
+            return
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run_tunnel_loop(
+    cmd: list[str],
+    env: dict[str, str],
+    *,
+    local_port: int,
+    reconnect_delay: float = 3.0,
+    health_check: bool = True,
+    health_interval: float = 15.0,
+    health_failures: int = 3,
+    health_timeout: float = 3.0,
+    startup_grace_s: float = 5.0,
+    max_restarts: int | None = None,
+    popen_fn=None,
+    probe_fn=None,
+    sleep_fn=time.sleep,
+    clock_fn=time.monotonic,
+) -> int:
+    """Maintain a `kubectl port-forward` child, restarting on exit or consecutive failed `/status` probes."""
+    import subprocess as _subproc
+
+    spawn = popen_fn or (lambda c, env: _subproc.Popen(c, env=env, start_new_session=True))
+    probe = probe_fn or (lambda port: probe_tunnel_health(port, timeout_s=health_timeout))
+    restarts = 0
+    proc = None
+    try:
+        while True:
+            print(f"[kiln tunnel] starting {' '.join(cmd)}", flush=True)
+            proc = spawn(cmd, env=env)
+            started_at = clock_fn()
+            last_probe_at = started_at
+            consec_failures = 0
+            poll_slice = min(1.0, max(0.02, float(health_interval) / 4.0)) if health_check else 1.0
+
+            while True:
+                rc = proc.poll()
+                if rc is not None:
+                    print(f"[kiln tunnel] exited rc={rc}; reconnecting in {reconnect_delay}s", flush=True)
+                    break
+                now = clock_fn()
+                if (
+                    health_check
+                    and (now - started_at) >= startup_grace_s
+                    and (now - last_probe_at) >= health_interval
+                ):
+                    last_probe_at = now
+                    if probe(local_port):
+                        consec_failures = 0
+                    else:
+                        consec_failures += 1
+                        if consec_failures >= max(1, int(health_failures)):
+                            print(
+                                f"[kiln tunnel] /status probe failed {consec_failures}x on 127.0.0.1:{local_port}; "
+                                f"restarting wedged port-forward",
+                                flush=True,
+                            )
+                            _stop_tunnel_proc(proc)
+                            break
+                sleep_fn(poll_slice)
+
+            proc = None
+            restarts += 1
+            if max_restarts is not None and restarts >= max_restarts:
+                return restarts
+            sleep_fn(reconnect_delay)
+    except KeyboardInterrupt:
+        _stop_tunnel_proc(proc)
+        return restarts
+
+
 def cmd_tunnel(a):
-    import subprocess
     cmd = build_tunnel_command(
         pod=a.pod,
         namespace=a.namespace,
@@ -538,14 +647,16 @@ def cmd_tunnel(a):
         remote_port=a.remote_port,
     )
     env = tunnel_env()
-    try:
-        while True:
-            print(f"[kiln tunnel] starting {' '.join(cmd)}", flush=True)
-            proc = subprocess.run(cmd, env=env)
-            print(f"[kiln tunnel] exited rc={proc.returncode}; reconnecting in {a.reconnect_delay}s", flush=True)
-            time.sleep(a.reconnect_delay)
-    except KeyboardInterrupt:
-        pass
+    run_tunnel_loop(
+        cmd,
+        env,
+        local_port=a.local_port,
+        reconnect_delay=a.reconnect_delay,
+        health_check=not a.no_health_check,
+        health_interval=a.health_interval,
+        health_failures=a.health_failures,
+        health_timeout=a.health_timeout,
+    )
 
 
 def cmd_costmodel(a):
@@ -852,6 +963,14 @@ def main(argv=None):
     s.add_argument("--local-port", type=int, default=18765)
     s.add_argument("--remote-port", type=int, default=18765)
     s.add_argument("--reconnect-delay", type=float, default=3.0)
+    s.add_argument("--health-interval", type=float, default=15.0,
+                   help="seconds between active HTTP /status probes (default: 15)")
+    s.add_argument("--health-failures", type=int, default=3,
+                   help="consecutive failed /status probes before killing wedged port-forward (default: 3)")
+    s.add_argument("--health-timeout", type=float, default=3.0,
+                   help="timeout per /status health probe in seconds (default: 3)")
+    s.add_argument("--no-health-check", action="store_true",
+                   help="disable active HTTP /status health probing")
     s.set_defaults(f=cmd_tunnel)
 
     s = sp.add_parser("costmodel", help="rank colocated or PD-disaggregated (xPyD) parallelism configs")

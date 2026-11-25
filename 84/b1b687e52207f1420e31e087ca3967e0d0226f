@@ -1,0 +1,22 @@
+kiln/cli.py
+  h_7339bf36ecd0bc 410-429,939-942,944-951
+kiln/patches.py
+  h_7339bf36ecd0bc 5-6,340-383,401,693
+kiln/server/app.py
+  h_7339bf36ecd0bc 95-104,290-296,303-318
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 49,85-86,1240,1312-1448,1470-1501,1729-1731
+tests/test_b300_kiln_improvements.py
+  h_7339bf36ecd0bc 407-506
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "84b1b687e52207f1420e31e087ca3967e0d0226f",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

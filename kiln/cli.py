@@ -407,10 +407,26 @@ def cmd_cancel(a):
 
 
 def cmd_withdraw(a):
-    r = http.post(
-        f"{_url()}/jobs/{a.id}/invalidate",
-        json={"reason": a.reason, "cascade": not a.no_cascade},
-    )
+    payload: dict = {
+        "reason": a.reason,
+        "cascade": not a.no_cascade,
+        "cascade_ast": list(a.cascade_ast or []),
+        "cancel_queued": not a.no_cancel_queued,
+    }
+    r = http.post(f"{_url()}/jobs/{a.id}/invalidate", json=payload)
+    r.raise_for_status()
+    _print(r.json())
+
+
+def cmd_certify(a):
+    payload = {
+        "agent": _agent(a),
+        "patch": a.patch,
+        "func": a.func,
+        "scope": a.scope,
+        "note": a.note,
+    }
+    r = http.post(f"{_url()}/jobs/{a.id}/certify", json=payload)
     r.raise_for_status()
     _print(r.json())
 
@@ -920,7 +936,19 @@ def main(argv=None):
     s.add_argument("id")
     s.add_argument("--reason", default="Withdrawn")
     s.add_argument("--no-cascade", action="store_true", help="do not invalidate sibling jobs sharing source sha256")
+    s.add_argument("--cascade-ast", action="append", default=[],
+                   help="also invalidate/cancel jobs sharing this defective function AST (e.g. 'fn' or 'fn:<sha>')")
+    s.add_argument("--no-cancel-queued", action="store_true",
+                   help="with --cascade-ast, do not cancel queued jobs matching the defective AST")
     s.set_defaults(f=cmd_withdraw)
+    s = sp.add_parser("certify", help="attach a function/patch AST-bound audit certificate to a completed job")
+    s.add_argument("id")
+    s.add_argument("--patch", help="@kiln_patch name to bind the certificate to")
+    s.add_argument("--func", help="function name (or Class.method) to bind the certificate to")
+    s.add_argument("--scope", default="", help="verification scope summary (e.g. 'M=1..1024 all dims')")
+    s.add_argument("--note", default="", help="optional audit notes")
+    s.add_argument("--agent")
+    s.set_defaults(f=cmd_certify)
     s = sp.add_parser("status"); s.set_defaults(f=cmd_status)
 
     s = sp.add_parser("leaderboard"); s.add_argument("--tier", default="slow")

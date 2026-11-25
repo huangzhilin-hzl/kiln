@@ -92,6 +92,16 @@ class CompleteReq(BaseModel):
 class InvalidateReq(BaseModel):
     reason: str = ""
     cascade: bool = True
+    cascade_ast: list[str] = Field(default_factory=list)
+    cancel_queued: bool = True
+
+
+class CertifyReq(BaseModel):
+    agent: str
+    patch: str | None = None
+    func: str | None = None
+    scope: str = ""
+    note: str = ""
 
 
 class PromoteReq(BaseModel):
@@ -277,12 +287,34 @@ def create_app(run: RunConfig, local_tiers: set[str] | None = None) -> FastAPI:
     @app.post("/jobs/{jid}/invalidate")
     def invalidate_job(jid: str, req: InvalidateReq):
         try:
-            ids = mgr.invalidate_job(jid, reason=req.reason, cascade_sha256=req.cascade)
+            ids = mgr.invalidate_job(
+                jid,
+                reason=req.reason,
+                cascade_sha256=req.cascade,
+                cascade_ast=req.cascade_ast,
+                cancel_queued=req.cancel_queued,
+            )
         except KeyError:
             raise HTTPException(404, "no such job")
         except ValueError as e:
             raise HTTPException(409, str(e))
         return {"invalidated": ids}
+
+    @app.post("/jobs/{jid}/certify")
+    def certify_job(jid: str, req: CertifyReq):
+        try:
+            return mgr.certify_job(
+                jid,
+                agent=req.agent,
+                patch=req.patch,
+                func=req.func,
+                scope=req.scope,
+                note=req.note,
+            )
+        except KeyError:
+            raise HTTPException(404, "no such job")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
 
     @app.post("/jobs/{jid}/promote")
     def promote_job(jid: str, req: PromoteReq):

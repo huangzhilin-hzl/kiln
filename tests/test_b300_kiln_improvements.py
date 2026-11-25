@@ -404,3 +404,103 @@ def test_tunnel_loop_restarts_wedged_port_forward_on_failed_probes():
     assert restarts == 2
     assert len(spawned) == 2
     assert all(p.terminated for p in spawned), "both wedged port-forward processes must be terminated"
+
+
+# --------------------------------------------------------------------------- Commit 5: Function-level AST certification & --cascade-ast
+def test_extract_function_ast_hashes_is_docstring_invariant_and_body_sensitive():
+    from kiln.patches import extract_function_ast_hashes
+
+    src_a = textwrap.dedent("""\
+        def quant_kernel(x):
+            '''Docstring v1'''
+            return x * 2  # comment 1
+    """)
+    src_b = textwrap.dedent("""\
+        def quant_kernel(x):
+            '''Docstring v2 changed'''
+            return x * 2  # comment 2
+    """)
+    src_c = textwrap.dedent("""\
+        def quant_kernel(x):
+            return x * 3
+    """)
+    ha = extract_function_ast_hashes(src_a)
+    hb = extract_function_ast_hashes(src_b)
+    hc = extract_function_ast_hashes(src_c)
+    assert ha["quant_kernel"] == hb["quant_kernel"]
+    assert ha["quant_kernel"] != hc["quant_kernel"]
+
+
+def test_certify_and_cascade_ast_invalidation_via_api(tmp_path: Path):
+    import time
+    from fastapi.testclient import TestClient
+    from kiln.bench.traffic import synth_traffic
+    from kiln.config import EngineConfig, TierConfig
+    from kiln.server.app import create_app
+
+    traffic = tmp_path / "traffic.jsonl"
+    synth_traffic(str(traffic), n=4, isl=16, osl=8)
+    run = RunConfig(
+        name="ast-audit-test",
+        engine=EngineConfig(kind="mock"),
+        tiers=[TierConfig(name="fast", repeats=1), TierConfig(name="slow", repeats=1)],
+        traffic_file=str(traffic),
+        workdir=str(tmp_path / "runs"),
+    )
+    app = create_app(run, local_tiers={"fast"})
+
+    buggy_fn = "def bad_fp4_quant(x):\n    return x * 0.5\n"
+    fixed_fn = "def bad_fp4_quant(x):\n    return x * 1.0\n"
+    src_base = buggy_fn + "SPEEDUP = 1.10\ndef make_forward(model): return model.forward\n"
+    src_sibling = buggy_fn + "SPEEDUP = 1.15\ndef extra_win(): return 1\ndef make_forward(model): return model.forward\n"
+    src_clean = fixed_fn + "SPEEDUP = 1.08\ndef make_forward(model): return model.forward\n"
+
+    with TestClient(app) as client:
+        # Submit 3 jobs on fast and wait for completion
+        ids = []
+        for idx, src in enumerate((src_base, src_sibling, src_clean)):
+            r = client.post("/jobs", json={"agent": f"agent_{idx+1}", "tier": "fast", "source": src})
+            assert r.status_code == 200
+            ids.append(r.json()["id"])
+        j_base, j_sib, j_clean = ids
+
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            statuses = [client.get(f"/jobs/{jid}").json()["status"] for jid in ids]
+            if all(st == "done" for st in statuses):
+                break
+            time.sleep(0.05)
+        assert [client.get(f"/jobs/{jid}").json()["status"] for jid in ids] == ["done", "done", "done"]
+
+        # Queue a sibling job on slow (remote/unclaimed so it stays queued!)
+        r_q = client.post("/jobs", json={"agent": "agent_2", "tier": "slow", "source": src_sibling})
+        assert r_q.status_code == 200
+        j_queued_slow = r_q.json()["id"]
+
+        # Certify the clean job's function AST
+        rc = client.post(
+            f"/jobs/{j_clean}/certify",
+            json={"agent": "auditor_1", "func": "bad_fp4_quant", "scope": "M=1..1024", "note": "bit-exact"},
+        )
+        assert rc.status_code == 200
+        cert_data = rc.json()
+        assert cert_data["certificate"]["func"] == "bad_fp4_quant"
+        assert len(cert_data["certificate"]["ast_sha256"]) == 64
+
+        lb = client.get("/leaderboard", params={"tier": "fast"}).json()
+        clean_row = next(row for row in lb if row["id"] == j_clean)
+        assert clean_row["certified"] is True
+        assert clean_row["certified_count"] == 1
+
+        # Withdraw j_base with --cascade-ast bad_fp4_quant: must invalidate j_sib & cancel j_queued_slow, sparing j_clean!
+        ri = client.post(
+            f"/jobs/{j_base}/invalidate",
+            json={"reason": "bad_fp4_quant drops upper bits", "cascade": True, "cascade_ast": ["bad_fp4_quant"]},
+        )
+        assert ri.status_code == 200
+        inv_ids = set(ri.json()["invalidated"])
+        assert {j_base, j_sib, j_queued_slow}.issubset(inv_ids)
+        assert j_clean not in inv_ids
+        assert client.get(f"/jobs/{j_sib}").json()["status"] == "invalidated"
+        assert client.get(f"/jobs/{j_queued_slow}").json()["status"] == "cancelled"
+        assert client.get(f"/jobs/{j_clean}").json()["status"] == "done"

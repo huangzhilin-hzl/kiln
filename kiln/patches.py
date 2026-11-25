@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ast
+import copy
+import hashlib
 import math
 import os
 import re
@@ -335,6 +337,50 @@ def _target_names(target: ast.AST) -> list[str]:
     return []
 
 
+def _strip_docstring_from_body(body: list[ast.stmt]) -> list[ast.stmt]:
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:]
+    return body
+
+
+def _normalized_func_ast_sha256(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """Hash a function AST ignoring line numbers, formatting, comments, and leading docstrings."""
+    cloned = copy.deepcopy(node)
+    cloned.body = _strip_docstring_from_body(list(cloned.body))
+    dumped = ast.dump(cloned, include_attributes=False)
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+
+def extract_function_ast_hashes(source: str) -> dict[str, str]:
+    """Return `{func_or_patch_key: sha256}` for top-level functions, class methods, and `@kiln_patch` targets."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    out: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            digest = _normalized_func_ast_sha256(stmt)
+            out[stmt.name] = digest
+            for dec in stmt.decorator_list:
+                call = _is_kiln_patch_decorator(dec)
+                if call is not None:
+                    pinfo = _extract_decorator_patch(call)
+                    if pinfo.get("name"):
+                        out[f"patch:{pinfo['name']}"] = digest
+        elif isinstance(stmt, ast.ClassDef):
+            for child in stmt.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out[f"{stmt.name}.{child.name}"] = _normalized_func_ast_sha256(child)
+    return out
+
+
 def inspect_candidate_source(source: str) -> dict[str, Any]:
     """Statically parse candidate source for tags, parent IDs, regimes, patches, targets, phases, and build triggers."""
     try:
@@ -352,6 +398,7 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
             "build_triggers": [],
             "patches": [],
             "targets": [],
+            "func_ast_hashes": {},
             "mock_speedup": None,
             "mock_prefill_speedup": None,
             "mock_bucket_speedups": {},
@@ -643,6 +690,7 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
         "build_triggers": build_triggers,
         "patches": patches,
         "targets": targets,
+        "func_ast_hashes": extract_function_ast_hashes(source),
         "mock_speedup": mock_speedup,
         "mock_prefill_speedup": mock_prefill_speedup,
         "mock_bucket_speedups": mock_bucket_speedups,

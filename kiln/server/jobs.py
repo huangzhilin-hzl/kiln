@@ -46,6 +46,7 @@ from kiln.patches import (
     compose_candidates,
     compose_pd_pair,
     detect_candidate_conflicts,
+    extract_function_ast_hashes,
     inspect_candidate_source,
 )
 
@@ -81,6 +82,8 @@ class Job:
     parent_id: str | None = None
     parent_ids: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    func_ast_hashes: dict[str, str] = field(default_factory=dict)
+    certificates: list[dict] = field(default_factory=list)
     force_trace: bool = False
     worker_id: str | None = None
     attempt_id: str | None = None
@@ -1234,6 +1237,7 @@ class JobManager:
                 parent_id=resolved_parent_id,
                 parent_ids=merged_parents,
                 tags=merged_tags,
+                func_ast_hashes=dict(inspected.get("func_ast_hashes") or {}),
                 force_trace=force_trace,
                 extra=({"superseded": superseded_ids} if superseded_ids else {}),
             )
@@ -1305,7 +1309,143 @@ class JobManager:
         with self.lock:
             self._maybe_cascade_invalidate_locked(job)
 
-    def invalidate_job(self, jid: str, reason: str = "", cascade_sha256: bool = True) -> list[str]:
+    def _job_func_ast_hashes_locked(self, job: Job) -> dict[str, str]:
+        if job.func_ast_hashes:
+            return job.func_ast_hashes
+        p = Path(job.candidate_path)
+        if p.is_file():
+            try:
+                job.func_ast_hashes = extract_function_ast_hashes(p.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+        return job.func_ast_hashes
+
+    def certify_job(
+        self,
+        jid: str,
+        *,
+        agent: str,
+        patch: str | None = None,
+        func: str | None = None,
+        scope: str = "",
+        note: str = "",
+    ) -> dict:
+        """Bind a structured audit certificate on `jid` to a normalized function/patch AST SHA-256."""
+        with self.lock:
+            job = self.jobs[jid]
+            if job.status != "done":
+                raise ValueError(f"Cannot certify {job.status} job {jid}; job must have status 'done'")
+            hashes = self._job_func_ast_hashes_locked(job)
+            target_func: str
+            ast_sha: str | None
+            if func:
+                if func not in hashes:
+                    raise ValueError(
+                        f"Function {func!r} not found in job {jid}; available: {sorted(hashes)}"
+                    )
+                target_func = func
+                ast_sha = hashes[func]
+            elif patch:
+                patch_key = f"patch:{patch}"
+                if patch_key in hashes:
+                    target_func = patch_key
+                    ast_sha = hashes[patch_key]
+                elif patch in hashes:
+                    target_func = patch
+                    ast_sha = hashes[patch]
+                else:
+                    raise ValueError(
+                        f"Patch {patch!r} not found in job {jid}; available: {sorted(hashes)}"
+                    )
+            else:
+                target_func = "source"
+                ast_sha = job.source_sha256
+
+            clean_scope = scope.strip()
+            clean_note = note.strip()
+            for existing in job.certificates:
+                if (
+                    existing.get("agent") == agent
+                    and existing.get("func") == target_func
+                    and existing.get("ast_sha256") == ast_sha
+                    and existing.get("scope", "") == clean_scope
+                ):
+                    return {
+                        "id": job.id,
+                        "certificate": existing,
+                        "certificates": list(job.certificates),
+                    }
+
+            cert = {
+                "agent": agent,
+                "patch": patch,
+                "func": target_func,
+                "ast_sha256": ast_sha,
+                "source_sha256": job.source_sha256,
+                "scope": clean_scope,
+                "note": clean_note,
+                "certified_at": time.time(),
+            }
+            job.certificates.append(cert)
+            worker = self.tiers.get(job.tier)
+            if worker is not None:
+                worker._save(job)
+            return {"id": job.id, "certificate": cert, "certificates": list(job.certificates)}
+
+    def _invalidate_matching_ast_locked(
+        self,
+        specs: list[tuple[str, str]],
+        exclude_id: str,
+        reason: str,
+        *,
+        cancel_queued: bool = True,
+    ) -> list[str]:
+        changed: list[str] = []
+        now = time.time()
+        for other in self.jobs.values():
+            if other.id == exclude_id:
+                continue
+            if other.status not in ("done", "queued"):
+                continue
+            if other.status == "queued" and not cancel_queued:
+                continue
+            other_hashes = self._job_func_ast_hashes_locked(other)
+            if not other_hashes:
+                continue
+            matched_spec: str | None = None
+            for fname, target_sha in specs:
+                cand_sha = other_hashes.get(fname) or other_hashes.get(f"patch:{fname}")
+                if not cand_sha:
+                    continue
+                if cand_sha == target_sha or (len(target_sha) >= 8 and cand_sha.startswith(target_sha)):
+                    matched_spec = f"{fname}:{cand_sha[:12]}"
+                    break
+            if matched_spec is None:
+                continue
+            worker = self.tiers.get(other.tier)
+            if other.status == "queued":
+                other.status = "cancelled"
+                other.finished_at = now
+                other.invalidated_reason = f"{reason} (matched AST {matched_spec})"
+                if worker is not None:
+                    worker.cancel_prebuild(other.id)
+                    worker._save(other)
+            else:
+                other.status = "invalidated"
+                other.invalidated_reason = f"{reason} (matched AST {matched_spec})"
+                if worker is not None:
+                    worker._save(other)
+            changed.append(other.id)
+        return changed
+
+    def invalidate_job(
+        self,
+        jid: str,
+        reason: str = "",
+        cascade_sha256: bool = True,
+        cascade_ast: list[str] | None = None,
+        cancel_queued: bool = True,
+    ) -> list[str]:
         with self.lock:
             job = self.jobs[jid]
             if job.status in ("queued", "running"):
@@ -1327,6 +1467,38 @@ class JobManager:
                         reason.strip() or f"Cascaded from withdrawn job {jid}",
                     )
                 )
+            if cascade_ast:
+                src_hashes = self._job_func_ast_hashes_locked(job)
+                parsed_specs: list[tuple[str, str]] = []
+                for raw in cascade_ast:
+                    spec = str(raw).strip()
+                    if not spec:
+                        continue
+                    if ":" in spec and not spec.startswith("patch:"):
+                        fname, sha_part = spec.rsplit(":", 1)
+                    elif spec.startswith("patch:") and spec.count(":") >= 2:
+                        fname, sha_part = spec.rsplit(":", 1)
+                    else:
+                        fname = spec
+                        sha_part = src_hashes.get(fname) or src_hashes.get(f"patch:{fname}") or ""
+                    fname = fname.strip()
+                    sha_part = sha_part.strip()
+                    if not fname or not sha_part:
+                        raise ValueError(
+                            f"Cannot resolve cascade_ast spec {spec!r} against job {jid}; "
+                            f"available functions: {sorted(src_hashes)}"
+                        )
+                    parsed_specs.append((fname, sha_part))
+                if parsed_specs:
+                    ast_changed = self._invalidate_matching_ast_locked(
+                        parsed_specs,
+                        jid,
+                        reason.strip() or f"AST-cascaded from withdrawn job {jid}",
+                        cancel_queued=cancel_queued,
+                    )
+                    for cid in ast_changed:
+                        if cid not in changed:
+                            changed.append(cid)
             return changed
 
     # ------------------------------------------------------------------ remote node workers
@@ -1554,6 +1726,9 @@ class JobManager:
         scr = ex.get("screening")
         if isinstance(scr, dict) and scr.get("stage") is not None:
             row["screen_stage"] = scr["stage"]
+        if j.certificates:
+            row["certified"] = True
+            row["certified_count"] = len(j.certificates)
         return row
 
     @classmethod

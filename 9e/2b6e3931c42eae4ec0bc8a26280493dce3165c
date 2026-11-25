@@ -1,0 +1,22 @@
+kiln/bench/agentx.py
+  h_7339bf36ecd0bc 20,22,28,31,166-169,182-189,206-215,258-410,422,438-445,546-555,560-561,565-609,629-641,643-699,703-712
+kiln/engine/base.py
+  h_7339bf36ecd0bc 194-200
+kiln/engine/vllm_server.py
+  h_7339bf36ecd0bc 25-30,82,218,227-234,237-242,335,339-350,356-362,369-370
+kiln/server/jobs.py
+  h_7339bf36ecd0bc 25,916-926
+tests/test_b300_kiln_improvements.py
+  h_7339bf36ecd0bc 246-344
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9e2b6e3931c42eae4ec0bc8a26280493dce3165c",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

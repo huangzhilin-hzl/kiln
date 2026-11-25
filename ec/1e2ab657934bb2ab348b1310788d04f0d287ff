@@ -1,0 +1,18 @@
+kiln/agents/launcher.py
+  h_7339bf36ecd0bc 17,21,251-252,260-326,332,334,353-355,373,376-381,384,440,448,459-460,465-486,493-494,497-498,511-569,638-640,668,679,681,683-696,741,752
+kiln/config.py
+  h_7339bf36ecd0bc 344
+tests/test_b300_kiln_improvements.py
+  h_7339bf36ecd0bc 705-836
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ec1e2ab657934bb2ab348b1310788d04f0d287ff",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}

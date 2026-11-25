@@ -10,6 +10,7 @@ import abc
 import math
 import os
 import signal
+import statistics
 import subprocess
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -84,6 +85,20 @@ class MeasureResult:
             return 0.0
         mean = sum(r) / len(r)
         return 100.0 * (max(r) - min(r)) / mean
+
+
+def split_warmup_steady_runs(runs: list[float]) -> dict[str, float]:
+    """Separate repeat-0 cold/JIT throughput from steady-state median (`runs[1:]`)."""
+    vals = [float(v) for v in runs if isinstance(v, (int, float)) and math.isfinite(v) and v > 0]
+    if not vals:
+        return {}
+    out: dict[str, float] = {"cold_repeat_tps": round(vals[0], 4)}
+    if len(vals) >= 2:
+        steady = float(statistics.median(vals[1:]))
+        out["steady_decode_tps"] = round(steady, 4)
+        if steady > 0:
+            out["warmup_gap_pct"] = round(100.0 * (steady - vals[0]) / steady, 2)
+    return out
 
 
 def bucket_tps_for_requests(

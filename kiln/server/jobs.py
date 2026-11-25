@@ -34,6 +34,7 @@ from kiln.engine.base import (
     evaluating_phase,
     replay_itl_metrics,
     shutdown_process_group,
+    split_warmup_steady_runs,
 )
 from kiln.engine.prebuild import PrebuildResult, prebuild_candidate
 from kiln.engine.vllm_profiler import (
@@ -194,10 +195,12 @@ class SharedEngineAdapter(Engine):
 class TierWorker:
     def __init__(self, run: RunConfig, tier: TierConfig, requests: list[Request], jobs_dir: Path,
                  local: bool = True, on_job_finished: Callable[[Job], None] | None = None,
-                 screen_threshold_fn: Callable[[], float] | None = None):
+                 screen_threshold_fn: Callable[[], float] | None = None,
+                 on_idle_check: Callable[[], None] | None = None):
         self.run, self.tier, self.jobs_dir, self.local = run, tier, jobs_dir, local
         self.on_job_finished = on_job_finished
         self.screen_threshold_fn = screen_threshold_fn
+        self.on_idle_check = on_idle_check
         self.requests = requests[: tier.max_requests] if tier.max_requests else requests
         self.q: queue.Queue[Job | None] = queue.Queue()
         self.stop_requested = threading.Event()
@@ -337,6 +340,8 @@ class TierWorker:
         self.baseline_prefill_tps = base.prefill_tps
         self.baseline_ttft_s = base.ttft_s
         self.baseline_extra = dict(base.extra or {})
+        if self.tier.agentx is None and base.runs_decode_tps:
+            self.baseline_extra.update(split_warmup_steady_runs(base.runs_decode_tps))
         self.baseline_bucket_tps = {
             str(k): float(v)
             for k, v in (self.baseline_extra.get("bucket_tps") or {}).items()
@@ -429,13 +434,27 @@ class TierWorker:
         _run_with_timeout(fn, timeout_s, f"{self.tier.name} ensure_baseline")
 
     def _idle_rebuild_timeout(self) -> float | None:
+        timeouts: list[float] = []
         delay = self.tier.idle_baseline_rebuild_s
-        if delay is None or not self.ready.is_set() or not self._engine_needs_baseline_rebuild():
-            return None
-        if self._any_shared_queued():
-            return None
-        elapsed = time.monotonic() - self._root_worker._last_job_finished_mono
-        return max(0.01, float(delay) - elapsed)
+        if (
+            delay is not None
+            and self.ready.is_set()
+            and self._engine_needs_baseline_rebuild()
+            and not self._any_shared_queued()
+        ):
+            elapsed = time.monotonic() - self._root_worker._last_job_finished_mono
+            timeouts.append(max(0.01, float(delay) - elapsed))
+        ap_delay = self.tier.idle_auto_promote_after_s
+        if (
+            self.on_idle_check is not None
+            and self.tier.idle_auto_promote_from
+            and ap_delay is not None
+            and self.ready.is_set()
+            and not self._has_queued_jobs()
+        ):
+            elapsed_ap = time.monotonic() - self._last_job_finished_mono
+            timeouts.append(max(0.05, float(ap_delay) - elapsed_ap))
+        return min(timeouts) if timeouts else None
 
     def _maybe_rebuild_idle_baseline(self) -> bool:
         delay = self.tier.idle_baseline_rebuild_s
@@ -576,6 +595,11 @@ class TierWorker:
                 job = self.q.get(timeout=idle_wait)
             except queue.Empty:
                 self._maybe_rebuild_idle_baseline()
+                if self.on_idle_check is not None:
+                    try:
+                        self.on_idle_check()
+                    except Exception as exc:
+                        print(f"[kiln] {self.tier.name}: idle auto-promote check failed ({exc})")
                 continue
             if job is None:
                 return
@@ -944,9 +968,21 @@ class TierWorker:
                 if bucket_speedups:
                     extra["bucket_speedups"] = bucket_speedups
 
+            if self.tier.agentx is None and m.runs_decode_tps:
+                ws = split_warmup_steady_runs(m.runs_decode_tps)
+                extra.update(ws)
+                base_steady = self.baseline_extra.get("steady_decode_tps")
+                cand_steady = ws.get("steady_decode_tps")
+                if isinstance(base_steady, (int, float)) and base_steady > 0 and isinstance(cand_steady, (int, float)):
+                    extra["steady_speedup"] = round(float(cand_steady) / float(base_steady), 4)
             cand_trace = TraceAnalysis.from_dict(m.trace_analysis) if m.trace_analysis else None
             if cand_trace is not None:
-                extra["trace_diff"] = diff_traces(cand_trace, self.baseline_trace)
+                td = diff_traces(cand_trace, self.baseline_trace)
+                extra["trace_diff"] = td
+                if td.get("cand_union_busy_ms") is not None:
+                    extra["union_busy_ms"] = td["cand_union_busy_ms"]
+                if td.get("delta_bubble_pct") is not None:
+                    extra["bubble_delta_pct"] = td["delta_bubble_pct"]
             rf = compute_roofline_attribution(
                 cand_trace,
                 self.hw_profile,
@@ -1063,6 +1099,7 @@ class JobManager:
                 local=(t.name in active),
                 on_job_finished=self._on_job_finished,
                 screen_threshold_fn=(lambda name=t.name: self._screen_threshold(name)),
+                on_idle_check=(lambda name=t.name: self.maybe_auto_promote_idle_tier(name)),
             )
             for t in run.tiers
         }
@@ -1231,6 +1268,12 @@ class JobManager:
             d.mkdir(parents=True)
             path = d / "candidate.py"
             path.write_text(source)
+            init_extra: dict = {}
+            if superseded_ids:
+                init_extra["superseded"] = superseded_ids
+            src_warnings = list(inspected.get("warnings") or ())
+            if src_warnings:
+                init_extra["source_warnings"] = src_warnings
             job = Job(
                 id=jid, agent=agent, tier=tier, note=note,
                 candidate_path=str(path), source_sha256=src_sha,
@@ -1239,7 +1282,7 @@ class JobManager:
                 tags=merged_tags,
                 func_ast_hashes=dict(inspected.get("func_ast_hashes") or {}),
                 force_trace=force_trace,
-                extra=({"superseded": superseded_ids} if superseded_ids else {}),
+                extra=init_extra,
             )
             self.tiers[tier].submit(job)
             self.jobs[jid] = job
@@ -1586,7 +1629,7 @@ class JobManager:
                 except queue.Empty:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        return None
+                        break
                     self.lock.wait(timeout=remaining)
                 else:
                     if job.status != "queued":
@@ -1595,15 +1638,24 @@ class JobManager:
                     job.worker_id = worker_id
                     job.attempt_id = uuid.uuid4().hex
                     break
-            job.lease_expires_at = time.time() + REMOTE_LEASE_S
-            worker._save(job)
-            return {
-                "id": job.id, "agent": job.agent, "note": job.note,
-                "attempt_id": job.attempt_id,
-                "force_trace": job.force_trace,
-                "screen_threshold": self._screen_threshold_locked(tier),
-                "source": Path(job.candidate_path).read_text(),
-            }
+            else:
+                return None
+            if job is None:
+                pass
+            else:
+                job.lease_expires_at = time.time() + REMOTE_LEASE_S
+                worker._save(job)
+                return {
+                    "id": job.id, "agent": job.agent, "note": job.note,
+                    "attempt_id": job.attempt_id,
+                    "force_trace": job.force_trace,
+                    "screen_threshold": self._screen_threshold_locked(tier),
+                    "source": Path(job.candidate_path).read_text(),
+                }
+        # Remote tier was idle across the poll window; trigger optional idle auto-promotion outside the lock.
+        if worker.tier.idle_auto_promote_from and worker.tier.idle_auto_promote_after_s is not None:
+            self.maybe_auto_promote_idle_tier(tier)
+        return None
 
     def complete_remote(self, tier: str, data: dict) -> None:
         worker = self.tiers[tier]
@@ -1630,11 +1682,67 @@ class JobManager:
             worker._save(result)
             job.__dict__.update(result.__dict__)
             worker.durations.append(job.finished_at - job.started_at)
+            worker._last_job_finished_mono = time.monotonic()
             if isinstance(data.get("baseline_tps"), (int, float)) and data["baseline_tps"] > 0:
                 worker.baseline_tps = float(data["baseline_tps"])
             if data.get("crashes") is not None:
                 worker.crashes = data["crashes"]
             self._maybe_cascade_invalidate_locked(job)
+
+    def maybe_auto_promote_idle_tier(
+        self, target_tier: str, *, now_mono: float | None = None
+    ) -> Job | None:
+        """Promote top unpromoted clean candidate from `idle_auto_promote_from` when `target_tier` sits idle."""
+        worker = self.tiers.get(target_tier)
+        if worker is None:
+            return None
+        cfg = worker.tier
+        src_tier = cfg.idle_auto_promote_from
+        delay_s = cfg.idle_auto_promote_after_s
+        if not src_tier or delay_s is None or src_tier not in self.tiers or src_tier == target_tier:
+            return None
+        now = time.monotonic() if now_mono is None else float(now_mono)
+        pick_id: str | None = None
+        pick_note: str = ""
+        with self.lock:
+            if any(
+                j.tier == target_tier and j.status in ("queued", "running")
+                for j in self.jobs.values()
+            ):
+                return None
+            if (now - worker._last_job_finished_mono) < float(delay_s):
+                return None
+            seen_shas = {
+                j.source_sha256
+                for j in self.jobs.values()
+                if j.tier == target_tier and j.status != "cancelled" and j.source_sha256
+            }
+            seen_parents = {
+                pid
+                for j in self.jobs.values()
+                if j.tier == target_tier and j.status != "cancelled"
+                for pid in self._parents_of(j)
+            }
+            pool = [
+                j for j in self._valid_done_jobs_locked(src_tier)
+                if j.speedup is not None and math.isfinite(j.speedup) and j.speedup > 0
+                and (not cfg.idle_auto_promote_require_certified or bool(j.certificates))
+                and j.id not in seen_parents
+                and (not j.source_sha256 or j.source_sha256 not in seen_shas)
+            ]
+            if not pool:
+                return None
+            pool.sort(key=lambda j: (float(j.speedup), j.submitted_at), reverse=True)
+            best = pool[0]
+            pick_id = best.id
+            pick_note = f"Auto-promoted idle {target_tier} from {src_tier} {best.id}: {best.note}".strip()
+        if pick_id is None:
+            return None
+        promoted = self.promote_job(pick_id, target_tier=target_tier, agent="auto_promoter", note=pick_note)
+        with self.lock:
+            promoted.extra = {**(promoted.extra or {}), "auto_promoted_from": pick_id}
+            worker._save(promoted)
+        return promoted
 
     def promote_job(
         self, jid: str, target_tier: str = "slow", agent: str | None = None, note: str = ""
@@ -1737,6 +1845,12 @@ class JobManager:
             ("spec_decode_acc_per_draft", 4),
             ("spec_decode_mean_accept_len", 4),
             ("num_preemptions", 1),
+            ("cold_repeat_tps", 2),
+            ("steady_decode_tps", 2),
+            ("steady_speedup", 4),
+            ("warmup_gap_pct", 2),
+            ("union_busy_ms", 3),
+            ("bubble_delta_pct", 2),
         ):
             val = ex.get(key)
             if isinstance(val, (int, float)):

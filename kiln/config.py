@@ -135,6 +135,9 @@ class TierConfig(BaseModel):
     prebuild_timeout_s: float = Field(default=300.0, gt=0.0)
     lazy_teardown: bool = True
     idle_baseline_rebuild_s: float | None = Field(default=30.0, ge=0.0)
+    idle_auto_promote_from: str | None = None
+    idle_auto_promote_after_s: float | None = Field(default=None, gt=0.0)
+    idle_auto_promote_require_certified: bool = False
 
     @model_validator(mode="after")
     def _validate_screening(self) -> "TierConfig":

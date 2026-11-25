@@ -119,6 +119,9 @@ class HotReloadExt:
         role = normalize_pd_role(pd_role if pd_role is not None else os.environ.get("KILN_PD_ROLE"))
         p = Path(path)
         source = p.read_text(encoding="utf-8") if p.is_file() else None
+        if source:
+            for warn in inspect_candidate_source(source).get("warnings") or ():
+                print(f"[kiln] WARNING {p.name}: {warn}", file=sys.stderr)
         skip_rebuild = self._kiln_can_skip_graph_rebuild(source, role)
         if skip_rebuild and not self._kiln_baseline_graphs_valid:
             self._kiln_rebuild_baseline()

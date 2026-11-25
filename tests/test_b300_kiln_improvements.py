@@ -599,3 +599,106 @@ def test_leaderboard_pareto_frontier_and_extended_sort_keys(tmp_path: Path):
         assert "speedup" in best_map["j_tput"]
         assert "itl_p50_ms" in best_map["j_itl"] and "active_decode_tps" in best_map["j_itl"]
         assert "ttft_p50_ms" in best_map["j_ttft"]
+
+
+# --------------------------------------------------------------------------- Commit 7: Profiler union_busy, warmup/steady split, UUID warning, idle auto-promote
+def test_profiler_diff_exposes_union_busy_and_bubble_delta():
+    from kiln.engine.vllm_profiler import analyze_trace_events, diff_traces, format_trace_report
+
+    # Two overlapped streams: sum = 2000us (1000+1000), union busy = 1500us (0..1500), span = 2000us -> bubble = 25%
+    base_events = [
+        {"ph": "X", "cat": "kernel", "name": "k_a", "ts": 0.0, "dur": 1000.0, "tid": 1},
+        {"ph": "X", "cat": "kernel", "name": "k_b", "ts": 500.0, "dur": 1000.0, "tid": 2},
+        {"ph": "X", "cat": "kernel", "name": "k_c", "ts": 1900.0, "dur": 100.0, "tid": 1},
+    ]
+    cand_events = [
+        {"ph": "X", "cat": "kernel", "name": "k_a", "ts": 0.0, "dur": 800.0, "tid": 1},
+        {"ph": "X", "cat": "kernel", "name": "k_b", "ts": 400.0, "dur": 800.0, "tid": 2},
+        {"ph": "X", "cat": "kernel", "name": "k_c", "ts": 1300.0, "dur": 100.0, "tid": 1},
+    ]
+    base_tr = analyze_trace_events(base_events, trace_path="base.json")
+    cand_tr = analyze_trace_events(cand_events, trace_path="cand.json")
+    td = diff_traces(cand_tr, base_tr)
+    assert td["base_union_busy_ms"] == pytest.approx(1.6)
+    assert td["cand_union_busy_ms"] == pytest.approx(1.3)
+    assert td["delta_union_busy_ms"] == pytest.approx(-0.3)
+    assert td["union_busy_speedup"] == pytest.approx(1.6 / 1.3, rel=1e-3)
+    assert td["delta_bubble_pct"] < 0
+    rep = format_trace_report(cand_tr, base_tr)
+    assert "union_busy=" in rep and "bubble_delta=" in rep
+
+
+def test_warmup_vs_steady_split_and_dynamic_torch_library_warning(tmp_path: Path):
+    from kiln.engine.base import split_warmup_steady_runs
+    from kiln.patches import detect_dynamic_torch_library_namespaces, inspect_candidate_source
+
+    ws = split_warmup_steady_runs([2200.0, 2500.0, 2520.0])
+    assert ws["cold_repeat_tps"] == pytest.approx(2200.0)
+    assert ws["steady_decode_tps"] == pytest.approx(2510.0)
+    assert ws["warmup_gap_pct"] == pytest.approx(100.0 * (2510.0 - 2200.0) / 2510.0, abs=0.05)
+
+    bad_src = textwrap.dedent("""\
+        import uuid, torch
+        _lib = torch.library.Library(f"kiln_{uuid.uuid4().hex}", "DEF")
+        def make_forward(m): return m.forward
+    """)
+    good_src = textwrap.dedent("""\
+        import torch
+        _lib = torch.library.Library("kiln_static_ops", "DEF")
+        def make_forward(m): return m.forward
+    """)
+    warns_bad = detect_dynamic_torch_library_namespaces(bad_src)
+    assert len(warns_bad) == 1 and "FXGraphCache" in warns_bad[0]
+    assert inspect_candidate_source(bad_src)["warnings"] == warns_bad
+    assert detect_dynamic_torch_library_namespaces(good_src) == []
+
+
+def test_idle_slow_tier_auto_promotes_top_unpromoted_fast_candidate(tmp_path: Path):
+    import time
+    from kiln.bench.traffic import synth_traffic
+    from kiln.config import EngineConfig, TierConfig
+    from kiln.server.jobs import JobManager
+
+    traffic = tmp_path / "traffic.jsonl"
+    synth_traffic(str(traffic), n=4, isl=16, osl=8)
+    run = RunConfig(
+        name="idle-autopromote-test",
+        engine=EngineConfig(kind="mock"),
+        tiers=[
+            TierConfig(name="fast", repeats=2),
+            TierConfig(
+                name="slow",
+                repeats=1,
+                idle_auto_promote_from="fast",
+                idle_auto_promote_after_s=10.0,
+                idle_auto_promote_require_certified=True,
+            ),
+        ],
+        traffic_file=str(traffic),
+        workdir=str(tmp_path / "runs"),
+    )
+    mgr = JobManager(run, [], local_tiers={"fast"})
+    # Seed two completed fast jobs: j1 higher speedup (uncertified), j2 certified
+    src1 = "SPEEDUP = 1.25\ndef make_forward(m): return m.forward\n"
+    src2 = "SPEEDUP = 1.18\ndef kernel_ok(x): return x\ndef make_forward(m): return m.forward\n"
+    j1 = mgr.submit("agent_1", "fast", src1, note="uncertified high")
+    j2 = mgr.submit("agent_2", "fast", src2, note="certified clean")
+    for j, sp in ((j1, 1.25), (j2, 1.18)):
+        j.status = "done"
+        j.speedup = sp
+        j.decode_tps = 1000.0 * sp
+    mgr.certify_job(j2.id, agent="auditor_1", func="kernel_ok", scope="all M")
+
+    # Before idle threshold: nothing promoted
+    now0 = mgr.tiers["slow"]._last_job_finished_mono
+    assert mgr.maybe_auto_promote_idle_tier("slow", now_mono=now0 + 2.0) is None
+
+    # Past idle threshold: certified j2 gets promoted to slow (j1 skipped because require_certified=True)
+    promoted = mgr.maybe_auto_promote_idle_tier("slow", now_mono=now0 + 15.0)
+    assert promoted is not None
+    assert promoted.tier == "slow"
+    assert promoted.parent_id == j2.id
+    assert promoted.extra.get("auto_promoted_from") == j2.id
+
+    # Second call while promoted is queued must NOT duplicate-promote
+    assert mgr.maybe_auto_promote_idle_tier("slow", now_mono=now0 + 30.0) is None

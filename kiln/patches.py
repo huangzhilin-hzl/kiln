@@ -381,6 +381,54 @@ def extract_function_ast_hashes(source: str) -> dict[str, str]:
     return out
 
 
+_DYNAMIC_NS_HINT_TOKENS = ("uuid", "uuid4", "hex", "time", "rand", "randint", "urandom", "getpid", "monotonic", "perf_counter")
+
+
+def _node_looks_dynamic_namespace(node: ast.AST | None) -> bool:
+    if node is None:
+        return False
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return False
+    if isinstance(node, (ast.JoinedStr, ast.BinOp, ast.Call)):
+        dumped = ast.dump(node, include_attributes=False).lower()
+        return any(tok in dumped for tok in _DYNAMIC_NS_HINT_TOKENS) or isinstance(node, ast.JoinedStr)
+    return False
+
+
+def detect_dynamic_torch_library_namespaces(source: str) -> list[str]:
+    """Detect dynamic/UUID `torch.library.Library` or `custom_op` namespaces that bust `FXGraphCache`."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    warnings: list[str] = []
+    seen: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attr_chain(node.func) or _func_tail_name(node.func) or ""
+        is_lib = chain.endswith("torch.library.Library") or chain == "Library"
+        is_custom_op = chain.endswith("torch.library.custom_op") or chain == "custom_op"
+        if not (is_lib or is_custom_op):
+            continue
+        ns_arg = node.args[0] if node.args else None
+        if ns_arg is None:
+            for kw in node.keywords:
+                if kw.arg in ("ns", "name"):
+                    ns_arg = kw.value
+                    break
+        if _node_looks_dynamic_namespace(ns_arg):
+            lineno = getattr(node, "lineno", 0)
+            if lineno not in seen:
+                seen.add(lineno)
+                api = "torch.library.Library" if is_lib else "torch.library.custom_op"
+                warnings.append(
+                    f"Line {lineno}: dynamic/UUID namespace passed to `{api}(...)` busts FXGraphCache "
+                    f"and leaks registrations across hot reloads; use a static deterministic namespace."
+                )
+    return warnings
+
+
 def inspect_candidate_source(source: str) -> dict[str, Any]:
     """Statically parse candidate source for tags, parent IDs, regimes, patches, targets, phases, and build triggers."""
     try:
@@ -399,6 +447,7 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
             "patches": [],
             "targets": [],
             "func_ast_hashes": {},
+            "warnings": [],
             "mock_speedup": None,
             "mock_prefill_speedup": None,
             "mock_bucket_speedups": {},
@@ -691,6 +740,7 @@ def inspect_candidate_source(source: str) -> dict[str, Any]:
         "patches": patches,
         "targets": targets,
         "func_ast_hashes": extract_function_ast_hashes(source),
+        "warnings": detect_dynamic_torch_library_namespaces(source),
         "mock_speedup": mock_speedup,
         "mock_prefill_speedup": mock_prefill_speedup,
         "mock_bucket_speedups": mock_bucket_speedups,

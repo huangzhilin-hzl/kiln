@@ -312,6 +312,8 @@ def diff_traces(
         return {
             "has_baseline": False,
             "cand_kernel_ms": round(candidate.total_kernel_us / 1000.0, 3),
+            "cand_union_busy_ms": round(candidate.busy_us / 1000.0, 3),
+            "cand_span_ms": round(candidate.span_us / 1000.0, 3),
             "cand_launches": candidate.total_launches,
             "cand_bubble_pct": round(candidate.bubble_pct, 2),
             "overlap_pct": round(candidate.overlap_pct, 2),
@@ -363,6 +365,9 @@ def diff_traces(
     cand_ms_tot = candidate.total_kernel_us / 1000.0
     base_ms_tot = baseline.total_kernel_us / 1000.0
     k_speedup = (base_ms_tot / cand_ms_tot) if cand_ms_tot > 0 and base_ms_tot > 0 else None
+    cand_busy_ms = candidate.busy_us / 1000.0
+    base_busy_ms = baseline.busy_us / 1000.0
+    busy_speedup = (base_busy_ms / cand_busy_ms) if cand_busy_ms > 0 and base_busy_ms > 0 else None
 
     return {
         "has_baseline": True,
@@ -370,6 +375,12 @@ def diff_traces(
         "base_kernel_ms": round(base_ms_tot, 3),
         "delta_kernel_ms": round(cand_ms_tot - base_ms_tot, 3),
         "kernel_speedup": round(k_speedup, 4) if k_speedup is not None else None,
+        "cand_union_busy_ms": round(cand_busy_ms, 3),
+        "base_union_busy_ms": round(base_busy_ms, 3),
+        "delta_union_busy_ms": round(cand_busy_ms - base_busy_ms, 3),
+        "union_busy_speedup": round(busy_speedup, 4) if busy_speedup is not None else None,
+        "cand_span_ms": round(candidate.span_us / 1000.0, 3),
+        "base_span_ms": round(baseline.span_us / 1000.0, 3),
         "cand_launches": candidate.total_launches,
         "base_launches": baseline.total_launches,
         "delta_launches": candidate.total_launches - baseline.total_launches,
@@ -579,6 +590,7 @@ def format_trace_report(
     if analysis.num_streams > 1 or analysis.bubble_pct > 0.0:
         lines.append(
             f"[Streams & Bubbles] streams={analysis.num_streams} span={analysis.span_us / 1000.0:.2f}ms "
+            f"union_busy={analysis.busy_us / 1000.0:.2f}ms "
             f"bubble={analysis.bubble_pct:.1f}% overlap={analysis.overlap_pct:.1f}% "
             f"comm_contention={analysis.comm_contention_pct:.1f}%"
         )
@@ -586,9 +598,12 @@ def format_trace_report(
     if baseline is not None:
         td = diff_traces(analysis, baseline, top_k=min(top_k, 8))
         sp_txt = f" ({td['kernel_speedup']:.3f}x)" if td.get("kernel_speedup") else ""
+        ub_txt = ""
+        if td.get("cand_union_busy_ms") is not None and td.get("delta_union_busy_ms") is not None:
+            ub_txt = f", union_busy={td['cand_union_busy_ms']:.2f}ms (delta {td['delta_union_busy_ms']:+.2f}ms)"
         lines.append(
             f"[Trace Diff vs Baseline] total={td['cand_kernel_ms']:.2f}ms "
-            f"(delta {td['delta_kernel_ms']:+.2f}ms{sp_txt}), "
+            f"(delta {td['delta_kernel_ms']:+.2f}ms{sp_txt}){ub_txt}, "
             f"launches={td['cand_launches']} (delta {td['delta_launches']:+d}), "
             f"bubble_delta={td['delta_bubble_pct']:+.2f}%"
         )

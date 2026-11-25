@@ -1,0 +1,22 @@
+kiln/config.py
+  h_7339bf36ecd0bc 437
+kiln/micro/__init__.py
+  h_7339bf36ecd0bc 3-11,29,31,38
+kiln/micro/counters.py
+  h_7339bf36ecd0bc 6,12,140-210,216-217,220-222,237-238,248,258,260,269-274,276,288,296-297
+kiln/micro/sandbox.py
+  h_7339bf36ecd0bc 24-30,487-491,561-566,568-576,609
+tests/test_b300_kiln_improvements.py
+  h_7339bf36ecd0bc 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b62f198741760dd812699737fe360beedc8549dc",
+  "prompts": {},
+  "humans": {
+    "h_7339bf36ecd0bc": {
+      "author": "Julian Huang <huangzhilin.hzl@gmail.com>"
+    }
+  }
+}
